@@ -74,10 +74,39 @@ need to run locally at once going forward, point one of them at a second databas
 
 Every tenant-scoped table carries `org_id` (see `internal/db/migrations/000001_init_schema.up.sql`
 for the full 18-table schema, structurally identical to the Python backend's SQLAlchemy
-models). Row-Level Security policies are **not** in the migration — same as the Python
-backend, they're applied manually per environment (see `WORKFLOW_PLAN_GO.md` workflow 1).
-`updated_at` is maintained by a Postgres trigger (`set_updated_at()`, applied to every table)
-rather than ORM `onupdate=...` logic, since this backend has no ORM to hook into.
+models). `updated_at` is maintained by a Postgres trigger (`set_updated_at()`, applied to every
+table) rather than ORM `onupdate=...` logic, since this backend has no ORM to hook into.
+
+### Row-Level Security (`internal/db/migrations/000002_enable_rls.up.sql`)
+
+Every table has a `tenant_isolation` policy scoped to the Postgres session variable
+`app.current_org_id`, read through a `current_org_id()` SQL function that returns `NULL`
+(never errors) when the variable is unset or blank. Because `org_id = NULL` is never `true`,
+a connection that forgets to `SET LOCAL app.current_org_id = '<uuid>'` sees **zero rows**, not
+every row — deny-by-default. Tables without their own `org_id` column
+(`agent_team_members`, `workflow_steps`, `approval_decisions`, `document_chunks`) are scoped
+transitively via an `EXISTS` subquery against their parent. `organizations` itself is scoped
+by its own `id`, since it *is* the tenant root.
+
+RLS is enforced (`FORCE ROW LEVEL SECURITY`) for a new non-superuser role, `app_user`
+(created by the same migration — local-dev password only, see the migration file's comments).
+**RLS does not apply to superusers or table owners**, so this is currently a no-op for the
+`postgres` role both migrations and today's app connect as. Verified directly against
+Postgres (not just "the SQL looks right"): inserted two orgs as `postgres`, then as `app_user`
+confirmed (a) no session var → 0 rows, (b) scoped to org A → only org A's rows across a direct
+table (`users`) and a transitively-scoped table (`document_chunks`), (c) an `INSERT` targeting
+org B while scoped to org A is rejected by the `WITH CHECK` clause.
+
+**Not yet done, deliberately deferred to workflow 2+:** the API's runtime connection pool
+still uses the `postgres` superuser (`DATABASE_URL` in `.env`), so nothing in this Go binary
+is actually RLS-restricted yet. Making that real requires two things once there's real
+request-handling code: (1) switch the per-request pool to `app_user` and call
+`SET LOCAL app.current_org_id = $1` at the start of every tenant-scoped transaction (per
+request, from the authenticated JWT's org), and (2) a **second** role/pool with `BYPASSRLS`
+for system contexts that legitimately need cross-tenant access — the Clerk webhook handler
+(workflow 2) creates orgs it has never seen before, and the workflow-9 background scheduler
+polls `next_run_at` across every org. Don't reuse `app_user` for those; a webhook forgetting
+to `SET LOCAL` would silently see nothing rather than the new org it just needs to insert.
 
 ### No ORM — `pgx` directly, not GORM
 
