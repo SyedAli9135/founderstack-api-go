@@ -90,23 +90,31 @@ by its own `id`, since it *is* the tenant root.
 
 RLS is enforced (`FORCE ROW LEVEL SECURITY`) for a new non-superuser role, `app_user`
 (created by the same migration — local-dev password only, see the migration file's comments).
-**RLS does not apply to superusers or table owners**, so this is currently a no-op for the
-`postgres` role both migrations and today's app connect as. Verified directly against
-Postgres (not just "the SQL looks right"): inserted two orgs as `postgres`, then as `app_user`
-confirmed (a) no session var → 0 rows, (b) scoped to org A → only org A's rows across a direct
-table (`users`) and a transitively-scoped table (`document_chunks`), (c) an `INSERT` targeting
-org B while scoped to org A is rejected by the `WITH CHECK` clause.
+**RLS does not apply to superusers or table owners**, so it was a no-op for the `postgres`
+role migrations run as. Verified directly against Postgres (not just "the SQL looks right"):
+inserted two orgs as `postgres`, then as `app_user` confirmed (a) no session var → 0 rows,
+(b) scoped to org A → only org A's rows across a direct table (`users`) and a
+transitively-scoped table (`document_chunks`), (c) an `INSERT` targeting org B while scoped
+to org A is rejected by the `WITH CHECK` clause.
 
-**Not yet done, deliberately deferred to workflow 2+:** the API's runtime connection pool
-still uses the `postgres` superuser (`DATABASE_URL` in `.env`), so nothing in this Go binary
-is actually RLS-restricted yet. Making that real requires two things once there's real
-request-handling code: (1) switch the per-request pool to `app_user` and call
-`SET LOCAL app.current_org_id = $1` at the start of every tenant-scoped transaction (per
-request, from the authenticated JWT's org), and (2) a **second** role/pool with `BYPASSRLS`
-for system contexts that legitimately need cross-tenant access — the Clerk webhook handler
+**The API's runtime connection pool now connects as `app_user`** (`cmd/api/main.go`, via
+`config.AppDatabaseURL` / the `APP_DATABASE_URL` env var — kept distinct from `DatabaseURL`,
+which stays the `postgres` superuser DSN used only by the `migrate` CLI). Confirmed live via
+`pg_stat_activity`: the running server's connection shows as `app_user`, not `postgres`. The
+health check still passes because `Ping` doesn't touch any RLS-protected table.
+
+A second role, `app_system` (`BYPASSRLS`, migration `000003_add_system_role.up.sql`), exists
+for contexts that legitimately need cross-tenant access — the Clerk webhook handler
 (workflow 2) creates orgs it has never seen before, and the workflow-9 background scheduler
-polls `next_run_at` across every org. Don't reuse `app_user` for those; a webhook forgetting
-to `SET LOCAL` would silently see nothing rather than the new org it just needs to insert.
+polls `next_run_at` across every org. No Go code connects through it yet, deliberately: there
+is no webhook handler or scheduler to use it. **Still deferred to workflow 2+:** actually
+calling `SET LOCAL app.current_org_id = $1` at the start of a tenant-scoped transaction, since
+that requires an authenticated request's org_id, which doesn't exist as a concept in this
+codebase until auth (workflow 2/3) lands — until then, any hypothetical query against a
+tenant table through `app_user` would correctly return zero rows (fail-closed), which is safe
+but means don't mistake "the pool is wired" for "requests are tenant-scoped" — nothing queries
+tenant tables yet at all. Don't reuse `app_user` for the webhook/scheduler when that code
+lands; a webhook forgetting `SET LOCAL` should fail loud, not silently see nothing.
 
 ### No ORM — `pgx` directly, not GORM
 

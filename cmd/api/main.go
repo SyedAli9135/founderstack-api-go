@@ -42,7 +42,9 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	// Connects as app_user (RLS-enforced), not the postgres superuser that
+	// runs migrations — see config.go's AppDatabaseURL doc comment.
+	dbPool, err := pgxpool.New(ctx, cfg.AppDatabaseURL)
 	if err != nil {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}

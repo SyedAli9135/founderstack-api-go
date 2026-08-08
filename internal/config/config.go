@@ -19,8 +19,13 @@ type Config struct {
 	AppBaseURL  string `mapstructure:"APP_BASE_URL"`
 	FrontendURL string `mapstructure:"FRONTEND_URL"`
 
-	// Database
+	// Database. DatabaseURL connects as the postgres superuser — used by the
+	// migrate CLI (via the Makefile) to run schema migrations, and RLS never
+	// applies to it. AppDatabaseURL is what the API server itself connects
+	// with (the restricted, RLS-enforced app_user role) — see
+	// internal/db/migrations/000002_enable_rls.up.sql and CLAUDE.md § Row-Level Security.
 	DatabaseURL      string `mapstructure:"DATABASE_URL"`
+	AppDatabaseURL   string `mapstructure:"APP_DATABASE_URL"`
 	DatabasePoolSize int    `mapstructure:"DATABASE_POOL_SIZE"`
 
 	// Auth (Clerk)
@@ -77,6 +82,7 @@ var requiredFields = []struct {
 	value func(*Config) string
 }{
 	{"DATABASE_URL", func(c *Config) string { return c.DatabaseURL }},
+	{"APP_DATABASE_URL", func(c *Config) string { return c.AppDatabaseURL }},
 	{"CLERK_SECRET_KEY", func(c *Config) string { return c.ClerkSecretKey.Expose() }},
 	{"CLERK_PUBLISHABLE_KEY", func(c *Config) string { return c.ClerkPublishableKey }},
 	{"CLERK_WEBHOOK_SECRET", func(c *Config) string { return c.ClerkWebhookSecret.Expose() }},
@@ -110,6 +116,7 @@ func Load() (*Config, error) {
 		"APP_BASE_URL":                  "http://localhost:8000",
 		"FRONTEND_URL":                  "http://localhost:3000",
 		"DATABASE_URL":                  "",
+		"APP_DATABASE_URL":              "",
 		"DATABASE_POOL_SIZE":            20,
 		"CLERK_SECRET_KEY":              "",
 		"CLERK_PUBLISHABLE_KEY":         "",
