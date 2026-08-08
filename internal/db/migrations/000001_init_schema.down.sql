@@ -1,0 +1,20 @@
+DROP TABLE IF EXISTS cost_ledger;
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS vector_namespaces;
+DROP TABLE IF EXISTS document_chunks;
+DROP TABLE IF EXISTS documents;
+DROP TABLE IF EXISTS approval_decisions;
+DROP TABLE IF EXISTS approvals;
+DROP TABLE IF EXISTS workflow_steps;
+DROP TABLE IF EXISTS workflow_runs;
+DROP TABLE IF EXISTS workflows;
+DROP TABLE IF EXISTS agent_team_members;
+DROP TABLE IF EXISTS agent_teams;
+DROP TABLE IF EXISTS agents;
+DROP TABLE IF EXISTS mcp_connections;
+DROP TABLE IF EXISTS api_key_registry;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS organizations;
+
+DROP FUNCTION IF EXISTS set_updated_at();
