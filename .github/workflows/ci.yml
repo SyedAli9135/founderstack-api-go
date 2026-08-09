@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Ephemeral Postgres for this run only — separate from and unrelated to
+    # the local dev docker-compose.local.yml. Schema + roles (app_user,
+    # app_system) are created fresh below via the same migrations used
+    # locally, so this exercises the real migration history, not a
+    # hand-maintained CI-only schema.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: founderstack
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d founderstack"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet (including build-tagged integration tests)
+        run: go vet -tags=integration ./...
+
+      - name: Format check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Install golang-migrate
+        run: go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+
+      - name: Run migrations
+        run: |
+          $(go env GOPATH)/bin/migrate \
+            -path internal/db/migrations \
+            -database "postgresql://postgres:password@localhost:5432/founderstack?sslmode=disable" \
+            up
+
+      - name: Test (unit + integration)
+        env:
+          TEST_SYSTEM_DATABASE_URL: postgresql://app_system:app_system_password@localhost:5432/founderstack?sslmode=disable
+        run: go test -tags=integration ./... -v

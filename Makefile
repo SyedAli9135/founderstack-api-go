@@ -1,11 +1,14 @@
-.PHONY: run build test vet fmt tidy \
+.PHONY: run build test test-integration vet fmt tidy \
         docker-up docker-down docker-logs \
         migrate-up migrate-down migrate-force migrate-version migrate-create \
+        sqlc-generate \
         health
 
-MIGRATIONS_DIR := internal/db/migrations
-DATABASE_URL   ?= $(shell grep -E '^DATABASE_URL=' .env 2>/dev/null | cut -d '=' -f2-)
-MIGRATE        := $(shell go env GOPATH)/bin/migrate
+MIGRATIONS_DIR      := internal/db/migrations
+DATABASE_URL        ?= $(shell grep -E '^DATABASE_URL=' .env 2>/dev/null | cut -d '=' -f2-)
+SYSTEM_DATABASE_URL ?= $(shell grep -E '^SYSTEM_DATABASE_URL=' .env 2>/dev/null | cut -d '=' -f2-)
+MIGRATE             := $(shell go env GOPATH)/bin/migrate
+SQLC                := $(shell go env GOPATH)/bin/sqlc
 
 ## --- App -------------------------------------------------------------
 
@@ -15,8 +18,11 @@ run: ## Run the API locally (reads .env)
 build: ## Compile the API binary to bin/api
 	go build -o bin/api ./cmd/api
 
-test: ## Run all Go tests
+test: ## Run all Go tests (fast, no DB — build-tagged integration tests are excluded)
 	go test ./...
+
+test-integration: ## Run integration tests too, against local Postgres (needs docker-up + migrate-up first)
+	TEST_SYSTEM_DATABASE_URL="$(SYSTEM_DATABASE_URL)" go test -tags=integration ./... -v
 
 vet: ## Static analysis
 	go vet ./...
@@ -58,3 +64,9 @@ migrate-version: ## Print the current migration version
 
 migrate-create: ## Scaffold a new migration pair (usage: make migrate-create NAME=add_thing)
 	$(MIGRATE) create -ext sql -dir $(MIGRATIONS_DIR) -seq $(NAME)
+
+## --- sqlc (typed Go from internal/db/queries/*.sql) ---------------------
+## Install once: go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
+
+sqlc-generate: ## Regenerate internal/db/dbgen from internal/db/queries + the migration schema
+	$(SQLC) generate

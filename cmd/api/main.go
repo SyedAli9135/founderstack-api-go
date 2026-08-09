@@ -18,7 +18,9 @@ import (
 	"github.com/pinecone-io/go-pinecone/v5/pinecone"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/founderstack/api/internal/api/middleware"
 	v1 "github.com/founderstack/api/internal/api/v1"
+	"github.com/founderstack/api/internal/api/webhooks"
 	"github.com/founderstack/api/internal/config"
 )
 
@@ -50,6 +52,15 @@ func run() error {
 	}
 	defer dbPool.Close()
 
+	// Connects as app_system (BYPASSRLS) — for the Clerk webhook and any
+	// future system context that legitimately spans tenants. See
+	// config.go's SystemDatabaseURL doc comment.
+	systemPool, err := pgxpool.New(ctx, cfg.SystemDatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect to postgres (system pool): %w", err)
+	}
+	defer systemPool.Close()
+
 	redisClient, err := newRedisClient(cfg)
 	if err != nil {
 		return fmt.Errorf("configure redis client: %w", err)
@@ -61,7 +72,7 @@ func run() error {
 		return fmt.Errorf("configure pinecone client: %w", err)
 	}
 
-	router := newRouter(cfg, dbPool, redisClient, pineconeClient)
+	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient)
 
 	srv := &http.Server{
 		Addr:              addr(),
@@ -133,17 +144,21 @@ func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	return client, nil
 }
 
-func newRouter(cfg *config.Config, db *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client) *gin.Engine {
+func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client) *gin.Engine {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
 	router := gin.New()
-	router.Use(gin.Recovery())
+	router.Use(middleware.RequestID())
+	router.Use(middleware.Recovery(cfg))
 	router.Use(cors.New(corsConfig(cfg)))
 
 	apiV1 := router.Group("/api/v1")
 	v1.NewHealthHandler(db, rdb, pc).Register(apiV1)
+
+	apiWebhooks := router.Group("/api/webhooks")
+	webhooks.NewClerkHandler(systemDB, cfg.ClerkWebhookSecret.Expose()).Register(apiWebhooks)
 
 	return router
 }
