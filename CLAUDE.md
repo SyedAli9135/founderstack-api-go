@@ -298,12 +298,39 @@ silently.
 **CI** (`.github/workflows/ci.yml`) runs on every push/PR: `go build`, `go vet -tags=integration`
 (so the integration test file is also type-checked, even though it doesn't execute without the
 tag), a `gofmt -l` check, then spins up a throwaway Postgres service container, runs the real
-migrations against it from empty, and runs the full tagged test suite — the exact same command
-sequence as `make test-integration`, just against a fresh ephemeral DB instead of the local
-dev one. This is CI in the "automated build/test gate" sense only — there is no CD step, no
-deployment target, and none is needed yet (see conversation history: no budget, no deployment
-target exists currently). Costs nothing at this project's scale (GitHub Actions' free tier is
-2,000 minutes/month for private repos; this suite runs in well under a minute).
+migrations against it from empty, and runs `make coverage` — the exact same command a
+developer runs locally, just against a fresh ephemeral DB instead of the local dev one. This
+is CI in the "automated build/test gate" sense only — there is no CD step, no deployment
+target, and none is needed yet (see conversation history: no budget, no deployment target
+exists currently). Costs nothing at this project's scale (GitHub Actions' free tier is 2,000
+minutes/month for private repos; this suite runs in well under a minute).
+
+**Coverage gate** (`make coverage`, `COVERAGE_THRESHOLD` in the `Makefile`, currently `55`):
+runs the full tagged suite with `-coverprofile`, strips `internal/db/dbgen` (sqlc-generated —
+testing generated code directly isn't meaningful; it's already exercised indirectly through
+the handler integration tests that call it) out of the profile, and fails if the remaining
+total statement coverage drops below the threshold. The threshold was set a few points below
+the actual total at the time it was introduced (~59.6%), not at 100% or an arbitrary round
+number — low enough that small legitimate additions in still-thin areas (`cmd/api`'s
+`run()`/`newRouter()` wiring, `internal/api/v1/health.go`, both accepted, documented gaps
+rather than hidden ones) don't fail CI on their own, high enough that a real regression (e.g.
+deleting the webhook tests) still trips it immediately.
+
+**Important nuance**: neither CI nor the coverage gate can literally block a `git push` — a
+push to a remote you have write access to always succeeds; what CI failing does is mark that
+commit's check red, which only *prevents merging* if branch protection rules on `main`
+require the check to pass (not currently configured — solo-dev repo, direct-to-main today).
+The one thing that *can* stop a push from completing locally is a client-side git hook — see
+below — and even that is trivially bypassed with `git push --no-verify`. Treat CI as the
+authoritative, unavoidable gate and the local hook as a fast-feedback convenience, not the
+other way around.
+
+**Local pre-push hook** (`.githooks/pre-push`, not enabled by default — `make install-hooks`
+once per clone to opt in, via `git config core.hooksPath .githooks` rather than the
+untracked, per-clone `.git/hooks/`). Checks local Postgres is reachable (clear error pointing
+at `make docker-up` if not, rather than a cryptic connection failure) and then runs the same
+`make coverage`. Purely a local convenience for fast feedback before a push leaves your
+machine — CI runs the authoritative version of the same check regardless.
 
 ### Router Layout
 

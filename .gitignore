@@ -7,6 +7,8 @@
 /dist/
 *.exe
 *.test
+coverage.out
+coverage.filtered.out
 
 # Go
 vendor/

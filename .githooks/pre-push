@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Runs before `git push` completes; blocks the push if it fails.
+#
+# Not installed by default — git only runs hooks from .git/hooks/, which
+# isn't version-controlled. Enable it once per clone:
+#   git config core.hooksPath .githooks
+#
+# This is a local convenience, not the authoritative gate — CI
+# (.github/workflows/ci.yml) runs the same `make coverage` check on GitHub's
+# side regardless of whether this hook is installed or gets bypassed
+# (git push --no-verify skips it entirely).
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+if ! docker exec founderstack-api-db-1 pg_isready -U postgres -d founderstack >/dev/null 2>&1; then
+    echo "pre-push: local Postgres isn't reachable (container founderstack-api-db-1)." >&2
+    echo "Run 'make docker-up' (and 'make migrate-up' if it's a fresh database), then push again." >&2
+    echo "Or skip this check for one push with: git push --no-verify" >&2
+    exit 1
+fi
+
+echo "pre-push: running tests with coverage..."
+make coverage

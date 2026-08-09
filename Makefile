@@ -1,4 +1,4 @@
-.PHONY: run build test test-integration vet fmt tidy \
+.PHONY: run build test test-integration coverage vet fmt tidy install-hooks \
         docker-up docker-down docker-logs \
         migrate-up migrate-down migrate-force migrate-version migrate-create \
         sqlc-generate \
@@ -9,6 +9,14 @@ DATABASE_URL        ?= $(shell grep -E '^DATABASE_URL=' .env 2>/dev/null | cut -
 SYSTEM_DATABASE_URL ?= $(shell grep -E '^SYSTEM_DATABASE_URL=' .env 2>/dev/null | cut -d '=' -f2-)
 MIGRATE             := $(shell go env GOPATH)/bin/migrate
 SQLC                := $(shell go env GOPATH)/bin/sqlc
+
+# Minimum acceptable total statement coverage (generated code in
+# internal/db/dbgen excluded — see the `coverage` target below for why).
+# Set a few points below the actual current total (~59.6% as of the tests
+# that established this number) so small legitimate additions in
+# still-thin areas (cmd/api wiring, health.go) don't fail CI on their own,
+# while a real regression (e.g. deleting the webhook tests) still trips it.
+COVERAGE_THRESHOLD := 55
 
 ## --- App -------------------------------------------------------------
 
@@ -21,8 +29,26 @@ build: ## Compile the API binary to bin/api
 test: ## Run all Go tests (fast, no DB — build-tagged integration tests are excluded)
 	go test ./...
 
+install-hooks: ## One-time setup: enable the versioned pre-push hook (.githooks/pre-push)
+	git config core.hooksPath .githooks
+	@echo "Installed. 'git push' now runs 'make coverage' first — skip once with 'git push --no-verify'."
+
 test-integration: ## Run integration tests too, against local Postgres (needs docker-up + migrate-up first)
 	TEST_SYSTEM_DATABASE_URL="$(SYSTEM_DATABASE_URL)" go test -tags=integration ./... -v
+
+coverage: ## Run the full suite with coverage and enforce COVERAGE_THRESHOLD (needs docker-up + migrate-up first)
+	@TEST_SYSTEM_DATABASE_URL="$(SYSTEM_DATABASE_URL)" go test -tags=integration ./... -coverprofile=coverage.out -covermode=atomic || exit 1
+	@grep -v "/internal/db/dbgen/" coverage.out > coverage.filtered.out
+	@pct=$$(go tool cover -func=coverage.filtered.out | tail -1 | grep -oE '[0-9]+\.[0-9]+'); \
+	echo ""; \
+	echo "Total coverage (internal/db/dbgen generated code excluded): $$pct%"; \
+	awk -v pct="$$pct" -v threshold="$(COVERAGE_THRESHOLD)" 'BEGIN { \
+		if (pct + 0 < threshold + 0) { \
+			print "FAIL: " pct "% is below the " threshold "% threshold"; exit 1; \
+		} else { \
+			print "PASS: " pct "% meets the " threshold "% threshold"; exit 0; \
+		} \
+	}'
 
 vet: ## Static analysis
 	go vet ./...

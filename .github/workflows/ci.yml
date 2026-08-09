@@ -62,7 +62,16 @@ jobs:
             -database "postgresql://postgres:password@localhost:5432/founderstack?sslmode=disable" \
             up
 
-      - name: Test (unit + integration)
-        env:
-          TEST_SYSTEM_DATABASE_URL: postgresql://app_system:app_system_password@localhost:5432/founderstack?sslmode=disable
-        run: go test -tags=integration ./... -v
+      - name: Test with coverage (fails below the threshold in the Makefile)
+        run: >
+          make coverage
+          SYSTEM_DATABASE_URL="postgresql://app_system:app_system_password@localhost:5432/founderstack?sslmode=disable"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.out
+            coverage.filtered.out
