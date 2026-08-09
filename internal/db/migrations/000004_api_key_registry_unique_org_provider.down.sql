@@ -1,0 +1,1 @@
+ALTER TABLE api_key_registry DROP CONSTRAINT IF EXISTS api_key_registry_org_provider_unique;

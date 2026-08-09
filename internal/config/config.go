@@ -72,6 +72,13 @@ type Config struct {
 	EncryptionKey             secret.Value `mapstructure:"ENCRYPTION_KEY"`
 	OAuthStateSecret          secret.Value `mapstructure:"OAUTH_STATE_SECRET"`
 	AnthropicAPIKeyMockPrefix string       `mapstructure:"ANTHROPIC_API_KEY_MOCK_PREFIX"`
+
+	// DevTokenSecret signs POST /api/v1/auth/dev-token's local test JWTs
+	// and is the only thing RequireAuth accepts them against — deliberately
+	// optional (not in requiredFields): most environments, including
+	// production, should simply leave it unset, which disables the dev
+	// token fallback path entirely rather than requiring it be configured.
+	DevTokenSecret secret.Value `mapstructure:"DEV_TOKEN_SECRET"`
 }
 
 // requiredFields lists the mapstructure keys that must resolve to a
@@ -149,6 +156,7 @@ func Load() (*Config, error) {
 		"ENCRYPTION_KEY":                "",
 		"OAUTH_STATE_SECRET":            "",
 		"ANTHROPIC_API_KEY_MOCK_PREFIX": "sk-ant-test-",
+		"DEV_TOKEN_SECRET":              "",
 	}
 	for key, def := range defaults {
 		v.SetDefault(key, def)

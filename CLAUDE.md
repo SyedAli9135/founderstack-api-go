@@ -15,9 +15,10 @@ agent loop, plus a hand-rolled, Postgres-checkpointed `internal/core/graph` pack
 outer planner → RAG → executor → approval → validator → reporter sequence (LangGraph's Go
 equivalent). Neither exists yet.
 
-**Only workflows 1 (bootstrap) and 2 (Clerk org/user sync) are implemented.** Don't assume
-routes, tables, or packages from later workflows in `WORKFLOW_PLAN_GO.md` exist yet — check
-`internal/api/v1/` and `internal/api/webhooks/` for what's actually registered.
+**Only workflows 1 (bootstrap), 2 (Clerk org/user sync), and 3 (BYOK API key management) are
+implemented.** Don't assume routes, tables, or packages from later workflows in
+`WORKFLOW_PLAN_GO.md` exist yet — check `internal/api/v1/`, `internal/api/webhooks/`,
+`internal/api/settings/`, and `internal/api/identity/` for what's actually registered.
 
 > **A note on how this codebase relates to the Python original**: match
 > `founderstack-api`'s *wire contract* (JSON shapes, field names, status codes, endpoint
@@ -121,13 +122,86 @@ seen before) is inherently something the RLS-scoped `app_user` pool cannot do: i
 `WITH CHECK (id = current_org_id())` policy would reject the insert, since there's no
 tenant-context session variable to set for an org that doesn't exist yet.
 
-**Still genuinely deferred:** nothing calls `SET LOCAL app.current_org_id = $1` yet, because
-that requires an *authenticated request's* org_id, which doesn't exist as a concept until
-real user-facing auth lands (workflow 3+, BYOK settings is the first endpoint that reads the
-Clerk JWT). The webhook is a system context by design — it doesn't need per-request tenant
-scoping, it *is* the thing that creates tenants. Don't reuse `app_user` for future
-system-context work (schedulers, admin tooling); a bug there should fail loud via a rejected
-query, not silently return zero rows.
+**No longer deferred as of workflow 3**: `internal/db/tenant.WithTx` is the one correct way to
+run a tenant-scoped operation against `app_user` — it opens a transaction, sets
+`app.current_org_id` via `set_config(..., true)` (not a string-built `SET LOCAL`, which
+doesn't support real parameterization), runs the caller's queries, commits. Every handler
+under `internal/api/settings/` goes through it; nothing queries `app_user` directly outside
+of it. Verified against real Postgres (`internal/db/tenant/tenant_integration_test.go`) doing
+exactly what §Row-Level Security above only asserted by hand: scoped to org A, a query sees
+org A and not org B; a query against `app_user` with no `WithTx` around it sees nothing at
+all, not everything.
+
+Don't reuse `app_user` (or `tenant.WithTx`) for system-context work (the webhook, a future
+scheduler); that's what `app_system` is for. A bug in a system-context handler should fail
+loud via a rejected query, not silently return zero rows because someone reached for the
+wrong pool.
+
+### Authentication (`internal/api/middleware/auth.go`)
+
+`middleware.RequireAuth(systemPool, cfg)` is the gate every tenant-scoped route sits behind
+(currently just `internal/api/settings/`). Mirrors founderstack-api's
+`get_current_user` → `get_current_org` dependency chain — same two failure cases in the same
+order (`clerk_user_id` not found/inactive in our `users` table → `USER_NOT_SYNCHRONIZED`;
+resolved `org_id` not found/inactive → `ORGANIZATION_NOT_FOUND`), same idea that the *local*
+DB row (not whatever the JWT happens to claim) is the source of truth for whether someone
+still has access. **One real improvement over the Python original**: that implementation
+explicitly decodes the JWT with signature verification turned off
+(`jwt.decode(token, options={"verify_signature": False})`) and relies on nothing upstream
+having tampered with it; this verifies the signature for real, against Clerk's JWKS, via the
+official `clerk-sdk-go`. JWKs are cached by `kid` in-process (`jwkCache`, per Clerk's own
+recommendation — "cache and only invalidate on an unrecognized kid," not fetch every request)
+rather than relying on undocumented caching inside the SDK's higher-level middleware helpers.
+
+Resolving identity (JWT → `clerk_user_id` → local user → local org) runs on `systemPool`
+(`app_system`), not `app_user` — the same chicken-and-egg reasoning as the webhook's org
+creation: you can't RLS-scope a query by an org_id you're still in the process of
+discovering. Once `RequireAuth` succeeds, it stores the resolved identity on the request via
+`internal/api/authctx`, and everything downstream switches to `app_user` + `tenant.WithTx`.
+
+**Dev token fallback** (`internal/pkg/devtoken`, `POST /api/v1/auth/dev-token`): the Python
+original's dev-token utility works by minting an *unsigned* JWT, which only functions because
+that backend's auth skips signature verification entirely. This one doesn't skip it, so a
+Python-style token would just be rejected. Instead this is a genuinely separate, parallel
+dev-only auth path — a short-lived HS256 token signed and verified under one shared secret
+(`DEV_TOKEN_SECRET`, optional, absent from `requiredFields` — leave it unset anywhere real).
+`RequireAuth` only attempts `devtoken.Verify` as a fallback *after* real Clerk verification
+has already failed, and only when `!cfg.IsProduction() && cfg.DevTokenSecret` is set — so
+production behaves identically whether or not the code path exists. The endpoint itself
+responds `404` (not `403`) when disabled, so an unauthenticated prod caller can't even
+confirm the route exists.
+
+### BYOK API Keys (`internal/core/llm`, `internal/pkg/vault`, `internal/api/settings`)
+
+- **`vault`** — `Encrypt`/`Decrypt` via AES-256-GCM. `ENCRYPTION_KEY` is reused from
+  founderstack-api's Fernet key: base64-decoded, a Fernet key is exactly the 32 raw bytes
+  AES-256 needs. Confirmed against the real `.env` value, not just a synthetic test key. The
+  two backends' ciphertexts are **not** interchangeable — Fernet's envelope (version byte,
+  timestamp, IV, HMAC) differs from GCM's (nonce + ciphertext + auth tag) — only the key
+  material is shared. Decoded once at startup (`cmd/api/main.go`) so a misconfigured key
+  fails the process at boot, not silently on a founder's first key submission.
+- **`llm`** — `ValidateKey` mirrors the Python original's dual-path check (mock-prefix
+  short-circuit vs. a real, cheap `Models.List(limit=1)` call) but distinguishes two failure
+  modes the Python version conflates: `ErrKeyRejected` (Anthropic said no — the founder's
+  problem, → `400`) vs. `ErrValidationUnavailable` (couldn't reach Anthropic at all — not the
+  founder's problem, → `503`). Python's `validate_key` catches every exception, including a
+  network failure, and reports it identically to "your key is invalid"; distinguishing them
+  here doesn't change any wire-contract behavior a frontend depends on, just makes the 500-ish
+  path actually reachable and correctly attributed. Verified against the *real* Anthropic API
+  (a deliberately-invalid key, checked manually — see the package's git history — not kept as
+  an automated test, since a test suite that depends on a third-party API's live availability
+  to pass is a flakiness/cost liability). `GetClient` resolves an org's key via `tenant.WithTx`
+  and decrypts it — stateless, unlike the Python original's 5-minute in-process cache with
+  rotation-invalidation logic, since nothing calls it yet (agent execution is workflow 9);
+  that complexity gets added if and when there's a real caller and a measured need for it.
+- **`settings`** — the 3 BYOK endpoints. `organization.deleted`-style soft behavior applies
+  here too: `DELETE /api/v1/settings/api-key` deactivates (`is_valid=false`), never removes
+  the row. Fixed a real gap in the Python original along the way: `api_key_registry` had no
+  `UNIQUE(org_id, provider)` constraint despite a comment stating "we enforce one Anthropic
+  key per org" — nothing actually enforced it, so a race between two concurrent submissions
+  could create two rows. Migration `000004_api_key_registry_unique_org_provider.up.sql` adds
+  the constraint the stated intent already assumed existed, enabling a real
+  `INSERT ... ON CONFLICT` upsert instead of Python's racy read-then-write.
 
 ### No ORM — `pgx` + `sqlc`, not GORM
 
@@ -334,22 +408,26 @@ machine — CI runs the authoritative version of the same check regardless.
 
 ### Router Layout
 
-| Prefix | File | Purpose |
-|--------|------|---------|
-| `/api/v1/health` | `internal/api/v1/health.go` | DB + Redis + Pinecone liveness |
-| `/api/webhooks/clerk` | `internal/api/webhooks/clerk.go` | Clerk org/user sync (workflow 2) |
+| Prefix | File | Auth | Purpose |
+|--------|------|------|---------|
+| `/api/v1/health` | `internal/api/v1/health.go` | none | DB + Redis + Pinecone liveness |
+| `/api/v1/auth/dev-token` | `internal/api/identity/devtoken.go` | none (self-issues) | local test token minting (workflow 3) |
+| `/api/v1/settings/api-key*` | `internal/api/settings/apikey.go` | `middleware.RequireAuth` | BYOK Anthropic key CRUD (workflow 3) |
+| `/api/webhooks/clerk` | `internal/api/webhooks/clerk.go` | Svix signature, not `RequireAuth` | Clerk org/user sync (workflow 2) |
 
-(Everything else in `WORKFLOW_PLAN_GO.md` — settings, integrations, documents, agents,
-workflows, runs — is unbuilt. Add rows here as routers land.)
+(Everything else in `WORKFLOW_PLAN_GO.md` — integrations, documents, agents, workflows, runs
+— is unbuilt. Add rows here as routers land.)
 
 ### Dependency policy
 
 Go dependencies are added when code actually imports them, not pre-installed speculatively
 against the full `WORKFLOW_PLAN_GO.md` dependency table — `go mod tidy` strips unused
 `require`s anyway, and an unused import is dead weight (and an unreviewed supply-chain
-surface) until something calls it. `golang-jwt/jwt`, `anthropic-sdk-go`, `cohere-go`,
-`sentry-go`, and `otel` are all planned (see the dependency table in `WORKFLOW_PLAN_GO.md`)
-but not yet in `go.mod` — add each when the workflow that needs it is implemented.
+surface) until something calls it. `clerk-sdk-go/v2`, `golang-jwt/jwt/v5`, and
+`anthropic-sdk-go` were all added in workflow 3, exactly when each was first actually used
+(real JWT verification, dev tokens, and BYOK key validation, respectively) — see
+"Authentication" and "BYOK API Keys" above. `cohere-go`, `sentry-go`, and `otel` are still
+planned but not yet in `go.mod` — add each when its workflow lands.
 
 ## Environment Variables
 
@@ -361,6 +439,9 @@ fails listing all that are missing, not just the first): `DATABASE_URL`, `APP_DA
 `*_DATABASE_URL` vars connect as three different Postgres roles for three different trust
 boundaries — see "Row-Level Security" above before adding a fourth use case to any of them.
 
+`DEV_TOKEN_SECRET` is deliberately **not** in that required list — it's local-testing-only
+(see "Authentication" above) and should stay unset everywhere real, including production.
+
 ## Adding a New Feature
 
 1. **New table / schema change**: `make migrate-create NAME=descriptive_name`, write the
@@ -371,9 +452,12 @@ boundaries — see "Row-Level Security" above before adding a fourth use case to
    generated `dbgen.Queries` method — see "No ORM" above.
 3. **New endpoint**: add a handler package under `internal/api/`, register it on the
    appropriate route group in `cmd/api/main.go::newRouter`. Use `response.OK`/`response.Fail`
-   for every response — see "Response Envelope" above. Decide which `*pgxpool.Pool` it needs
-   (`app_user` for ordinary tenant-scoped requests, `app_system` only for genuine cross-tenant
-   system contexts) before wiring it in `main.go`.
+   for every response — see "Response Envelope" above. If it needs an authenticated caller,
+   put `middleware.RequireAuth(systemPool, cfg)` on its route group (see "Authentication"
+   above) and read the caller via `authctx.FromContext(c)`, then run its actual DB work
+   through `tenant.WithTx(ctx, appPool, user.OrgID, ...)` — never a bare query against
+   `app_user`. `app_system` is only for genuine cross-tenant system contexts (webhooks,
+   schedulers), not a shortcut around auth.
 4. **New external dependency**: `go get` it when you write the first line of code that imports
    it, not before (see "Dependency policy" above).
 5. **New secret/config value**: add a field to `internal/config/config.go`'s `Config` struct

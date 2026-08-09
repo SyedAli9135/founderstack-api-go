@@ -1,0 +1,179 @@
+package middleware
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+	"sync"
+
+	"github.com/clerk/clerk-sdk-go/v2"
+	"github.com/clerk/clerk-sdk-go/v2/jwt"
+	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/founderstack/api/internal/api/authctx"
+	"github.com/founderstack/api/internal/api/response"
+	"github.com/founderstack/api/internal/config"
+	"github.com/founderstack/api/internal/db/dbgen"
+	"github.com/founderstack/api/internal/pkg/devtoken"
+)
+
+// jwkCache caches Clerk's JSON Web Keys by kid. Clerk's own docs recommend
+// caching and only invalidating when a replacement key is generated (i.e.
+// on an unrecognized kid) rather than fetching on every request — this is
+// exactly that, kept explicit rather than relying on undocumented internal
+// caching behavior in the SDK's higher-level helpers.
+type jwkCache struct {
+	mu   sync.RWMutex
+	keys map[string]*clerk.JSONWebKey
+}
+
+func newJWKCache() *jwkCache {
+	return &jwkCache{keys: make(map[string]*clerk.JSONWebKey)}
+}
+
+// get returns the cached key for keyID, calling fetch only on a cache
+// miss. fetch is a parameter (rather than a hardcoded call to
+// jwt.GetJSONWebKey) so the cache's hit/miss behavior is unit-testable
+// without a real Clerk API call — see auth_test.go.
+func (c *jwkCache) get(ctx context.Context, keyID string, fetch func(context.Context, string) (*clerk.JSONWebKey, error)) (*clerk.JSONWebKey, error) {
+	c.mu.RLock()
+	jwk, ok := c.keys[keyID]
+	c.mu.RUnlock()
+	if ok {
+		return jwk, nil
+	}
+
+	fetched, err := fetch(ctx, keyID)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.keys[keyID] = fetched
+	c.mu.Unlock()
+	return fetched, nil
+}
+
+// RequireAuth verifies the request's Clerk session JWT
+// (Authorization: Bearer <token>) and resolves it to a local user + org,
+// storing both on the context via authctx for handlers to read.
+//
+// Mirrors founderstack-api's get_current_user -> get_current_org dependency
+// chain: same two failure cases in the same order (user not synced to our
+// DB yet, then org missing/inactive), same messages. One deliberate
+// improvement over the Python original: that implementation explicitly
+// decodes the JWT with signature verification turned off
+// (jwt.decode(token, options={"verify_signature": False})); this verifies
+// it for real, against Clerk's JWKS, via the official clerk-sdk-go.
+//
+// systemPool must be app_system (BYPASSRLS) — resolving "which org does
+// this brand-new request belong to" has no org context yet to scope an
+// RLS-restricted query by, the same chicken-and-egg case as the webhook's
+// org creation. Once RequireAuth succeeds, handlers switch to app_user via
+// tenant.WithTx for their own tenant-scoped work — this middleware's use of
+// app_system stops at resolving identity, nothing more.
+//
+// When cfg.DevTokenSecret is set and !cfg.IsProduction(), a token that
+// fails real Clerk verification is retried against devtoken.Verify before
+// giving up — see that package's doc comment for why this exists as a
+// separate path rather than a weakened primary one.
+func RequireAuth(systemPool *pgxpool.Pool, cfg *config.Config) gin.HandlerFunc {
+	cache := newJWKCache()
+	q := dbgen.New(systemPool)
+
+	return func(c *gin.Context) {
+		token := bearerToken(c.GetHeader("Authorization"))
+		if token == "" {
+			response.Fail(c, http.StatusUnauthorized, "MISSING_AUTHORIZATION", "Missing or malformed Authorization header")
+			c.Abort()
+			return
+		}
+
+		ctx := c.Request.Context()
+
+		clerkUserID, err := verifyClerkToken(ctx, cache, token)
+		if err != nil {
+			clerkUserID, err = devTokenFallback(cfg, token)
+			if err != nil {
+				response.Fail(c, http.StatusUnauthorized, "INVALID_TOKEN", "Invalid session token")
+				c.Abort()
+				return
+			}
+		}
+
+		user, err := q.GetActiveUserByClerkUserID(ctx, clerkUserID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				response.Fail(c, http.StatusUnauthorized, "USER_NOT_SYNCHRONIZED", "User profile not synchronized")
+			} else {
+				response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not verify session")
+			}
+			c.Abort()
+			return
+		}
+
+		org, err := q.GetActiveOrganizationByID(ctx, user.OrgID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				response.Fail(c, http.StatusNotFound, "ORGANIZATION_NOT_FOUND", "Organization not found or inactive")
+			} else {
+				response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not verify session")
+			}
+			c.Abort()
+			return
+		}
+
+		authctx.Set(c, authctx.User{
+			ID:      user.ID,
+			OrgID:   user.OrgID,
+			Role:    user.Role,
+			OrgName: org.Name,
+			OrgSlug: org.Slug,
+		})
+		c.Next()
+	}
+}
+
+func fetchJWK(ctx context.Context, keyID string) (*clerk.JSONWebKey, error) {
+	return jwt.GetJSONWebKey(ctx, &jwt.GetJSONWebKeyParams{KeyID: keyID})
+}
+
+// verifyClerkToken runs the real verification path and returns the
+// token's subject (a clerk_user_id) on success.
+func verifyClerkToken(ctx context.Context, cache *jwkCache, token string) (string, error) {
+	unverified, err := jwt.Decode(ctx, &jwt.DecodeParams{Token: token})
+	if err != nil {
+		return "", err
+	}
+	jwk, err := cache.get(ctx, unverified.KeyID, fetchJWK)
+	if err != nil {
+		return "", err
+	}
+	claims, err := jwt.Verify(ctx, &jwt.VerifyParams{Token: token, JWK: jwk})
+	if err != nil {
+		return "", err
+	}
+	return claims.Subject, nil
+}
+
+// devTokenFallback attempts devtoken.Verify — only ever reached after real
+// Clerk verification has already failed, and only does anything when
+// cfg.DevTokenSecret is configured and the process isn't running as
+// production. Both conditions false is the common case (most environments,
+// including every production one, should leave DEV_TOKEN_SECRET unset).
+func devTokenFallback(cfg *config.Config, token string) (string, error) {
+	if cfg.IsProduction() || cfg.DevTokenSecret.IsEmpty() {
+		return "", errors.New("dev token fallback not enabled")
+	}
+	return devtoken.Verify(cfg.DevTokenSecret.Expose(), token)
+}
+
+func bearerToken(header string) string {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return ""
+	}
+	return strings.TrimPrefix(header, prefix)
+}

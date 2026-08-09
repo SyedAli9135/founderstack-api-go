@@ -11,10 +11,26 @@ import (
 )
 
 type Querier interface {
+	ClearOrganizationActiveApiKey(ctx context.Context, id pgtype.UUID) error
+	DeactivateAnthropicKey(ctx context.Context, orgID pgtype.UUID) (int64, error)
+	// Queries backing BYOK API key management (workflow 3). Run through
+	// app_user via tenant.WithTx — this is genuinely tenant-scoped data, not a
+	// system-context lookup like clerk_sync.sql or auth.sql.
+	GetActiveAnthropicKeyByOrgID(ctx context.Context, orgID pgtype.UUID) (GetActiveAnthropicKeyByOrgIDRow, error)
+	GetActiveOrganizationByID(ctx context.Context, id pgtype.UUID) (GetActiveOrganizationByIDRow, error)
+	// Queries backing request authentication (internal/api/middleware/auth.go).
+	// Run through app_system (BYPASSRLS): resolving "who is this JWT for, and
+	// which org do they belong to" is inherently a lookup that happens before
+	// any tenant context exists to scope an RLS-restricted query by — the same
+	// chicken-and-egg reasoning as the Clerk webhook's org creation.
+	GetActiveUserByClerkUserID(ctx context.Context, clerkUserID string) (GetActiveUserByClerkUserIDRow, error)
+	GetAnthropicKeyStatus(ctx context.Context, orgID pgtype.UUID) (GetAnthropicKeyStatusRow, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
+	SetOrganizationActiveApiKey(ctx context.Context, arg SetOrganizationActiveApiKeyParams) error
 	SoftDeleteOrganizationByClerkOrgID(ctx context.Context, clerkOrgID string) (int64, error)
 	SoftDeleteUserByClerkUserID(ctx context.Context, clerkUserID string) (int64, error)
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (int64, error)
+	UpsertAnthropicKey(ctx context.Context, arg UpsertAnthropicKeyParams) (pgtype.UUID, error)
 	// Queries backing the Clerk webhook sync (POST /api/webhooks/clerk). Run
 	// through the app_system (BYPASSRLS) pool, never app_user — see
 	// internal/api/webhooks/clerk.go.

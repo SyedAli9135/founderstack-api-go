@@ -6,6 +6,7 @@
 
 MIGRATIONS_DIR      := internal/db/migrations
 DATABASE_URL        ?= $(shell grep -E '^DATABASE_URL=' .env 2>/dev/null | cut -d '=' -f2-)
+APP_DATABASE_URL    ?= $(shell grep -E '^APP_DATABASE_URL=' .env 2>/dev/null | cut -d '=' -f2-)
 SYSTEM_DATABASE_URL ?= $(shell grep -E '^SYSTEM_DATABASE_URL=' .env 2>/dev/null | cut -d '=' -f2-)
 MIGRATE             := $(shell go env GOPATH)/bin/migrate
 SQLC                := $(shell go env GOPATH)/bin/sqlc
@@ -34,10 +35,10 @@ install-hooks: ## One-time setup: enable the versioned pre-push hook (.githooks/
 	@echo "Installed. 'git push' now runs 'make coverage' first — skip once with 'git push --no-verify'."
 
 test-integration: ## Run integration tests too, against local Postgres (needs docker-up + migrate-up first)
-	TEST_SYSTEM_DATABASE_URL="$(SYSTEM_DATABASE_URL)" go test -tags=integration ./... -v
+	TEST_SYSTEM_DATABASE_URL="$(SYSTEM_DATABASE_URL)" TEST_APP_DATABASE_URL="$(APP_DATABASE_URL)" go test -tags=integration ./... -v
 
 coverage: ## Run the full suite with coverage and enforce COVERAGE_THRESHOLD (needs docker-up + migrate-up first)
-	@TEST_SYSTEM_DATABASE_URL="$(SYSTEM_DATABASE_URL)" go test -tags=integration ./... -coverprofile=coverage.out -covermode=atomic || exit 1
+	@TEST_SYSTEM_DATABASE_URL="$(SYSTEM_DATABASE_URL)" TEST_APP_DATABASE_URL="$(APP_DATABASE_URL)" go test -tags=integration ./... -coverprofile=coverage.out -covermode=atomic || exit 1
 	@grep -v "/internal/db/dbgen/" coverage.out > coverage.filtered.out
 	@pct=$$(go tool cover -func=coverage.filtered.out | tail -1 | grep -oE '[0-9]+\.[0-9]+'); \
 	echo ""; \

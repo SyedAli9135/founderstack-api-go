@@ -12,16 +12,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/clerk/clerk-sdk-go/v2"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pinecone-io/go-pinecone/v5/pinecone"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/founderstack/api/internal/api/identity"
 	"github.com/founderstack/api/internal/api/middleware"
+	"github.com/founderstack/api/internal/api/settings"
 	v1 "github.com/founderstack/api/internal/api/v1"
 	"github.com/founderstack/api/internal/api/webhooks"
 	"github.com/founderstack/api/internal/config"
+	"github.com/founderstack/api/internal/pkg/vault"
 )
 
 func main() {
@@ -38,6 +42,17 @@ func run() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+
+	// Configures the Clerk SDK's default backend (used by
+	// middleware.RequireAuth to fetch JWKS for JWT verification).
+	clerk.SetKey(cfg.ClerkSecretKey.Expose())
+
+	// Decoded once at startup so a misconfigured ENCRYPTION_KEY fails the
+	// process at boot — not silently, on a founder's first BYOK submission.
+	encryptionKey, err := vault.DecodeKey(cfg.EncryptionKey.Expose())
+	if err != nil {
+		return fmt.Errorf("decode ENCRYPTION_KEY: %w", err)
 	}
 
 	// Cancelled on SIGINT/SIGTERM; everything below shuts down off this.
@@ -72,7 +87,7 @@ func run() error {
 		return fmt.Errorf("configure pinecone client: %w", err)
 	}
 
-	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient)
+	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey)
 
 	srv := &http.Server{
 		Addr:              addr(),
@@ -144,7 +159,7 @@ func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	return client, nil
 }
 
-func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client) *gin.Engine {
+func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte) *gin.Engine {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -156,6 +171,15 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 
 	apiV1 := router.Group("/api/v1")
 	v1.NewHealthHandler(db, rdb, pc).Register(apiV1)
+
+	apiAuth := router.Group("/api/v1/auth")
+	identity.NewDevTokenHandler(cfg).Register(apiAuth)
+
+	// Every route under here requires a verified session — db is app_user
+	// (RLS-enforced); each handler scopes its own queries via tenant.WithTx.
+	apiSettings := router.Group("/api/v1/settings")
+	apiSettings.Use(middleware.RequireAuth(systemDB, cfg))
+	settings.NewHandler(db, encryptionKey, cfg.AnthropicAPIKeyMockPrefix).Register(apiSettings)
 
 	apiWebhooks := router.Group("/api/webhooks")
 	webhooks.NewClerkHandler(systemDB, cfg.ClerkWebhookSecret.Expose()).Register(apiWebhooks)
