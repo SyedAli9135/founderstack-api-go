@@ -25,12 +25,36 @@ type Querier interface {
 	// chicken-and-egg reasoning as the Clerk webhook's org creation.
 	GetActiveUserByClerkUserID(ctx context.Context, clerkUserID string) (GetActiveUserByClerkUserIDRow, error)
 	GetAnthropicKeyStatus(ctx context.Context, orgID pgtype.UUID) (GetAnthropicKeyStatusRow, error)
+	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
+	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
+	// Used only by the background refresh job (app_system pool). Scoped to
+	// oauth_status = 'connected' so a already-expired or revoked connection
+	// isn't retried every 30 minutes forever.
+	ListExpiringConnectionsSystem(ctx context.Context, tokenExpiresAt pgtype.Timestamptz) ([]ListExpiringConnectionsSystemRow, error)
+	MarkConnectionExpired(ctx context.Context, arg MarkConnectionExpiredParams) (int64, error)
+	MarkConnectionExpiredByIDSystem(ctx context.Context, id pgtype.UUID) (int64, error)
+	RevokeConnection(ctx context.Context, arg RevokeConnectionParams) (int64, error)
 	SetOrganizationActiveApiKey(ctx context.Context, arg SetOrganizationActiveApiKeyParams) error
 	SoftDeleteOrganizationByClerkOrgID(ctx context.Context, clerkOrgID string) (int64, error)
 	SoftDeleteUserByClerkUserID(ctx context.Context, clerkUserID string) (int64, error)
+	UpdateConnectionTokens(ctx context.Context, arg UpdateConnectionTokensParams) (int64, error)
+	// Used only by the background refresh job (app_system pool) — targets a
+	// specific connection by id, already scoped to the right org by virtue of
+	// having come from ListExpiringConnectionsSystem's own row.
+	UpdateConnectionTokensByIDSystem(ctx context.Context, arg UpdateConnectionTokensByIDSystemParams) (int64, error)
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (int64, error)
 	UpsertAnthropicKey(ctx context.Context, arg UpsertAnthropicKeyParams) (pgtype.UUID, error)
+	// Queries backing third-party integration connections (workflow 4),
+	// against the mcp_connections table. Per-org reads/writes (connect,
+	// callback, api-key, status, delete) run through app_user via
+	// tenant.WithTx, same as api_key_registry in api_keys.sql. The two
+	// "System" queries below are the exception — the background token-refresh
+	// job scans expiring connections across every org, which is inherently a
+	// cross-tenant system-context operation (same reasoning as clerk_sync.sql),
+	// so those run against app_system (BYPASSRLS) directly, never through
+	// tenant.WithTx.
+	UpsertConnection(ctx context.Context, arg UpsertConnectionParams) (pgtype.UUID, error)
 	// Queries backing the Clerk webhook sync (POST /api/webhooks/clerk). Run
 	// through the app_system (BYPASSRLS) pool, never app_user — see
 	// internal/api/webhooks/clerk.go.

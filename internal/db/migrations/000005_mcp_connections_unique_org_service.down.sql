@@ -1,0 +1,1 @@
+ALTER TABLE mcp_connections DROP CONSTRAINT IF EXISTS mcp_connections_org_service_unique;

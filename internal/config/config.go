@@ -36,15 +36,15 @@ type Config struct {
 	// LocalStack (local dev S3 mock)
 	LocalstackAuthToken secret.Value `mapstructure:"LOCALSTACK_AUTH_TOKEN"`
 
-	// OAuth client credentials (workflow 4)
+	// OAuth / API-key client credentials
 	SlackClientID        string       `mapstructure:"SLACK_CLIENT_ID"`
 	SlackClientSecret    secret.Value `mapstructure:"SLACK_CLIENT_SECRET"`
+	DiscordClientID      string       `mapstructure:"DISCORD_CLIENT_ID"`
+	DiscordClientSecret  secret.Value `mapstructure:"DISCORD_CLIENT_SECRET"`
 	NotionClientID       string       `mapstructure:"NOTION_CLIENT_ID"`
 	NotionClientSecret   secret.Value `mapstructure:"NOTION_CLIENT_SECRET"`
 	GoogleClientID       string       `mapstructure:"GOOGLE_CLIENT_ID"`
 	GoogleClientSecret   secret.Value `mapstructure:"GOOGLE_CLIENT_SECRET"`
-	TwitterClientID      string       `mapstructure:"TWITTER_CLIENT_ID"`
-	TwitterSecretKey     secret.Value `mapstructure:"TWITTER_SECRET_KEY"`
 	LinkedInClientID     string       `mapstructure:"LINKEDIN_CLIENT_ID"`
 	LinkedInClientSecret secret.Value `mapstructure:"LINKEDIN_CLIENT_SECRET"`
 
@@ -133,12 +133,12 @@ func Load() (*Config, error) {
 		"LOCALSTACK_AUTH_TOKEN":         "",
 		"SLACK_CLIENT_ID":               "",
 		"SLACK_CLIENT_SECRET":           "",
+		"DISCORD_CLIENT_ID":             "",
+		"DISCORD_CLIENT_SECRET":         "",
 		"NOTION_CLIENT_ID":              "",
 		"NOTION_CLIENT_SECRET":          "",
 		"GOOGLE_CLIENT_ID":              "",
 		"GOOGLE_CLIENT_SECRET":          "",
-		"TWITTER_CLIENT_ID":             "",
-		"TWITTER_SECRET_KEY":            "",
 		"LINKEDIN_CLIENT_ID":            "",
 		"LINKEDIN_CLIENT_SECRET":        "",
 		"PINECONE_API_KEY":              "",

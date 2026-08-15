@@ -1,4 +1,3 @@
-// Command api runs the FounderStack API HTTP server.
 package main
 
 import (
@@ -20,11 +19,14 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/founderstack/api/internal/api/identity"
+	integrationsapi "github.com/founderstack/api/internal/api/integrations"
 	"github.com/founderstack/api/internal/api/middleware"
 	"github.com/founderstack/api/internal/api/settings"
 	v1 "github.com/founderstack/api/internal/api/v1"
 	"github.com/founderstack/api/internal/api/webhooks"
 	"github.com/founderstack/api/internal/config"
+	"github.com/founderstack/api/internal/core/integrations"
+	"github.com/founderstack/api/internal/core/integrations/providers"
 	"github.com/founderstack/api/internal/pkg/vault"
 )
 
@@ -87,7 +89,13 @@ func run() error {
 		return fmt.Errorf("configure pinecone client: %w", err)
 	}
 
-	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey)
+	integrationsRegistry := newIntegrationsRegistry(cfg)
+	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry)
+
+	// Runs until ctx is cancelled (same SIGINT/SIGTERM signal the HTTP
+	// server shuts down on) — see integrations.RunRefreshJob's doc comment
+	// for why this needs systemPool rather than the RLS-scoped dbPool.
+	go integrations.RunRefreshJob(ctx, systemPool, encryptionKey, integrationsRegistry)
 
 	srv := &http.Server{
 		Addr:              addr(),
@@ -159,7 +167,7 @@ func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	return client, nil
 }
 
-func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte) *gin.Engine {
+func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry) *gin.Engine {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -184,7 +192,43 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiWebhooks := router.Group("/api/webhooks")
 	webhooks.NewClerkHandler(systemDB, cfg.ClerkWebhookSecret.Expose()).Register(apiWebhooks)
 
+	stateManager := integrations.NewStateManager(rdb, cfg.OAuthStateSecret.Expose())
+	intHandler := integrationsapi.NewHandler(db, encryptionKey, registry, stateManager, cfg.FrontendURL)
+
+	apiIntegrations := router.Group("/api/v1/integrations")
+	apiIntegrations.Use(middleware.RequireAuth(systemDB, cfg))
+	intHandler.Register(apiIntegrations)
+
+	// Unauthenticated: the OAuth provider redirects the founder's browser
+	// here directly, with no JWT — see Handler.RegisterCallback's doc
+	// comment. Same URL prefix as apiIntegrations above; the route
+	// patterns (":service/callback" vs. ":service/connect" etc.) don't
+	// collide, so Gin's router handles both groups fine.
+	apiIntegrationsCallback := router.Group("/api/v1/integrations")
+	intHandler.RegisterCallback(apiIntegrationsCallback)
+
 	return router
+}
+
+// newIntegrationsRegistry constructs one provider per catalog.go entry —
+// the single place, per the "open/closed" design note in
+// WORKFLOW_PLAN_GO.md's workflow 4 section, that needs a new line when a
+// provider is added. Every provider's redirect URL follows the same
+// {API_URL}/api/v1/integrations/{service}/callback shape.
+func newIntegrationsRegistry(cfg *config.Config) *integrations.Registry {
+	callbackURL := func(service string) string {
+		return cfg.AppBaseURL + "/api/v1/integrations/" + service + "/callback"
+	}
+	return integrations.NewRegistry(
+		providers.NewSlack(cfg.SlackClientID, cfg.SlackClientSecret.Expose(), callbackURL("slack")),
+		providers.NewDiscord(cfg.DiscordClientID, cfg.DiscordClientSecret.Expose(), callbackURL("discord")),
+		providers.NewNotion(cfg.NotionClientID, cfg.NotionClientSecret.Expose(), callbackURL("notion")),
+		providers.NewGoogleDrive(cfg.GoogleClientID, cfg.GoogleClientSecret.Expose(), callbackURL("google_drive")),
+		providers.NewGoogleCalendar(cfg.GoogleClientID, cfg.GoogleClientSecret.Expose(), callbackURL("google_calendar")),
+		providers.NewLinkedIn(cfg.LinkedInClientID, cfg.LinkedInClientSecret.Expose(), callbackURL("linkedin")),
+		providers.NewStripe(),
+		providers.NewGitHub(),
+	)
 }
 
 // corsConfig mirrors app/main.py's CORS policy: wide open in development,

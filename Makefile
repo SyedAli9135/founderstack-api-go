@@ -17,7 +17,7 @@ SQLC                := $(shell go env GOPATH)/bin/sqlc
 # that established this number) so small legitimate additions in
 # still-thin areas (cmd/api wiring, health.go) don't fail CI on their own,
 # while a real regression (e.g. deleting the webhook tests) still trips it.
-COVERAGE_THRESHOLD := 55
+COVERAGE_THRESHOLD := 60
 
 ## --- App -------------------------------------------------------------
 

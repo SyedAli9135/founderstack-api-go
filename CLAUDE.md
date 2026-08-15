@@ -15,10 +15,14 @@ agent loop, plus a hand-rolled, Postgres-checkpointed `internal/core/graph` pack
 outer planner → RAG → executor → approval → validator → reporter sequence (LangGraph's Go
 equivalent). Neither exists yet.
 
-**Only workflows 1 (bootstrap), 2 (Clerk org/user sync), and 3 (BYOK API key management) are
-implemented.** Don't assume routes, tables, or packages from later workflows in
-`WORKFLOW_PLAN_GO.md` exist yet — check `internal/api/v1/`, `internal/api/webhooks/`,
-`internal/api/settings/`, and `internal/api/identity/` for what's actually registered.
+**Only workflows 1 (bootstrap), 2 (Clerk org/user sync), 3 (BYOK API key management), and 4
+(connect integration — OAuth/API-key) are implemented.** Don't assume routes, tables, or
+packages from later workflows in `WORKFLOW_PLAN_GO.md` exist yet — check `internal/api/v1/`,
+`internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`, and
+`internal/api/integrations/` for what's actually registered. Workflow 4's code is complete and
+tested, but nothing will actually connect to a live third party until real OAuth app credentials
+are registered on each provider's dashboard and put in `.env` — see "Third-Party Integrations
+(workflow 4)" below and its "Status" note in `WORKFLOW_PLAN_GO.md`.
 
 > **A note on how this codebase relates to the Python original**: match
 > `founderstack-api`'s *wire contract* (JSON shapes, field names, status codes, endpoint
@@ -203,6 +207,110 @@ confirm the route exists.
   the constraint the stated intent already assumed existed, enabling a real
   `INSERT ... ON CONFLICT` upsert instead of Python's racy read-then-write.
 
+### Third-Party Integrations (workflow 4) — `internal/core/integrations`, `internal/api/integrations`
+
+8 catalog entries (`internal/core/integrations/catalog.go`): Slack, Discord, Notion, Google
+Drive, Google Calendar, LinkedIn via OAuth 2.0; Stripe, GitHub via a founder-pasted API
+key/PAT. **Twitter/X was deliberately dropped** (no free developer tier as of Feb 2026 —
+pay-per-use only); **Telegram and QuickBooks Online were both built, manually verified
+end-to-end against real credentials, then dropped** at the founder's discretion (2026-08-15).
+QuickBooks specifically was cut after friction with Intuit's account-verification requirements
+during signup outweighed its value — it was never part of the original "Core 5" (workflow 5's
+finance tools were scoped to Stripe, not QuickBooks), so nothing was actually lost. Dropping
+QuickBooks also reverted `OAuthProvider.ExchangeCode` and `TokenValidator.ValidateToken` to
+simpler signatures (see the interface segregation note below) — QuickBooks' `realmId` quirk was
+the only reason those interfaces carried extra parameters every other provider had to ignore.
+For both drops, code/tests/docs were fully removed rather than left disabled, so there's
+nothing stale to trip over if either is reconsidered later — re-adding one is a new
+`providers/*.go` file, one `catalog.go` line, one `main.go` registry line (plus, for QuickBooks
+specifically, re-widening those two interfaces again).
+**LinkedIn is scoped to just the free
+"Share on LinkedIn" product** (`w_member_social`), not the paid, partner-gated Marketing
+Developer Platform — both decisions driven by the same solo-founder/no-funding constraint that
+shaped the rest of this catalog; see `WORKFLOW_PLAN_GO.md`'s workflow 4 implementation note for
+the full reasoning, including why Google Drive is scoped to `drive.file` (avoids Google's paid
+CASA security assessment).
+
+**Provider interface segregation, not one fat interface** (`internal/core/integrations/types.go`):
+`Provider` (just `Name()`) is the only thing every catalog entry implements. `OAuthProvider`,
+`Refreshable`, `Revocable`, `TokenValidator`, and `KeyProvider` are separate small interfaces a
+provider implements only where it genuinely applies — GitHub's PAT has no `RevokeToken`, Notion
+has no public revocation API, Slack bot tokens don't expire so `slack.go` never implements
+`Refreshable`. Every call site (the HTTP handlers, the refresh job) resolves a `Provider` via
+`Registry.Get(service)` and then type-asserts the capability it needs
+(`provider.(integrations.Refreshable)`, ...) rather than switching on the service name. This is
+the actual open/closed lever for the package: adding integration #11 is a new
+`providers/*.go` file implementing the interfaces it needs, one line in `catalog.go`, and one
+line in `cmd/api/main.go::newIntegrationsRegistry`'s constructor call — zero diffs to
+`handler.go`, `state.go`, `tokenstore.go`, or `refresh.go`.
+
+`Registry` (`internal/core/integrations/registry.go`) is built once, explicitly, in
+`newIntegrationsRegistry` (`cmd/api/main.go`) — deliberately not `init()`-based self-registration
+(the pattern `database/sql` drivers use): every provider here is first-party, in this one
+module, so there's no genuine plugin/external-driver need that self-registration's hidden
+control flow would be earning its keep for.
+
+**Token storage** (`internal/core/integrations/tokenstore.go`): a `Token`
+(access/refresh/expiry/scopes/provider-specific `Extra` map) is JSON-marshaled into one envelope
+and encrypted with the existing `vault.Encrypt` (same AES-256-GCM, same key as BYOK) into
+`mcp_connections.encrypted_credentials`. `Token.Extra` is currently unused by every provider in
+the catalog (its one real use case, QuickBooks' `realmId`, was removed — see above) but is kept
+as a zero-cost extension point: a nil map costs nothing, and a future provider needing one odd
+extra field wouldn't require a new `mcp_connections` column, just a value in this map. Migration
+`000005_mcp_connections_unique_org_service.up.sql` adds `UNIQUE(org_id, service_name)` (the same
+gap-fix pattern as `000004` for `api_key_registry`), enabling a real `INSERT ... ON CONFLICT`
+upsert instead of a racy read-then-write.
+
+**CSRF state** (`internal/core/integrations/state.go`): `StateManager.Generate`/`.Verify`, not
+free functions — holds the Redis client and decoded `OAUTH_STATE_SECRET`, built once in
+`main.go`, matching every other handler's dependency-injection shape in this codebase. A
+callback request carries no JWT (the provider redirects the browser here directly), so
+`org_id`/`service` are recovered from a Redis-backed, one-time-use, HMAC-signed nonce rather
+than trusted from the callback URL — `Verify` checks the signature *before* touching Redis, so a
+forged/garbage state costs nothing but CPU, and deletes the Redis entry immediately on lookup so
+a replayed callback fails on its second attempt (covered by an integration test).
+
+**Provider-specific wrinkles worth knowing about before touching a provider file:**
+- **Slack** (`providers/slack.go`) is hand-implemented with `net/http`, not
+  `golang.org/x/oauth2` — every Slack Web API response, including a *failed* token exchange, is
+  HTTP 200 with an `"ok": false` body, which `x/oauth2`'s `Exchange` would silently treat as a
+  successful (empty) token.
+- **Notion** has no public revoke endpoint — `providers/notion.go` doesn't implement `Revocable`,
+  so `DELETE .../notion` deactivates locally only (best-effort, by design, via the type
+  assertion in the handler — not a gap).
+- **LinkedIn**'s `ValidateToken` uses token introspection
+  (`POST /oauth/v2/introspectToken`), not a resource API — with only `w_member_social` granted
+  there's no profile endpoint the token is actually authorized to call, but introspection is
+  client-authenticated rather than scope-gated, so it works regardless.
+
+**Background refresh job** (`internal/core/integrations/refresh.go`): `RunRefreshJob` runs on
+`app_system` (BYPASSRLS) directly, never `tenant.WithTx` — scanning expiring connections across
+every org is inherently cross-tenant, same reasoning as the Clerk webhook's org creation. Started
+as a goroutine from `cmd/api/main.go::run`, cancelled on the same SIGINT/SIGTERM context the HTTP
+server shuts down on. Runs once immediately at startup (a connection that expired while the
+process was down shouldn't wait a full 30-minute tick to be caught), then every `RefreshInterval`
+(30 min) for any connection expiring within `refreshWindow` (10 min). A refresh response never
+re-sends provider-specific `Extra` fields — both the job and the manual `GET .../status` refresh
+path preserve the existing connection's `Extra` rather than dropping it (currently a no-op for
+every provider in the catalog, but correct and free to keep — see `Token.Extra`'s note above).
+
+**Testing**: unit tests cover every provider's request/response-shape logic (Slack's `ok`-field
+handling, LinkedIn's introspection `active` branch, ...) via a shared HTTP-interception harness
+(`internal/core/integrations/providers/oauth_flow_test.go`) that reroutes requests for real
+provider hostnames to local `httptest` servers — chosen over either hardcoding fake endpoints
+into the provider files or skipping this logic's coverage entirely, since a live-third-party-API
+dependency in the test suite is exactly the flakiness/cost liability `llm.go`'s `ValidateKey`
+doc comment already argues against, and this logic (JSON field names, header construction,
+Slack's HTTP-200-with-`ok:false` convention) is real "not obviously right" surface worth locking
+down. Integration tests (`internal/api/integrations/handler_integration_test.go`,
+`internal/core/integrations/refresh_integration_test.go`) run the full HTTP lifecycle and the
+refresh job against real Postgres + Redis, with fake `Provider` implementations standing in for
+Slack/Stripe — same reasoning, same pattern. One real bug this caught before it
+shipped: `GET .../status` originally re-validated a token against its provider unconditionally,
+which meant a locally revoked connection (`DELETE .../{service}`) could flip back to `"connected"`
+if the provider's own validation call didn't happen to detect revocation — fixed by checking
+`IsActive` first and short-circuiting to the stored status.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -379,16 +487,18 @@ target, and none is needed yet (see conversation history: no budget, no deployme
 exists currently). Costs nothing at this project's scale (GitHub Actions' free tier is 2,000
 minutes/month for private repos; this suite runs in well under a minute).
 
-**Coverage gate** (`make coverage`, `COVERAGE_THRESHOLD` in the `Makefile`, currently `55`):
+**Coverage gate** (`make coverage`, `COVERAGE_THRESHOLD` in the `Makefile`, currently `60`):
 runs the full tagged suite with `-coverprofile`, strips `internal/db/dbgen` (sqlc-generated —
 testing generated code directly isn't meaningful; it's already exercised indirectly through
 the handler integration tests that call it) out of the profile, and fails if the remaining
-total statement coverage drops below the threshold. The threshold was set a few points below
-the actual total at the time it was introduced (~59.6%), not at 100% or an arbitrary round
-number — low enough that small legitimate additions in still-thin areas (`cmd/api`'s
-`run()`/`newRouter()` wiring, `internal/api/v1/health.go`, both accepted, documented gaps
-rather than hidden ones) don't fail CI on their own, high enough that a real regression (e.g.
-deleting the webhook tests) still trips it immediately.
+total statement coverage drops below the threshold. The threshold is kept a few points below
+the actual total (raised from 55 to 60 after workflow 4 pushed real coverage to ~64.5%, following
+the same "a few points below actual, not 100% or an arbitrary round number" policy the gate
+started with at ~59.6%) — low enough that small legitimate additions in still-thin areas
+(`cmd/api`'s `run()`/`newRouter()` wiring, `internal/api/v1/health.go`, both accepted, documented
+gaps rather than hidden ones) don't fail CI on their own, high enough that a real regression
+(e.g. deleting the webhook tests, or workflow 4's provider request-shape tests) still trips it
+immediately.
 
 **Important nuance**: neither CI nor the coverage gate can literally block a `git push` — a
 push to a remote you have write access to always succeeds; what CI failing does is mark that
@@ -414,9 +524,11 @@ machine — CI runs the authoritative version of the same check regardless.
 | `/api/v1/auth/dev-token` | `internal/api/identity/devtoken.go` | none (self-issues) | local test token minting (workflow 3) |
 | `/api/v1/settings/api-key*` | `internal/api/settings/apikey.go` | `middleware.RequireAuth` | BYOK Anthropic key CRUD (workflow 3) |
 | `/api/webhooks/clerk` | `internal/api/webhooks/clerk.go` | Svix signature, not `RequireAuth` | Clerk org/user sync (workflow 2) |
+| `/api/v1/integrations`, `/api/v1/integrations/{service}/connect`, `.../api-key`, `.../status`, `DELETE .../{service}` | `internal/api/integrations/handler.go` | `middleware.RequireAuth` | Connect/manage third-party integrations (workflow 4) |
+| `/api/v1/integrations/{service}/callback` | `internal/api/integrations/handler.go` | none — org/service recovered from `state`, not a JWT | OAuth provider redirect target (workflow 4) |
 
-(Everything else in `WORKFLOW_PLAN_GO.md` — integrations, documents, agents, workflows, runs
-— is unbuilt. Add rows here as routers land.)
+(Everything else in `WORKFLOW_PLAN_GO.md` — documents, agents, workflows, runs — is unbuilt.
+Add rows here as routers land.)
 
 ### Dependency policy
 
@@ -426,8 +538,15 @@ against the full `WORKFLOW_PLAN_GO.md` dependency table — `go mod tidy` strips
 surface) until something calls it. `clerk-sdk-go/v2`, `golang-jwt/jwt/v5`, and
 `anthropic-sdk-go` were all added in workflow 3, exactly when each was first actually used
 (real JWT verification, dev tokens, and BYOK key validation, respectively) — see
-"Authentication" and "BYOK API Keys" above. `cohere-go`, `sentry-go`, and `otel` are still
-planned but not yet in `go.mod` — add each when its workflow lands.
+"Authentication" and "BYOK API Keys" above. `golang.org/x/oauth2` (plus `x/oauth2/google`) was
+added in workflow 4 for the 6 standard-OAuth2 providers; **Slack was deliberately implemented
+without it** (`providers/slack.go`, plain `net/http`) since Slack's own response shape — HTTP
+200 even on a failed token exchange — doesn't fit `x/oauth2`'s assumptions, so pulling in the
+dependency there would have bought nothing. Stripe's `ValidateKey` is one REST call, not the
+`stripe-go` SDK the original plan sketched — same "don't add a dependency a single GET doesn't
+justify" reasoning; revisit if workflow 5's Stripe MCP tools end up needing more than that.
+`cohere-go`, `sentry-go`, and `otel` are still planned but not yet in `go.mod` — add each when
+its workflow lands.
 
 ## Environment Variables
 
@@ -438,6 +557,14 @@ fails listing all that are missing, not just the first): `DATABASE_URL`, `APP_DA
 `LOCALSTACK_AUTH_TOKEN`, `PINECONE_API_KEY`, `ENCRYPTION_KEY`, `OAUTH_STATE_SECRET`. The three
 `*_DATABASE_URL` vars connect as three different Postgres roles for three different trust
 boundaries — see "Row-Level Security" above before adding a fourth use case to any of them.
+
+The per-provider OAuth client ID/secret pairs (`SLACK_CLIENT_ID`, `DISCORD_CLIENT_ID`, ...) are
+deliberately **not** in that required list, unlike `OAUTH_STATE_SECRET` itself: the app boots
+and serves all of workflow 4's routes fine with every one of them blank — a request to `POST
+/api/v1/integrations/{service}/connect` for an unconfigured provider just fails at the real
+OAuth server (wrong/empty `client_id`), not at boot. Requiring them all up front would force a
+solo founder to register every provider's app before the server even starts, for integrations
+they may not use yet.
 
 `DEV_TOKEN_SECRET` is deliberately **not** in that required list — it's local-testing-only
 (see "Authentication" above) and should stay unset everywhere real, including production.
