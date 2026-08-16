@@ -258,7 +258,7 @@ func TestIntegrationsHandler_FullLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("connect on a non-OAuth service is rejected", func(t *testing.T) {
+	t.Run("connect on a key-based service with no key is rejected", func(t *testing.T) {
 		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/integrations/stripe/connect", nil)
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
@@ -364,31 +364,47 @@ func TestIntegrationsHandler_FullLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("stripe api-key connects via KeyProvider path", func(t *testing.T) {
-		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/integrations/stripe/api-key",
+	t.Run("stripe connects via the KeyProvider branch of /connect", func(t *testing.T) {
+		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/integrations/stripe/connect",
 			map[string]string{"key": "sk_test_fake"})
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
-		if rec.Code != http.StatusCreated {
-			t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
 		}
 	})
 
-	t.Run("api-key on an OAuth service is rejected", func(t *testing.T) {
-		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/integrations/slack/api-key",
+	t.Run("connect on an OAuth service ignores a stray key in the body", func(t *testing.T) {
+		// The frontend always posts to this one endpoint regardless of
+		// auth_type (matching founderstack-api's actual contract) — the
+		// dispatch is by catalog AuthType, not by whether a key happens to
+		// be present, so an accidental/leftover key in the body must not
+		// change OAuth behavior.
+		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/integrations/slack/connect",
 			map[string]string{"key": "whatever"})
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+		}
+		var got struct {
+			Data struct {
+				RedirectURL string `json:"redirect_url"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Data.RedirectURL == "" {
+			t.Fatal("expected a redirect_url even with a key in the body")
 		}
 	})
 
-	t.Run("api-key with a rejected key does not save a connection", func(t *testing.T) {
+	t.Run("connect with a rejected key does not save a connection", func(t *testing.T) {
 		fakeStripe.validateErr = errors.New("fake: key rejected")
 		defer func() { fakeStripe.validateErr = nil }()
 
-		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/integrations/stripe/api-key",
+		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/integrations/stripe/connect",
 			map[string]string{"key": "sk_test_bad"})
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
@@ -439,12 +455,12 @@ func TestIntegrationsHandler_CrossOrgIsolation(t *testing.T) {
 	registry := integrations.NewRegistry(fakeStripe)
 	router := testRouter(t, systemPool, appPool, rdb, cfg, encKey, registry, "http://localhost:3000")
 
-	reqA := authedRequest(t, cfg, userA, http.MethodPost, "/api/v1/integrations/stripe/api-key",
+	reqA := authedRequest(t, cfg, userA, http.MethodPost, "/api/v1/integrations/stripe/connect",
 		map[string]string{"key": "sk_test_org_a_only"})
 	recA := httptest.NewRecorder()
 	router.ServeHTTP(recA, reqA)
-	if recA.Code != http.StatusCreated {
-		t.Fatalf("org A connect: status = %d, want 201; body = %s", recA.Code, recA.Body.String())
+	if recA.Code != http.StatusOK {
+		t.Fatalf("org A connect: status = %d, want 200; body = %s", recA.Code, recA.Body.String())
 	}
 
 	reqB := authedRequest(t, cfg, userB, http.MethodGet, "/api/v1/integrations/stripe/status", nil)

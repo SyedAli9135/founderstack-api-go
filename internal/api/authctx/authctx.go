@@ -1,6 +1,3 @@
-// Package authctx stores the authenticated caller (resolved by
-// middleware.RequireAuth) on the Gin request context, for handlers to read
-// without each one re-deriving it from the JWT.
 package authctx
 
 import (

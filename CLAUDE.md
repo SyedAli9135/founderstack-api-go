@@ -231,6 +231,20 @@ shaped the rest of this catalog; see `WORKFLOW_PLAN_GO.md`'s workflow 4 implemen
 the full reasoning, including why Google Drive is scoped to `drive.file` (avoids Google's paid
 CASA security assessment).
 
+**`POST /api/v1/integrations/{service}/connect` is one endpoint for every auth type, not two**
+(fixed 2026-08-16, found while syncing `founderstack-web` against this backend). It was
+originally split into a separate `/connect` (OAuth) and `/api-key` (Stripe/GitHub) — a
+deviation from `founderstack-api`'s actual wire contract, where `connect_integration` has always
+been a single route dispatching internally on `auth_type`. `founderstack-web`'s
+`useConnectIntegration` was built correctly against that real contract and always posts to
+`/connect` regardless of service — so the split silently broke the key-based connect flow in the
+*actual UI* (curl testing against `/api-key` directly never caught this, since manual curl calls
+bypassed the frontend's real call path entirely). `Handler.Connect` now branches internally on
+`catalog.Meta.AuthType`: `oauth` ignores the body and returns `redirect_url`; `api_key`/`pat`
+reads `{ key }` from the body. This is the general lesson, not just this one bug: verify a wire
+contract against what the actual frontend sends, not just against what a handler accepts in
+isolation.
+
 **Provider interface segregation, not one fat interface** (`internal/core/integrations/types.go`):
 `Provider` (just `Name()`) is the only thing every catalog entry implements. `OAuthProvider`,
 `Refreshable`, `Revocable`, `TokenValidator`, and `KeyProvider` are separate small interfaces a
@@ -524,7 +538,7 @@ machine — CI runs the authoritative version of the same check regardless.
 | `/api/v1/auth/dev-token` | `internal/api/identity/devtoken.go` | none (self-issues) | local test token minting (workflow 3) |
 | `/api/v1/settings/api-key*` | `internal/api/settings/apikey.go` | `middleware.RequireAuth` | BYOK Anthropic key CRUD (workflow 3) |
 | `/api/webhooks/clerk` | `internal/api/webhooks/clerk.go` | Svix signature, not `RequireAuth` | Clerk org/user sync (workflow 2) |
-| `/api/v1/integrations`, `/api/v1/integrations/{service}/connect`, `.../api-key`, `.../status`, `DELETE .../{service}` | `internal/api/integrations/handler.go` | `middleware.RequireAuth` | Connect/manage third-party integrations (workflow 4) |
+| `/api/v1/integrations`, `/api/v1/integrations/{service}/connect` (all auth types), `.../status`, `DELETE .../{service}` | `internal/api/integrations/handler.go` | `middleware.RequireAuth` | Connect/manage third-party integrations (workflow 4) |
 | `/api/v1/integrations/{service}/callback` | `internal/api/integrations/handler.go` | none — org/service recovered from `state`, not a JWT | OAuth provider redirect target (workflow 4) |
 
 (Everything else in `WORKFLOW_PLAN_GO.md` — documents, agents, workflows, runs — is unbuilt.

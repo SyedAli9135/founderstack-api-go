@@ -37,12 +37,11 @@ func NewHandler(appPool *pgxpool.Pool, encryptionKey []byte, registry *integrati
 	}
 }
 
-// Register mounts the 5 authenticated routes on rg. rg's group must
+// Register mounts the 4 authenticated routes on rg. rg's group must
 // already have middleware.RequireAuth applied.
 func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("", h.ListIntegrations)
 	rg.POST("/:service/connect", h.Connect)
-	rg.POST("/:service/api-key", h.SubmitAPIKey)
 	rg.DELETE("/:service", h.Disconnect)
 	rg.GET("/:service/status", h.Status)
 }
@@ -109,7 +108,22 @@ func (h *Handler) ListIntegrations(c *gin.Context) {
 
 const timeFormat = "2006-01-02T15:04:05Z07:00"
 
-// Connect starts an OAuth flow — POST /api/v1/integrations/{service}/connect.
+type connectRequest struct {
+	// Key is only used for api_key/pat services — absent (or ignored) for
+	// oauth ones, which don't take a body at all.
+	Key string `json:"key"`
+}
+
+// Connect connects a service — POST /api/v1/integrations/{service}/connect.
+// One endpoint for both auth shapes, dispatching on the catalog's
+// AuthType, matching founderstack-api's actual wire contract exactly
+// (see founderstack-api/app/api/v1/endpoints/integrations.py's
+// connect_integration): oauth services return a redirect_url; api_key/pat
+// services validate and store the key from the request body. This was
+// briefly split into a separate POST .../api-key route during the initial
+// Go build — that deviated from the real contract founderstack-web is
+// built against (it always posts here, never to a separate route), so it
+// was merged back.
 func (h *Handler) Connect(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -118,7 +132,8 @@ func (h *Handler) Connect(c *gin.Context) {
 	}
 
 	service := c.Param("service")
-	if _, known := integrations.Catalog[service]; !known {
+	meta, known := integrations.Catalog[service]
+	if !known {
 		response.Fail(c, http.StatusNotFound, "UNKNOWN_SERVICE", "No such integration: "+service)
 		return
 	}
@@ -127,19 +142,46 @@ func (h *Handler) Connect(c *gin.Context) {
 		response.Fail(c, http.StatusNotFound, "UNKNOWN_SERVICE", "No such integration: "+service)
 		return
 	}
-	oauthProvider, ok := provider.(integrations.OAuthProvider)
+
+	ctx := c.Request.Context()
+
+	if meta.AuthType == integrations.AuthTypeOAuth {
+		oauthProvider, ok := provider.(integrations.OAuthProvider)
+		if !ok {
+			response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", service+" is catalogued as oauth but its provider doesn't implement OAuthProvider")
+			return
+		}
+		state, err := h.stateManager.Generate(ctx, user.OrgID.String(), service)
+		if err != nil {
+			response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not start the connection")
+			return
+		}
+		response.OK(c, http.StatusOK, "", gin.H{"redirect_url": oauthProvider.GetAuthURL(state)})
+		return
+	}
+
+	// api_key / pat
+	keyProvider, ok := provider.(integrations.KeyProvider)
 	if !ok {
-		response.Fail(c, http.StatusBadRequest, "NOT_OAUTH_SERVICE", service+" is connected via an API key, not OAuth — use POST .../api-key")
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", service+" is catalogued as key-based but its provider doesn't implement KeyProvider")
+		return
+	}
+	var req connectRequest
+	if err := c.ShouldBindJSON(&req); err != nil || req.Key == "" {
+		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "key is required for this service")
+		return
+	}
+	if err := keyProvider.ValidateKey(ctx, req.Key); err != nil {
+		response.Fail(c, http.StatusBadRequest, "INVALID_KEY", "That key could not be validated: "+err.Error())
 		return
 	}
 
-	state, err := h.stateManager.Generate(c.Request.Context(), user.OrgID.String(), service)
-	if err != nil {
-		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not start the connection")
+	tok := integrations.Token{AccessToken: req.Key}
+	if err := integrations.SaveConnection(ctx, h.appPool, h.encryptionKey, user.OrgID, service, meta.Name, "manual", "connected", tok); err != nil {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not save the key")
 		return
 	}
-
-	response.OK(c, http.StatusOK, "", gin.H{"redirect_url": oauthProvider.GetAuthURL(state)})
+	response.OK(c, http.StatusOK, "", gin.H{"status": "connected"})
 }
 
 // Callback completes an OAuth flow — GET /api/v1/integrations/{service}/callback.
@@ -204,56 +246,6 @@ func (h *Handler) Callback(c *gin.Context) {
 	}
 
 	c.Redirect(http.StatusFound, h.frontendURL+"/integrations?connected="+service)
-}
-
-type submitAPIKeyRequest struct {
-	Key string `json:"key" binding:"required"`
-}
-
-// SubmitAPIKey validates and stores a pasted key/PAT —
-// POST /api/v1/integrations/{service}/api-key (Stripe, GitHub).
-func (h *Handler) SubmitAPIKey(c *gin.Context) {
-	user, ok := authctx.FromContext(c)
-	if !ok {
-		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
-		return
-	}
-
-	service := c.Param("service")
-	var req submitAPIKeyRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "key is required")
-		return
-	}
-
-	provider, ok := h.registry.Get(service)
-	if !ok {
-		response.Fail(c, http.StatusNotFound, "UNKNOWN_SERVICE", "No such integration: "+service)
-		return
-	}
-	keyProvider, ok := provider.(integrations.KeyProvider)
-	if !ok {
-		response.Fail(c, http.StatusBadRequest, "NOT_KEY_SERVICE", service+" is connected via OAuth, not an API key — use POST .../connect")
-		return
-	}
-
-	ctx := c.Request.Context()
-	if err := keyProvider.ValidateKey(ctx, req.Key); err != nil {
-		response.Fail(c, http.StatusBadRequest, "INVALID_KEY", "That key could not be validated: "+err.Error())
-		return
-	}
-
-	displayName := service
-	if meta, known := integrations.Catalog[service]; known {
-		displayName = meta.Name
-	}
-	tok := integrations.Token{AccessToken: req.Key}
-	if err := integrations.SaveConnection(ctx, h.appPool, h.encryptionKey, user.OrgID, service, displayName, "manual", "connected", tok); err != nil {
-		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not save the key")
-		return
-	}
-
-	response.OK(c, http.StatusCreated, "", gin.H{"status": "connected"})
 }
 
 // Disconnect revokes (best-effort) and deactivates a connection —
