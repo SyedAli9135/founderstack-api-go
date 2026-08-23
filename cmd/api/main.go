@@ -21,6 +21,7 @@ import (
 	"github.com/pinecone-io/go-pinecone/v5/pinecone"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/founderstack/api/internal/api/agents"
 	"github.com/founderstack/api/internal/api/documents"
 	"github.com/founderstack/api/internal/api/identity"
 	integrationsapi "github.com/founderstack/api/internal/api/integrations"
@@ -138,7 +139,7 @@ func run() error {
 	// job queue.
 	docsProcessor.RecoverStuckJobs(ctx, systemPool)
 
-	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor)
+	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, mcpRegistry)
 
 	// Runs until ctx is cancelled (same SIGINT/SIGTERM signal the HTTP
 	// server shuts down on) — see integrations.RunRefreshJob's doc comment
@@ -215,7 +216,7 @@ func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	return client, nil
 }
 
-func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor) *gin.Engine {
+func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, mcpRegistry *coremcp.Registry) *gin.Engine {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -258,6 +259,10 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiDocuments := router.Group("/api/v1")
 	apiDocuments.Use(middleware.RequireAuth(systemDB, cfg))
 	documents.NewHandler(db, docsStore, docsProcessor).Register(apiDocuments)
+
+	apiAgents := router.Group("/api/v1")
+	apiAgents.Use(middleware.RequireAuth(systemDB, cfg))
+	agents.NewHandler(db, mcpRegistry).Register(apiAgents)
 
 	return router
 }

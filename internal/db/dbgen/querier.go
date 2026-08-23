@@ -16,6 +16,11 @@ type Querier interface {
 	// org, deactivating a non-active provider's key must not clobber a
 	// different, still-active provider's pointer.
 	ClearOrganizationActiveApiKeyForProvider(ctx context.Context, arg ClearOrganizationActiveApiKeyForProviderParams) error
+	CountActiveAgents(ctx context.Context, orgID pgtype.UUID) (int64, error)
+	// Soft delete — is_active=false, row stays for run history (Workflow 9+).
+	// :execrows (not :exec) so the handler can distinguish "deactivated" from
+	// "no such agent in this org" (0 rows) and return a real 404.
+	DeactivateAgent(ctx context.Context, arg DeactivateAgentParams) (int64, error)
 	DeactivateKeyByProvider(ctx context.Context, arg DeactivateKeyByProviderParams) (int64, error)
 	DeleteDocumentChunks(ctx context.Context, docID pgtype.UUID) error
 	// Queries backing BYOK API key management (workflow 3). Run through
@@ -32,13 +37,20 @@ type Querier interface {
 	// any tenant context exists to scope an RLS-restricted query by — the same
 	// chicken-and-egg reasoning as the Clerk webhook's org creation.
 	GetActiveUserByClerkUserID(ctx context.Context, clerkUserID string) (GetActiveUserByClerkUserIDRow, error)
+	GetAgent(ctx context.Context, arg GetAgentParams) (GetAgentRow, error)
 	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
 	GetDocument(ctx context.Context, arg GetDocumentParams) (GetDocumentRow, error)
 	GetKeyStatusByProvider(ctx context.Context, arg GetKeyStatusByProviderParams) (GetKeyStatusByProviderRow, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
+	GetOrganizationMaxAgents(ctx context.Context, id pgtype.UUID) (*int32, error)
 	// Only called after purgeDocumentJob has successfully removed the
 	// Pinecone vectors and the S3 object — see internal/core/documents/purge.go.
 	HardDeleteDocument(ctx context.Context, arg HardDeleteDocumentParams) error
+	// ON CONFLICT ... DO NOTHING against the partial unique index added in
+	// 000006_agents_unique_org_name_active: a real duplicate name returns 0
+	// rows (pgx.ErrNoRows on the :one Scan), which the handler translates to a
+	// 400 DUPLICATE_AGENT_NAME rather than a generic 500.
+	InsertAgent(ctx context.Context, arg InsertAgentParams) (InsertAgentRow, error)
 	// Queries backing workflow 6 (document upload / RAG). Tenant-scoped reads
 	// and writes run through app_user via tenant.WithTx, same convention as
 	// every other feature area in this file set. The recovery-sweep query
@@ -52,6 +64,11 @@ type Querier interface {
 	// after — one INSERT instead of an insert-then-update dance.
 	InsertDocument(ctx context.Context, arg InsertDocumentParams) error
 	InsertDocumentChunk(ctx context.Context, arg InsertDocumentChunkParams) error
+	// Queries backing workflow 7 (agent configuration CRUD). All tenant-scoped,
+	// run through app_user via tenant.WithTx like every other feature area in
+	// this file set — nothing here is cross-tenant, unlike the recovery-sweep
+	// style queries elsewhere.
+	ListAgents(ctx context.Context, orgID pgtype.UUID) ([]ListAgentsRow, error)
 	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
 	ListDocumentChunkPineconeIDs(ctx context.Context, docID pgtype.UUID) ([]string, error)
 	// Excludes 'deleting': once DELETE .../{id} has been called, the
@@ -86,6 +103,13 @@ type Querier interface {
 	SoftDeleteDocument(ctx context.Context, arg SoftDeleteDocumentParams) error
 	SoftDeleteOrganizationByClerkOrgID(ctx context.Context, clerkOrgID string) (int64, error)
 	SoftDeleteUserByClerkUserID(ctx context.Context, clerkUserID string) (int64, error)
+	// Partial update via COALESCE against sqlc.narg — every field is optional
+	// on the PATCH wire contract; only the ones actually present in the
+	// request are non-nil here. A rename that collides with another active
+	// agent's name still hits the 000006 partial unique index (COALESCE can't
+	// route around a real constraint), surfacing as a Postgres 23505 the
+	// handler translates the same way InsertAgent's ON CONFLICT branch does.
+	UpdateAgent(ctx context.Context, arg UpdateAgentParams) (UpdateAgentRow, error)
 	UpdateConnectionTokens(ctx context.Context, arg UpdateConnectionTokensParams) (int64, error)
 	// Used only by the background refresh job (app_system pool) — targets a
 	// specific connection by id, already scoped to the right org by virtue of

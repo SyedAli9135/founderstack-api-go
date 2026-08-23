@@ -22,11 +22,13 @@ Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 fro
 Anthropic-only original). See "BYOK API Keys" below.
 
 **Only workflows 1 (bootstrap), 2 (Clerk org/user sync), 3 (BYOK API key management), 4 (connect
-integration — OAuth/API-key), 5 (MCP tool gateway), and 6 (document upload / RAG) are
-implemented.** Don't assume routes, tables, or packages from later workflows in
-`WORKFLOW_PLAN_GO.md` exist yet — check `internal/api/v1/`, `internal/api/webhooks/`,
-`internal/api/settings/`, `internal/api/identity/`, `internal/api/integrations/`, and
-`internal/api/documents/` for what's actually registered. Workflow 4's code is complete and
+integration — OAuth/API-key), 5 (MCP tool gateway), 6 (document upload / RAG), and 7 (agent
+configuration) are implemented.** Don't assume routes, tables, or packages from later workflows
+in `WORKFLOW_PLAN_GO.md` exist yet — check `internal/api/v1/`, `internal/api/webhooks/`,
+`internal/api/settings/`, `internal/api/identity/`, `internal/api/integrations/`,
+`internal/api/documents/`, and `internal/api/agents/` for what's actually registered. Workflow 7
+is configuration CRUD only — no agent actually runs, calls an LLM, or executes a tool yet; that's
+workflow 9's job (`internal/core/graph`, not built). Workflow 4's code is complete and
 tested, but nothing will actually connect to a live third party until real OAuth app credentials
 are registered on each provider's dashboard and put in `.env` — see "Third-Party Integrations
 (workflow 4)" below and its "Status" note in `WORKFLOW_PLAN_GO.md`.
@@ -595,6 +597,63 @@ before/after (`waitForFreshIndexed`), not just the status string. Unit tests
 chunking/extraction logic and the Cohere retry configuration without any live dependency, same
 split as every other package in this codebase.
 
+### Agent Configuration (workflow 7) — `internal/api/agents`
+
+Pure CRUD over the `agents` table — name, system prompt, model, and a `policy_scope` JSONB
+column (`{max_tool_calls, max_cost_per_run_usd, allowed_tools}`). **Nothing here calls an LLM or
+executes a tool** — that's workflow 9's job (`internal/core/graph`, not built yet); this package
+only manages the row that later constrains what workflow 9's executor node will be allowed to
+do. There's no Python original to mirror here (`app/models/ai.py` defines the `Agent`
+SQLAlchemy model, structurally identical to the Go migration's `agents` table, but no
+`app/api/v1/endpoints/agents.py` was ever built) — the wire contract below was designed fresh
+against `WORKFLOW_PLAN_GO.md`'s spec, same as workflows 5 and 6 were.
+
+**Duplicate-name rejection is a real partial-unique-index, not just an app-level check** —
+migration `000006_agents_unique_org_name_active.up.sql` adds a unique index on `(org_id, name)
+WHERE is_active = true`, the same gap-fix pattern `api_key_registry` (000004) and
+`mcp_connections` (000005) already established. Partial, not a plain `UNIQUE` constraint,
+specifically so a deactivated agent's name doesn't block a brand-new agent from reusing it.
+`POST` hits it via `INSERT ... ON CONFLICT (org_id, name) WHERE is_active = true DO NOTHING` (0
+rows back means `pgx.ErrNoRows` on the `:one` scan → `400 DUPLICATE_AGENT_NAME`); a `PATCH`
+rename can't use `ON CONFLICT` (that's insert-only SQL), so a colliding rename just raises a real
+Postgres `23505`, caught via `errors.As(err, &pgconn.PgError{})` and translated the same way.
+
+**`allowed_mcp_servers` is derived, never accepted from the client** — computed server-side from
+the unique `service` prefixes in `policy_scope.allowed_tools` (`serversFromTools`), so the two
+JSONB columns can't drift out of sync the way they would if the frontend had to keep both
+consistent by hand.
+
+**`GET /api/v1/agents/tools`, not in the original plan text** — the plan sketched the allowed-
+tools multi-select as populated "from `GET /api/v1/integrations` connected tools," but that
+endpoint only reports connection *status*, not individual tool names; the real catalog (service,
+tool name, description) only exists in workflow 5's `coremcp.Registry`, which had no HTTP
+endpoint before this. `Handler.ListAvailableTools` cross-references the org's connected services
+(`mcp_connections`, `is_active = true`) against `Registry.ListTools()` and returns the
+intersection — read-only introspection, not execution, so it doesn't pull workflow 9's scope
+forward. Offering a tool from an unconnected service would just be a dead-end choice nothing
+could ever call.
+
+**`GetAgent` intentionally does not filter by `is_active`** — a soft-deleted agent's full config
+stays fetchable by id (`DELETE` only sets `is_active = false`; the row is never removed, "without
+losing run history" per the acceptance criteria). Only `ListAgents` and the plan-limit's
+`CountActiveAgents` exclude inactive agents — a future run-history view (workflow 9/11) needs
+`GetAgent` to still resolve for a run whose agent has since been deleted.
+
+**Plan limit reads `organizations.max_agents` (already in the schema, default 3), not a
+hardcoded tier table** — workflow 15 (billing) isn't built, so every org sits at the column's
+default today; `POST` compares `CountActiveAgents` against it before inserting, accepting the
+same small TOCTOU race this codebase tolerates elsewhere at this scale (no billing-grade
+guarantee needed yet).
+
+**Verified twice**: a full manual `curl` pass against real Postgres (every validation rejection,
+the plan-limit boundary at exactly 3, rename-collision, name-reuse-after-delete), then
+`internal/api/agents/handler_integration_test.go` (22 subtests covering the same scenarios) run
+against real Postgres with a **fake 2-tool MCP registry** — 2 tiny in-memory `gomcp.Server`s
+(`stripe.get_mrr`, `slack.send_message`), same "don't depend on a live third-party service"
+reasoning as `internal/core/mcp/gateway_integration_test.go`'s `echoTokenServer`. `handler_test.go`
+unit-tests `slugify`/`serversFromTools` in isolation. `internal/api/agents` lands at ~75%
+coverage.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -829,9 +888,10 @@ machine — CI runs the authoritative version of the same check regardless.
 | `/api/v1/integrations`, `/api/v1/integrations/{service}/connect` (all auth types), `.../status`, `DELETE .../{service}` | `internal/api/integrations/handler.go` | `middleware.RequireAuth` | Connect/manage third-party integrations (workflow 4) |
 | `/api/v1/integrations/{service}/callback` | `internal/api/integrations/handler.go` | none — org/service recovered from `state`, not a JWT | OAuth provider redirect target (workflow 4) |
 | `/api/v1/documents/upload`, `GET /documents`, `GET /documents/{id}`, `DELETE /documents/{id}`, `POST /documents/{id}/reindex` | `internal/api/documents/handler.go` | `middleware.RequireAuth` | Upload/list/reindex/delete founder documents for RAG (workflow 6) |
+| `GET/POST /api/v1/agents`, `GET /agents/tools`, `GET/PATCH/DELETE /agents/{id}` | `internal/api/agents/handler.go` | `middleware.RequireAuth` | Agent configuration CRUD — no execution (workflow 7) |
 
-(Everything else in `WORKFLOW_PLAN_GO.md` — agents, workflows, runs — is unbuilt. Add rows here
-as routers land.)
+(Everything else in `WORKFLOW_PLAN_GO.md` — workflows, runs — is unbuilt. Add rows here as
+routers land.)
 
 ### Dependency policy
 
