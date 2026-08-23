@@ -4,21 +4,28 @@
 -- style queries elsewhere.
 
 -- name: ListAgents :many
-SELECT id, name, slug, description, agent_type, model, system_prompt,
-       context_window_tokens, max_output_tokens, temperature,
-       policy_scope, allowed_mcp_servers, is_active, version,
-       created_at, updated_at
-FROM agents
-WHERE org_id = $1 AND is_active = true
-ORDER BY created_at DESC;
+-- workflow_count (added for workflow 8's "deleting an agent that has
+-- workflows shows a warning" acceptance criterion) is a correlated
+-- subquery, not a JOIN + GROUP BY — an agent with 0 workflows must still
+-- appear exactly once, and a JOIN would either drop it (INNER) or need the
+-- GROUP BY/aggregate dance anyway for no real benefit at this scale.
+SELECT a.id, a.name, a.slug, a.description, a.agent_type, a.model, a.system_prompt,
+       a.context_window_tokens, a.max_output_tokens, a.temperature,
+       a.policy_scope, a.allowed_mcp_servers, a.is_active, a.version,
+       a.created_at, a.updated_at,
+       (SELECT COUNT(*) FROM workflows w WHERE w.agent_id = a.id AND w.is_active = true) AS workflow_count
+FROM agents a
+WHERE a.org_id = $1 AND a.is_active = true
+ORDER BY a.created_at DESC;
 
 -- name: GetAgent :one
-SELECT id, name, slug, description, agent_type, model, system_prompt,
-       context_window_tokens, max_output_tokens, temperature,
-       policy_scope, allowed_mcp_servers, is_active, version,
-       created_at, updated_at
-FROM agents
-WHERE org_id = $1 AND id = $2;
+SELECT a.id, a.name, a.slug, a.description, a.agent_type, a.model, a.system_prompt,
+       a.context_window_tokens, a.max_output_tokens, a.temperature,
+       a.policy_scope, a.allowed_mcp_servers, a.is_active, a.version,
+       a.created_at, a.updated_at,
+       (SELECT COUNT(*) FROM workflows w WHERE w.agent_id = a.id AND w.is_active = true) AS workflow_count
+FROM agents a
+WHERE a.org_id = $1 AND a.id = $2;
 
 -- name: CountActiveAgents :one
 SELECT COUNT(*) FROM agents WHERE org_id = $1 AND is_active = true;

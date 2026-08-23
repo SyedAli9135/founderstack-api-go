@@ -22,14 +22,16 @@ Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 fro
 Anthropic-only original). See "BYOK API Keys" below.
 
 **Only workflows 1 (bootstrap), 2 (Clerk org/user sync), 3 (BYOK API key management), 4 (connect
-integration — OAuth/API-key), 5 (MCP tool gateway), 6 (document upload / RAG), and 7 (agent
-configuration) are implemented.** Don't assume routes, tables, or packages from later workflows
-in `WORKFLOW_PLAN_GO.md` exist yet — check `internal/api/v1/`, `internal/api/webhooks/`,
-`internal/api/settings/`, `internal/api/identity/`, `internal/api/integrations/`,
-`internal/api/documents/`, and `internal/api/agents/` for what's actually registered. Workflow 7
-is configuration CRUD only — no agent actually runs, calls an LLM, or executes a tool yet; that's
-workflow 9's job (`internal/core/graph`, not built). Workflow 4's code is complete and
-tested, but nothing will actually connect to a live third party until real OAuth app credentials
+integration — OAuth/API-key), 5 (MCP tool gateway), 6 (document upload / RAG), 7 (agent
+configuration), and 8 (workflow config + scheduling) are implemented.** Don't assume routes,
+tables, or packages from later workflows in `WORKFLOW_PLAN_GO.md` exist yet — check
+`internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
+`internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`, and
+`internal/api/workflows/` for what's actually registered. Workflows 7 and 8 are configuration
+only — no agent actually runs, calls an LLM, or executes a tool yet, and a queued workflow run
+never advances past `status='pending'`; all of that is workflow 9's job (`internal/core/graph`,
+not built). Workflow 4's code is complete and tested, but nothing will actually connect to a live
+third party until real OAuth app credentials
 are registered on each provider's dashboard and put in `.env` — see "Third-Party Integrations
 (workflow 4)" below and its "Status" note in `WORKFLOW_PLAN_GO.md`.
 
@@ -654,6 +656,80 @@ reasoning as `internal/core/mcp/gateway_integration_test.go`'s `echoTokenServer`
 unit-tests `slugify`/`serversFromTools` in isolation. `internal/api/agents` lands at ~75%
 coverage.
 
+### Workflow Configuration & Scheduling (workflow 8) — `internal/api/workflows`, `internal/core/workflows`
+
+CRUD over the `workflows` table (trigger type, cron schedule, pause/resume) plus a background
+scheduler that decides *when* a scheduled workflow fires. **Neither "Run Now" nor the scheduler
+executes anything** — both stop at `INSERT`ing a `pending` `workflow_runs` row; turning that into
+an actual run (calling the LLM, executing tools) is workflow 9's job (`internal/core/graph`, not
+built). This is a deliberate, documented boundary carried over from workflow 7's "config only, no
+execution" precedent, not an oversight — a founder clicking "Run Now" today gets a real, durable
+queued-run record they can already see in Postgres (`SELECT * FROM workflow_runs`), not a fake
+success.
+
+**Two columns the plan calls for never existed in either schema.** `task_input_template` and
+`estimated_manual_minutes` are absent from both the Go migration and the Python original's
+`app/models/ai.py` `Workflow` model — the same kind of plan-vs-schema gap workflow 7 hit with
+`Agent`. Migration `000007_workflows_task_input_and_estimate.up.sql` adds both.
+
+**`DELETE` and `PATCH {is_active: false}` (pause) are the exact same operation, deliberately.**
+The plan's own acceptance criteria describe a pause/resume toggle *and* a delete action against
+the same `is_active` column with no second flag to tell them apart — rather than inventing a
+"paused vs. really deleted" distinction the plan never asked for (and `workflow_runs`/
+`workflow_steps` reference `workflows` without `ON DELETE CASCADE`, making a real hard-delete
+risky once a workflow has run history — same reasoning as `organizations`' soft-delete),
+`DeactivateWorkflow` exists only for symmetry with every other resource's `DELETE` verb here.
+**Consequence: `ListWorkflows` does not filter by `is_active`**, unlike `ListAgents`/
+`ListDocuments` — a paused workflow must stay visible so the founder can toggle it back on. The
+"Paused" state is purely a frontend rendering of `is_active`, not a separate backend concept.
+
+**`trigger_type`/`cron_expression`/`next_run_at` are one coupled unit on `PATCH`, handled
+explicitly, not 3 independent `COALESCE`d fields.** `Handler.Update` pre-reads the existing row,
+computes the *effective* trigger config (request value if present, existing value otherwise),
+validates it exactly like `Create` does, and always passes explicit values for all 3 together —
+a bare per-field `COALESCE` could otherwise land the row on `trigger_type='scheduled'` with a
+stale or absent `cron_expression`. Switching *to* `scheduled` requires `cron_expression` in that
+same request even if the workflow already had one from a previous scheduled period; switching
+*away* from `scheduled` clears both `cron_expression` and `next_run_at` (`computeSchedule`
+returns `nil` for both when `triggerType != "scheduled"`).
+
+**`GET /api/v1/agents`/`GET /api/v1/agents/{id}` (workflow 7) now return `workflow_count`** — a
+correlated subquery (`ListAgents`/`GetAgent` in `internal/db/queries/agents.sql`) counting each
+agent's active workflows, added specifically for this workflow's "deleting an agent that has
+workflows shows a warning" acceptance criterion. The agents card grid's existing delete-confirm
+UI (built in workflow 7) renders "N workflows use this agent" above Cancel/Delete when nonzero —
+a warning, not a block, since agent deletion is already non-destructive.
+
+**The scheduler is a plain `time.Ticker`, not `robfig/cron`'s own `Cron{}` runner** —
+`robfig/cron/v3` is used only for `ParseStandard` (validation, both at request-time and inside
+the scheduler's own re-derivation of `next_run_at`) and `Schedule.Next()`, matching the plan's
+literal "goroutine with `time.Ticker` (60s)" spec rather than handing scheduling control to a
+second, competing scheduling library. `internal/core/workflows.RunScheduler` runs once
+immediately at boot (a workflow whose fire time passed while the process was down shouldn't wait
+a full minute to be caught), then every 60s — same "recovery sweep" shape as workflow 6's
+`RecoverStuckJobs` and workflow 4's `RunRefreshJob`. Runs on `app_system` (BYPASSRLS): scanning
+`next_run_at` across every org is inherently cross-tenant.
+
+**Frontend's scheduled-trigger UI is presets + a raw custom cron field, not a live preview** —
+the plan wanted an as-you-type "Next run: Mon May 6, 2026 at 9:00 AM" preview, but computing that
+correctly client-side would need its own cron-parsing npm dependency purely for a preview
+(`internal/db/queries/workflows.sql`'s `computeSchedule` equivalent doesn't exist in JS anywhere
+in this codebase). Instead, the real backend-computed `next_run_at` shows in a success toast right
+after creation, then on the workflow's card from then on — real, not simulated, just not
+instantaneous-as-you-type.
+
+**Verified twice**: a full manual `curl` pass against real Postgres (every validation rejection,
+the coupled trigger-type/cron-expression logic, pause/resume list-visibility, Run Now producing a
+real `workflow_runs` row, the `workflow_count` warning data), then
+`internal/api/workflows/handler_integration_test.go` (17 subtests, same scenarios) and
+`internal/core/workflows/scheduler_integration_test.go` (3 subtests: fires a due workflow and
+advances `next_run_at`, ignores a not-yet-due one, ignores a paused one) — all against real
+Postgres, no fakes needed (nothing here calls Cohere/Pinecone/S3/MCP). `handler_test.go`
+unit-tests `computeSchedule` in isolation. `internal/api/workflows` lands at ~75% coverage;
+`internal/core/workflows` at ~52% — lower because `RunScheduler`'s outer `for`/`select` ticker
+loop itself isn't exercised, only the `tick`/`fireWorkflow` logic it calls each iteration, the
+same accepted gap `RunRefreshJob`'s own loop has.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -889,9 +965,10 @@ machine — CI runs the authoritative version of the same check regardless.
 | `/api/v1/integrations/{service}/callback` | `internal/api/integrations/handler.go` | none — org/service recovered from `state`, not a JWT | OAuth provider redirect target (workflow 4) |
 | `/api/v1/documents/upload`, `GET /documents`, `GET /documents/{id}`, `DELETE /documents/{id}`, `POST /documents/{id}/reindex` | `internal/api/documents/handler.go` | `middleware.RequireAuth` | Upload/list/reindex/delete founder documents for RAG (workflow 6) |
 | `GET/POST /api/v1/agents`, `GET /agents/tools`, `GET/PATCH/DELETE /agents/{id}` | `internal/api/agents/handler.go` | `middleware.RequireAuth` | Agent configuration CRUD — no execution (workflow 7) |
+| `GET/POST /api/v1/workflows`, `GET/PATCH/DELETE /workflows/{id}`, `POST /workflows/{id}/run` | `internal/api/workflows/handler.go` | `middleware.RequireAuth` | Workflow config CRUD + queuing a run — no execution (workflow 8) |
 
-(Everything else in `WORKFLOW_PLAN_GO.md` — workflows, runs — is unbuilt. Add rows here as
-routers land.)
+(Everything else in `WORKFLOW_PLAN_GO.md` — runs (beyond queuing), approvals — is unbuilt. Add
+rows here as routers land.)
 
 ### Dependency policy
 
@@ -919,8 +996,12 @@ its second real caller (`UpsertVectors`). `aws-sdk-go-v2/{config,credentials,ser
 `ledongthuc/pdf` were added in workflow 6, exactly when first used (S3 storage and PDF text
 extraction, respectively) — DOCX extraction deliberately got no new dependency (hand-rolled
 `archive/zip`+`encoding/xml` in `internal/core/documents/extract.go` instead), same reasoning as
-Slack's hand-rolled OAuth and Stripe's plain `net/http`. `sentry-go` and `otel` are still planned
-but not yet in `go.mod` — add each when its workflow lands.
+Slack's hand-rolled OAuth and Stripe's plain `net/http`. `robfig/cron/v3` was added in workflow 8,
+exactly when first used (`ParseStandard`/`Schedule.Next()` for cron validation and `next_run_at`
+computation) — only its parser is used, not its own `Cron{}` job-runner, since workflow 8's
+scheduler is a plain `time.Ticker` per the plan's spec (see "Workflow Configuration & Scheduling"
+above). `sentry-go` and `otel` are still planned but not yet in `go.mod` — add each when its
+workflow lands.
 
 ## Environment Variables
 

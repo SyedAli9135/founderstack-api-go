@@ -231,28 +231,30 @@ type VectorNamespace struct {
 }
 
 type Workflow struct {
-	ID                 pgtype.UUID        `json:"id"`
-	CreatedAt          pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
-	OrgID              pgtype.UUID        `json:"org_id"`
-	AgentID            pgtype.UUID        `json:"agent_id"`
-	TeamID             pgtype.UUID        `json:"team_id"`
-	Name               string             `json:"name"`
-	Description        *string            `json:"description"`
-	TriggerType        string             `json:"trigger_type"`
-	GraphDefinition    []byte             `json:"graph_definition"`
-	InputSchema        []byte             `json:"input_schema"`
-	OutputSchema       []byte             `json:"output_schema"`
-	MaxAgentHops       *int32             `json:"max_agent_hops"`
-	A2aEnabled         *bool              `json:"a2a_enabled"`
-	RequiresApproval   *bool              `json:"requires_approval"`
-	ApprovalConditions []byte             `json:"approval_conditions"`
-	CronExpression     *string            `json:"cron_expression"`
-	Timezone           *string            `json:"timezone"`
-	NextRunAt          pgtype.Timestamptz `json:"next_run_at"`
-	IsActive           *bool              `json:"is_active"`
-	Version            *int32             `json:"version"`
-	CreatedBy          pgtype.UUID        `json:"created_by"`
+	ID                     pgtype.UUID        `json:"id"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	OrgID                  pgtype.UUID        `json:"org_id"`
+	AgentID                pgtype.UUID        `json:"agent_id"`
+	TeamID                 pgtype.UUID        `json:"team_id"`
+	Name                   string             `json:"name"`
+	Description            *string            `json:"description"`
+	TriggerType            string             `json:"trigger_type"`
+	GraphDefinition        []byte             `json:"graph_definition"`
+	InputSchema            []byte             `json:"input_schema"`
+	OutputSchema           []byte             `json:"output_schema"`
+	MaxAgentHops           *int32             `json:"max_agent_hops"`
+	A2aEnabled             *bool              `json:"a2a_enabled"`
+	RequiresApproval       *bool              `json:"requires_approval"`
+	ApprovalConditions     []byte             `json:"approval_conditions"`
+	CronExpression         *string            `json:"cron_expression"`
+	Timezone               *string            `json:"timezone"`
+	NextRunAt              pgtype.Timestamptz `json:"next_run_at"`
+	IsActive               *bool              `json:"is_active"`
+	Version                *int32             `json:"version"`
+	CreatedBy              pgtype.UUID        `json:"created_by"`
+	TaskInputTemplate      *string            `json:"task_input_template"`
+	EstimatedManualMinutes *int32             `json:"estimated_manual_minutes"`
 }
 
 type WorkflowRun struct {

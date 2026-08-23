@@ -87,6 +87,11 @@ type agentView struct {
 	Version             int32           `json:"version"`
 	CreatedAt           time.Time       `json:"created_at"`
 	UpdatedAt           time.Time       `json:"updated_at"`
+	// WorkflowCount (workflow 8) is only populated by List/Get — a
+	// freshly created or updated agent can't have any workflows pointing
+	// at it yet within the same request, so Insert/Update always report 0
+	// rather than needing their own extra query.
+	WorkflowCount int64 `json:"workflow_count"`
 }
 
 // row is the shape shared by every agents-table sqlc row type
@@ -111,6 +116,7 @@ type row struct {
 	Version             *int32
 	CreatedAt           pgtype.Timestamptz
 	UpdatedAt           pgtype.Timestamptz
+	WorkflowCount       int64
 }
 
 func toView(r row) agentView {
@@ -131,31 +137,32 @@ func toView(r row) agentView {
 		Version:             derefInt32(r.Version),
 		CreatedAt:           r.CreatedAt.Time,
 		UpdatedAt:           r.UpdatedAt.Time,
+		WorkflowCount:       r.WorkflowCount,
 	}
 }
 
 func viewFromList(r dbgen.ListAgentsRow) agentView {
 	return toView(row{r.ID, r.Name, r.Slug, r.Description, r.AgentType, r.Model, r.SystemPrompt,
 		r.ContextWindowTokens, r.MaxOutputTokens, r.Temperature, r.PolicyScope, r.AllowedMcpServers,
-		r.IsActive, r.Version, r.CreatedAt, r.UpdatedAt})
+		r.IsActive, r.Version, r.CreatedAt, r.UpdatedAt, r.WorkflowCount})
 }
 
 func viewFromGet(r dbgen.GetAgentRow) agentView {
 	return toView(row{r.ID, r.Name, r.Slug, r.Description, r.AgentType, r.Model, r.SystemPrompt,
 		r.ContextWindowTokens, r.MaxOutputTokens, r.Temperature, r.PolicyScope, r.AllowedMcpServers,
-		r.IsActive, r.Version, r.CreatedAt, r.UpdatedAt})
+		r.IsActive, r.Version, r.CreatedAt, r.UpdatedAt, r.WorkflowCount})
 }
 
 func viewFromInsert(r dbgen.InsertAgentRow) agentView {
 	return toView(row{r.ID, r.Name, r.Slug, r.Description, r.AgentType, r.Model, r.SystemPrompt,
 		r.ContextWindowTokens, r.MaxOutputTokens, r.Temperature, r.PolicyScope, r.AllowedMcpServers,
-		r.IsActive, r.Version, r.CreatedAt, r.UpdatedAt})
+		r.IsActive, r.Version, r.CreatedAt, r.UpdatedAt, 0})
 }
 
 func viewFromUpdate(r dbgen.UpdateAgentRow) agentView {
 	return toView(row{r.ID, r.Name, r.Slug, r.Description, r.AgentType, r.Model, r.SystemPrompt,
 		r.ContextWindowTokens, r.MaxOutputTokens, r.Temperature, r.PolicyScope, r.AllowedMcpServers,
-		r.IsActive, r.Version, r.CreatedAt, r.UpdatedAt})
+		r.IsActive, r.Version, r.CreatedAt, r.UpdatedAt, 0})
 }
 
 // List returns every active agent for the org — GET /api/v1/agents.

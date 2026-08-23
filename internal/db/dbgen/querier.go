@@ -22,6 +22,12 @@ type Querier interface {
 	// "no such agent in this org" (0 rows) and return a real 404.
 	DeactivateAgent(ctx context.Context, arg DeactivateAgentParams) (int64, error)
 	DeactivateKeyByProvider(ctx context.Context, arg DeactivateKeyByProviderParams) (int64, error)
+	// Semantically identical to PATCH {is_active: false} (pause) — kept as its
+	// own endpoint only for symmetry with every other resource's DELETE verb
+	// in this codebase, not because it does anything a pause doesn't already
+	// do. See CLAUDE.md's workflow 8 section for why workflows don't have a
+	// separate "really gone" state the way documents/agents effectively do.
+	DeactivateWorkflow(ctx context.Context, arg DeactivateWorkflowParams) (int64, error)
 	DeleteDocumentChunks(ctx context.Context, docID pgtype.UUID) error
 	// Queries backing BYOK API key management (workflow 3). Run through
 	// app_user via tenant.WithTx — this is genuinely tenant-scoped data, not a
@@ -43,6 +49,8 @@ type Querier interface {
 	GetKeyStatusByProvider(ctx context.Context, arg GetKeyStatusByProviderParams) (GetKeyStatusByProviderRow, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
 	GetOrganizationMaxAgents(ctx context.Context, id pgtype.UUID) (*int32, error)
+	GetWorkflow(ctx context.Context, arg GetWorkflowParams) (GetWorkflowRow, error)
+	GetWorkflowRun(ctx context.Context, arg GetWorkflowRunParams) (GetWorkflowRunRow, error)
 	// Only called after purgeDocumentJob has successfully removed the
 	// Pinecone vectors and the S3 object — see internal/core/documents/purge.go.
 	HardDeleteDocument(ctx context.Context, arg HardDeleteDocumentParams) error
@@ -64,10 +72,26 @@ type Querier interface {
 	// after — one INSERT instead of an insert-then-update dance.
 	InsertDocument(ctx context.Context, arg InsertDocumentParams) error
 	InsertDocumentChunk(ctx context.Context, arg InsertDocumentChunkParams) error
+	// graph_definition is fixed, not user-configurable — every workflow runs
+	// the same planner -> rag_retriever -> executor -> validator -> reporter
+	// pipeline (Workflow 9's node list); nothing in this workflow's spec lets
+	// a founder customize the graph shape itself, only the trigger/schedule
+	// and the agent + task input that pipeline runs against.
+	InsertWorkflow(ctx context.Context, arg InsertWorkflowParams) (InsertWorkflowRow, error)
+	// "Run Now" and the scheduler both stop here — INSERT a pending run row,
+	// nothing consumes it yet. See CLAUDE.md's workflow 8 section: turning
+	// 'pending' rows into actual execution is Workflow 9's job
+	// (internal/core/graph, not built).
+	InsertWorkflowRun(ctx context.Context, arg InsertWorkflowRunParams) (InsertWorkflowRunRow, error)
 	// Queries backing workflow 7 (agent configuration CRUD). All tenant-scoped,
 	// run through app_user via tenant.WithTx like every other feature area in
 	// this file set — nothing here is cross-tenant, unlike the recovery-sweep
 	// style queries elsewhere.
+	// workflow_count (added for workflow 8's "deleting an agent that has
+	// workflows shows a warning" acceptance criterion) is a correlated
+	// subquery, not a JOIN + GROUP BY — an agent with 0 workflows must still
+	// appear exactly once, and a JOIN would either drop it (INNER) or need the
+	// GROUP BY/aggregate dance anyway for no real benefit at this scale.
 	ListAgents(ctx context.Context, orgID pgtype.UUID) ([]ListAgentsRow, error)
 	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
 	ListDocumentChunkPineconeIDs(ctx context.Context, docID pgtype.UUID) ([]string, error)
@@ -76,6 +100,9 @@ type Querier interface {
 	// purgeDocumentJob finishes removing it (the row itself is only ever
 	// hard-deleted after that succeeds — see HardDeleteDocument).
 	ListDocuments(ctx context.Context, orgID pgtype.UUID) ([]ListDocumentsRow, error)
+	// Background scheduler (internal/core/workflows/scheduler.go) — app_system,
+	// never tenant.WithTx; see the file-level comment above.
+	ListDueScheduledWorkflows(ctx context.Context) ([]ListDueScheduledWorkflowsRow, error)
 	// Used only by the background refresh job (app_system pool). Scoped to
 	// oauth_status = 'connected' so a already-expired or revoked connection
 	// isn't retried every 30 minutes forever.
@@ -94,6 +121,14 @@ type Querier interface {
 	// exists to cover. olderThan guards against re-kicking a job that's
 	// still genuinely in flight in *this* process, not actually stuck.
 	ListStuckDocuments(ctx context.Context, updatedAt pgtype.Timestamptz) ([]ListStuckDocumentsRow, error)
+	// Deliberately NOT filtered by is_active, unlike ListAgents/ListDocuments
+	// — pausing a workflow (PATCH is_active=false) must keep it visible so the
+	// founder can toggle it back on; is_active in the response drives the
+	// pause/resume toggle and "Paused" badge client-side. agent_name comes via
+	// a plain JOIN, not a nullable LEFT JOIN: agent_id is NOT NULL and agents
+	// are only ever soft-deleted (never actually removed), so the referenced
+	// row always exists.
+	ListWorkflows(ctx context.Context, orgID pgtype.UUID) ([]ListWorkflowsRow, error)
 	MarkConnectionExpired(ctx context.Context, arg MarkConnectionExpiredParams) (int64, error)
 	MarkConnectionExpiredByIDSystem(ctx context.Context, id pgtype.UUID) (int64, error)
 	MarkDocumentFailed(ctx context.Context, arg MarkDocumentFailedParams) error
@@ -103,6 +138,11 @@ type Querier interface {
 	SoftDeleteDocument(ctx context.Context, arg SoftDeleteDocumentParams) error
 	SoftDeleteOrganizationByClerkOrgID(ctx context.Context, clerkOrgID string) (int64, error)
 	SoftDeleteUserByClerkUserID(ctx context.Context, clerkUserID string) (int64, error)
+	// Same shape as InsertWorkflowRun (triggered_by is NULL — the system, not
+	// a user, triggered this one), used because the scheduler has no
+	// per-request user/org session to run InsertWorkflowRun's tenant.WithTx
+	// variant under.
+	SystemInsertWorkflowRun(ctx context.Context, arg SystemInsertWorkflowRunParams) error
 	// Partial update via COALESCE against sqlc.narg — every field is optional
 	// on the PATCH wire contract; only the ones actually present in the
 	// request are non-nil here. A rename that collides with another active
@@ -117,6 +157,18 @@ type Querier interface {
 	UpdateConnectionTokensByIDSystem(ctx context.Context, arg UpdateConnectionTokensByIDSystemParams) (int64, error)
 	UpdateDocumentProcessing(ctx context.Context, arg UpdateDocumentProcessingParams) error
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (int64, error)
+	// Partial update via COALESCE, same convention as UpdateAgent — but
+	// trigger_type/cron_expression/next_run_at are 3 fields the *handler*
+	// treats as one coupled unit (see internal/api/workflows/handler.go's
+	// Update): it always passes explicit values for all 3 together, computed
+	// from the effective (existing-unless-overridden) trigger config, rather
+	// than relying on COALESCE to reconcile them independently — a bare
+	// COALESCE per-field could otherwise land on a state like
+	// trigger_type='scheduled' with a stale or absent cron_expression.
+	// agent_id is intentionally not updatable here — reassigning a workflow to
+	// a different agent isn't part of this workflow's spec.
+	UpdateWorkflow(ctx context.Context, arg UpdateWorkflowParams) (UpdateWorkflowRow, error)
+	UpdateWorkflowNextRunAt(ctx context.Context, arg UpdateWorkflowNextRunAtParams) error
 	UpsertAPIKey(ctx context.Context, arg UpsertAPIKeyParams) (pgtype.UUID, error)
 	// Queries backing third-party integration connections (workflow 4),
 	// against the mcp_connections table. Per-org reads/writes (connect,
@@ -133,6 +185,19 @@ type Querier interface {
 	// internal/api/webhooks/clerk.go.
 	UpsertOrganization(ctx context.Context, arg UpsertOrganizationParams) (pgtype.UUID, error)
 	UpsertUserForMembership(ctx context.Context, arg UpsertUserForMembershipParams) error
+	// Queries backing workflow 8 (workflow config CRUD + scheduling). Most are
+	// tenant-scoped through app_user via tenant.WithTx, like every other
+	// feature area in this file set. The 3 queries under "background
+	// scheduler" are the deliberate exception — the scheduler scans due
+	// workflows across every org, which is inherently a cross-tenant
+	// system-context operation, so those run on app_system directly, same
+	// reasoning as internal/core/integrations/refresh.go's RunRefreshJob and
+	// internal/core/documents/recover.go's RecoverStuckJobs.
+	// Used at create time to confirm the agent_id a workflow is being pointed
+	// at both belongs to this org and is still active — you shouldn't be able
+	// to assign a workflow to a deactivated agent. Also returns name so the
+	// Create response can embed agent_name without a second query.
+	ValidateAgentForOrg(ctx context.Context, arg ValidateAgentForOrgParams) (ValidateAgentForOrgRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

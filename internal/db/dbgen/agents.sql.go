@@ -43,12 +43,13 @@ func (q *Queries) DeactivateAgent(ctx context.Context, arg DeactivateAgentParams
 }
 
 const getAgent = `-- name: GetAgent :one
-SELECT id, name, slug, description, agent_type, model, system_prompt,
-       context_window_tokens, max_output_tokens, temperature,
-       policy_scope, allowed_mcp_servers, is_active, version,
-       created_at, updated_at
-FROM agents
-WHERE org_id = $1 AND id = $2
+SELECT a.id, a.name, a.slug, a.description, a.agent_type, a.model, a.system_prompt,
+       a.context_window_tokens, a.max_output_tokens, a.temperature,
+       a.policy_scope, a.allowed_mcp_servers, a.is_active, a.version,
+       a.created_at, a.updated_at,
+       (SELECT COUNT(*) FROM workflows w WHERE w.agent_id = a.id AND w.is_active = true) AS workflow_count
+FROM agents a
+WHERE a.org_id = $1 AND a.id = $2
 `
 
 type GetAgentParams struct {
@@ -73,6 +74,7 @@ type GetAgentRow struct {
 	Version             *int32             `json:"version"`
 	CreatedAt           pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	WorkflowCount       int64              `json:"workflow_count"`
 }
 
 func (q *Queries) GetAgent(ctx context.Context, arg GetAgentParams) (GetAgentRow, error) {
@@ -95,6 +97,7 @@ func (q *Queries) GetAgent(ctx context.Context, arg GetAgentParams) (GetAgentRow
 		&i.Version,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.WorkflowCount,
 	)
 	return i, err
 }
@@ -200,13 +203,14 @@ func (q *Queries) InsertAgent(ctx context.Context, arg InsertAgentParams) (Inser
 
 const listAgents = `-- name: ListAgents :many
 
-SELECT id, name, slug, description, agent_type, model, system_prompt,
-       context_window_tokens, max_output_tokens, temperature,
-       policy_scope, allowed_mcp_servers, is_active, version,
-       created_at, updated_at
-FROM agents
-WHERE org_id = $1 AND is_active = true
-ORDER BY created_at DESC
+SELECT a.id, a.name, a.slug, a.description, a.agent_type, a.model, a.system_prompt,
+       a.context_window_tokens, a.max_output_tokens, a.temperature,
+       a.policy_scope, a.allowed_mcp_servers, a.is_active, a.version,
+       a.created_at, a.updated_at,
+       (SELECT COUNT(*) FROM workflows w WHERE w.agent_id = a.id AND w.is_active = true) AS workflow_count
+FROM agents a
+WHERE a.org_id = $1 AND a.is_active = true
+ORDER BY a.created_at DESC
 `
 
 type ListAgentsRow struct {
@@ -226,12 +230,18 @@ type ListAgentsRow struct {
 	Version             *int32             `json:"version"`
 	CreatedAt           pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	WorkflowCount       int64              `json:"workflow_count"`
 }
 
 // Queries backing workflow 7 (agent configuration CRUD). All tenant-scoped,
 // run through app_user via tenant.WithTx like every other feature area in
 // this file set — nothing here is cross-tenant, unlike the recovery-sweep
 // style queries elsewhere.
+// workflow_count (added for workflow 8's "deleting an agent that has
+// workflows shows a warning" acceptance criterion) is a correlated
+// subquery, not a JOIN + GROUP BY — an agent with 0 workflows must still
+// appear exactly once, and a JOIN would either drop it (INNER) or need the
+// GROUP BY/aggregate dance anyway for no real benefit at this scale.
 func (q *Queries) ListAgents(ctx context.Context, orgID pgtype.UUID) ([]ListAgentsRow, error) {
 	rows, err := q.db.Query(ctx, listAgents, orgID)
 	if err != nil {
@@ -258,6 +268,7 @@ func (q *Queries) ListAgents(ctx context.Context, orgID pgtype.UUID) ([]ListAgen
 			&i.Version,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.WorkflowCount,
 		); err != nil {
 			return nil, err
 		}

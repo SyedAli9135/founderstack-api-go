@@ -29,12 +29,14 @@ import (
 	"github.com/founderstack/api/internal/api/settings"
 	v1 "github.com/founderstack/api/internal/api/v1"
 	"github.com/founderstack/api/internal/api/webhooks"
+	workflowsapi "github.com/founderstack/api/internal/api/workflows"
 	"github.com/founderstack/api/internal/config"
 	coredocs "github.com/founderstack/api/internal/core/documents"
 	"github.com/founderstack/api/internal/core/integrations"
 	"github.com/founderstack/api/internal/core/integrations/providers"
 	coremcp "github.com/founderstack/api/internal/core/mcp"
 	mcpservers "github.com/founderstack/api/internal/core/mcp/servers"
+	coreworkflows "github.com/founderstack/api/internal/core/workflows"
 	"github.com/founderstack/api/internal/pkg/vault"
 )
 
@@ -145,6 +147,12 @@ func run() error {
 	// server shuts down on) — see integrations.RunRefreshJob's doc comment
 	// for why this needs systemPool rather than the RLS-scoped dbPool.
 	go integrations.RunRefreshJob(ctx, systemPool, encryptionKey, integrationsRegistry)
+
+	// Workflow 8's background scheduler — same reasoning as the refresh job
+	// above for why this runs on systemPool. Only inserts pending
+	// workflow_runs rows; see coreworkflows.RunScheduler's doc comment for
+	// why it doesn't do anything past that yet.
+	go coreworkflows.RunScheduler(ctx, systemPool)
 
 	srv := &http.Server{
 		Addr:              addr(),
@@ -263,6 +271,10 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiAgents := router.Group("/api/v1")
 	apiAgents.Use(middleware.RequireAuth(systemDB, cfg))
 	agents.NewHandler(db, mcpRegistry).Register(apiAgents)
+
+	apiWorkflows := router.Group("/api/v1")
+	apiWorkflows.Use(middleware.RequireAuth(systemDB, cfg))
+	workflowsapi.NewHandler(db).Register(apiWorkflows)
 
 	return router
 }
