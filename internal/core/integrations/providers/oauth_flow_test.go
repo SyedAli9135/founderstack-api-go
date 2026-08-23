@@ -161,6 +161,61 @@ func TestDiscord_ExchangeRevokeValidate(t *testing.T) {
 	}
 }
 
+// TestDiscord_ExchangeCode_CapturesWebhook proves the webhook.incoming
+// grant's webhook object survives ExchangeCode into Token.Extra — a real
+// bug (silently discarded) until workflow 5's Discord MCP tool needed it.
+func TestDiscord_ExchangeCode_CapturesWebhook(t *testing.T) {
+	d := NewDiscord("cid", "csecret", "https://api.example.com/cb")
+
+	tokenSrv := jsonServer(t, http.StatusOK, map[string]any{
+		"access_token": "discord-access", "refresh_token": "discord-refresh",
+		"token_type": "Bearer", "expires_in": 3600,
+		"webhook": map[string]any{
+			"id":         "223704706495545344",
+			"token":      "3d89bb7572e0fb30d8128367b3b1b44",
+			"channel_id": "223704706495545399",
+			"url":        "https://discord.com/api/webhooks/223704706495545344/3d89bb7572e0fb30d8128367b3b1b44",
+		},
+	})
+	ctx := withIntercept(t, map[string]*httptest.Server{"discord.com": tokenSrv})
+
+	tok, err := d.ExchangeCode(ctx, "code")
+	if err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	want := map[string]string{
+		"webhook_id":         "223704706495545344",
+		"webhook_token":      "3d89bb7572e0fb30d8128367b3b1b44",
+		"webhook_channel_id": "223704706495545399",
+		"webhook_url":        "https://discord.com/api/webhooks/223704706495545344/3d89bb7572e0fb30d8128367b3b1b44",
+	}
+	for k, v := range want {
+		if tok.Extra[k] != v {
+			t.Errorf("Extra[%q] = %q, want %q", k, tok.Extra[k], v)
+		}
+	}
+}
+
+// TestDiscord_ExchangeCode_NoWebhookIsFine proves a grant without the
+// webhook object (e.g. identify-only) doesn't error or panic — Extra
+// just stays nil.
+func TestDiscord_ExchangeCode_NoWebhookIsFine(t *testing.T) {
+	d := NewDiscord("cid", "csecret", "https://api.example.com/cb")
+
+	tokenSrv := jsonServer(t, http.StatusOK, map[string]any{
+		"access_token": "discord-access", "token_type": "Bearer", "expires_in": 3600,
+	})
+	ctx := withIntercept(t, map[string]*httptest.Server{"discord.com": tokenSrv})
+
+	tok, err := d.ExchangeCode(ctx, "code")
+	if err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if len(tok.Extra) != 0 {
+		t.Errorf("Extra = %+v, want empty", tok.Extra)
+	}
+}
+
 func TestNotion_ExchangeAndValidate(t *testing.T) {
 	tokenSrv := jsonServer(t, http.StatusOK, map[string]any{"access_token": "notion-access", "token_type": "bearer"})
 	ctx := withIntercept(t, map[string]*httptest.Server{"api.notion.com": tokenSrv})

@@ -11,12 +11,19 @@ import (
 )
 
 type Querier interface {
-	ClearOrganizationActiveApiKey(ctx context.Context, id pgtype.UUID) error
-	DeactivateAnthropicKey(ctx context.Context, orgID pgtype.UUID) (int64, error)
+	// Only clears active_api_key_id/llm_provider when provider is the org's
+	// *currently active* provider — with multiple providers now storable per
+	// org, deactivating a non-active provider's key must not clobber a
+	// different, still-active provider's pointer.
+	ClearOrganizationActiveApiKeyForProvider(ctx context.Context, arg ClearOrganizationActiveApiKeyForProviderParams) error
+	DeactivateKeyByProvider(ctx context.Context, arg DeactivateKeyByProviderParams) (int64, error)
 	// Queries backing BYOK API key management (workflow 3). Run through
 	// app_user via tenant.WithTx — this is genuinely tenant-scoped data, not a
-	// system-context lookup like clerk_sync.sql or auth.sql.
-	GetActiveAnthropicKeyByOrgID(ctx context.Context, orgID pgtype.UUID) (GetActiveAnthropicKeyByOrgIDRow, error)
+	// system-context lookup like clerk_sync.sql or auth.sql. Provider is a
+	// caller-supplied parameter (llm.ProviderID), not baked into the SQL —
+	// generalized 2026-08-21 from an Anthropic-only literal to support all 5
+	// catalog providers (see internal/core/llm/catalog.go).
+	GetActiveKeyByOrgIDAndProvider(ctx context.Context, arg GetActiveKeyByOrgIDAndProviderParams) (GetActiveKeyByOrgIDAndProviderRow, error)
 	GetActiveOrganizationByID(ctx context.Context, id pgtype.UUID) (GetActiveOrganizationByIDRow, error)
 	// Queries backing request authentication (internal/api/middleware/auth.go).
 	// Run through app_system (BYPASSRLS): resolving "who is this JWT for, and
@@ -24,14 +31,22 @@ type Querier interface {
 	// any tenant context exists to scope an RLS-restricted query by — the same
 	// chicken-and-egg reasoning as the Clerk webhook's org creation.
 	GetActiveUserByClerkUserID(ctx context.Context, clerkUserID string) (GetActiveUserByClerkUserIDRow, error)
-	GetAnthropicKeyStatus(ctx context.Context, orgID pgtype.UUID) (GetAnthropicKeyStatusRow, error)
 	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
+	GetKeyStatusByProvider(ctx context.Context, arg GetKeyStatusByProviderParams) (GetKeyStatusByProviderRow, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
 	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
 	// Used only by the background refresh job (app_system pool). Scoped to
 	// oauth_status = 'connected' so a already-expired or revoked connection
 	// isn't retried every 30 minutes forever.
 	ListExpiringConnectionsSystem(ctx context.Context, tokenExpiresAt pgtype.Timestamptz) ([]ListExpiringConnectionsSystemRow, error)
+	// Every provider the org has ever submitted a key for (valid or not),
+	// annotated with whether it's the org's *currently active* provider —
+	// backs GET /api/v1/settings/api-key/providers, which merges this with
+	// llm.Catalog so the frontend gets one request for "every supported
+	// provider, plus this org's status for each." COALESCE forces a real
+	// false (not SQL NULL) when llm_provider is unset, so the generated Go
+	// field is a plain bool, not a nullable pointer.
+	ListKeyStatuses(ctx context.Context, orgID pgtype.UUID) ([]ListKeyStatusesRow, error)
 	MarkConnectionExpired(ctx context.Context, arg MarkConnectionExpiredParams) (int64, error)
 	MarkConnectionExpiredByIDSystem(ctx context.Context, id pgtype.UUID) (int64, error)
 	RevokeConnection(ctx context.Context, arg RevokeConnectionParams) (int64, error)
@@ -44,7 +59,7 @@ type Querier interface {
 	// having come from ListExpiringConnectionsSystem's own row.
 	UpdateConnectionTokensByIDSystem(ctx context.Context, arg UpdateConnectionTokensByIDSystemParams) (int64, error)
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (int64, error)
-	UpsertAnthropicKey(ctx context.Context, arg UpsertAnthropicKeyParams) (pgtype.UUID, error)
+	UpsertAPIKey(ctx context.Context, arg UpsertAPIKeyParams) (pgtype.UUID, error)
 	// Queries backing third-party integration connections (workflow 4),
 	// against the mcp_connections table. Per-org reads/writes (connect,
 	// callback, api-key, status, delete) run through app_user via

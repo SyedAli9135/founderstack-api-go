@@ -1,5 +1,3 @@
-//go:build integration
-
 package llm
 
 import (
@@ -82,6 +80,46 @@ func TestGetClient_DecryptsAndBuildsClient(t *testing.T) {
 	}
 	if client.Options == nil {
 		t.Fatal("GetClient() returned a zero-value client")
+	}
+}
+
+func TestGetClient_IgnoresOtherProvidersKeys(t *testing.T) {
+	// GetClient is Anthropic-only by design (see the package doc comment)
+	// — an org with only an OpenAI key on file must resolve as "no
+	// Anthropic key", not accidentally pick up the wrong provider's row.
+	systemPool := testSystemPool(t)
+	appPool := testAppPool(t)
+	ctx := context.Background()
+
+	encKey := make([]byte, 32)
+	if _, err := rand.Read(encKey); err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := vault.Encrypt("sk-test-an-openai-shaped-key", encKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var orgID pgtype.UUID
+	if err := systemPool.QueryRow(ctx,
+		"insert into organizations (name, slug, clerk_org_id) values ('OpenAI Only Org', 'openai-only-org', 'clerk_openai_only_org') returning id",
+	).Scan(&orgID); err != nil {
+		t.Fatalf("insert test org: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = systemPool.Exec(context.Background(), "delete from organizations where id = $1", orgID)
+	})
+	if _, err := systemPool.Exec(ctx,
+		`insert into api_key_registry (org_id, provider, key_prefix, encrypted_key, kms_key_id, is_valid)
+		 values ($1, 'openai', 'sk-test...', $2, 'local-aes-gcm', true)`,
+		orgID, encrypted,
+	); err != nil {
+		t.Fatalf("insert test key: %v", err)
+	}
+
+	_, err = GetClient(ctx, appPool, encKey, orgID)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("GetClient() error = %v, want pgx.ErrNoRows — an OpenAI-only org has no Anthropic key", err)
 	}
 }
 

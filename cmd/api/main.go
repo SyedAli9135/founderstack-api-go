@@ -27,6 +27,8 @@ import (
 	"github.com/founderstack/api/internal/config"
 	"github.com/founderstack/api/internal/core/integrations"
 	"github.com/founderstack/api/internal/core/integrations/providers"
+	coremcp "github.com/founderstack/api/internal/core/mcp"
+	mcpservers "github.com/founderstack/api/internal/core/mcp/servers"
 	"github.com/founderstack/api/internal/pkg/vault"
 )
 
@@ -90,6 +92,26 @@ func run() error {
 	}
 
 	integrationsRegistry := newIntegrationsRegistry(cfg)
+
+	// Not wired to any HTTP route or Gateway yet — tool execution is
+	// workflow 9's job (the executor node, once internal/core/graph
+	// exists; that's also when coremcp.NewGateway(dbPool, encryptionKey,
+	// mcpRegistry) actually gets called). Building the registry here
+	// anyway means a wiring bug (a malformed tool schema, a missing
+	// registration) fails the process at boot, not silently the first
+	// time something tries to call a tool.
+	mcpRegistry, err := newMCPRegistry(ctx)
+	if err != nil {
+		return fmt.Errorf("build mcp tool registry: %w", err)
+	}
+	if tools, err := mcpRegistry.ListTools(ctx); err == nil {
+		count := 0
+		for _, ts := range tools {
+			count += len(ts)
+		}
+		logger.Info("mcp tool registry ready", "services", len(tools), "tools", count)
+	}
+
 	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry)
 
 	// Runs until ctx is cancelled (same SIGINT/SIGTERM signal the HTTP
@@ -187,7 +209,7 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	// (RLS-enforced); each handler scopes its own queries via tenant.WithTx.
 	apiSettings := router.Group("/api/v1/settings")
 	apiSettings.Use(middleware.RequireAuth(systemDB, cfg))
-	settings.NewHandler(db, encryptionKey, cfg.AnthropicAPIKeyMockPrefix).Register(apiSettings)
+	settings.NewHandler(db, encryptionKey, cfg.APIKeyMockPrefix).Register(apiSettings)
 
 	apiWebhooks := router.Group("/api/webhooks")
 	webhooks.NewClerkHandler(systemDB, cfg.ClerkWebhookSecret.Expose()).Register(apiWebhooks)
@@ -229,6 +251,16 @@ func newIntegrationsRegistry(cfg *config.Config) *integrations.Registry {
 		providers.NewStripe(),
 		providers.NewGitHub(),
 	)
+}
+
+// newMCPRegistry connects every MCP tool server (workflow 5) —
+// mcpservers.AllServers() is the single place a new tool server needs a
+// new line (shared with cmd/seedtools, which needs the identical map).
+// Every server is wired via mcp.NewInMemoryTransports() inside
+// coremcp.NewRegistry, not called directly — see internal/core/mcp's
+// package doc for why.
+func newMCPRegistry(ctx context.Context) (*coremcp.Registry, error) {
+	return coremcp.NewRegistry(ctx, mcpservers.AllServers())
 }
 
 // corsConfig mirrors app/main.py's CORS policy: wide open in development,

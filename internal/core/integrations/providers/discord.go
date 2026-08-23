@@ -41,12 +41,38 @@ func (d *Discord) GetAuthURL(state string) string {
 	return d.cfg.AuthCodeURL(state)
 }
 
+// ExchangeCode also extracts the incoming webhook Discord's token
+// response carries because of the webhook.incoming scope — a real gap
+// found and fixed while building workflow 5's Discord MCP tool
+// (2026-08-23): toToken alone only copies the standard OAuth2 fields
+// (access/refresh token, expiry), so the webhook object was being
+// silently discarded on every connect until this fix. Discord's REST API
+// has no general "post a message as this user" call reachable from these
+// scopes — the webhook URL *is* the only way workflow 5's send_message
+// tool can post anything, so without this extraction that tool cannot
+// function no matter how it's implemented.
 func (d *Discord) ExchangeCode(ctx context.Context, code string) (*integrations.Token, error) {
 	t, err := d.cfg.Exchange(ctx, code)
 	if err != nil {
 		return nil, err
 	}
-	return toToken(t), nil
+	tok := toToken(t)
+	if webhook, ok := t.Extra("webhook").(map[string]interface{}); ok {
+		tok.Extra = map[string]string{}
+		if url, ok := webhook["url"].(string); ok {
+			tok.Extra["webhook_url"] = url
+		}
+		if id, ok := webhook["id"].(string); ok {
+			tok.Extra["webhook_id"] = id
+		}
+		if wtoken, ok := webhook["token"].(string); ok {
+			tok.Extra["webhook_token"] = wtoken
+		}
+		if channelID, ok := webhook["channel_id"].(string); ok {
+			tok.Extra["webhook_channel_id"] = channelID
+		}
+	}
+	return tok, nil
 }
 
 func (d *Discord) RevokeToken(ctx context.Context, token string) error {

@@ -184,23 +184,26 @@ func UpdateTokens(ctx context.Context, pool *pgxpool.Pool, encryptionKey []byte,
 }
 
 // GetIntegrationToken is the shared lookup MCP tool handlers use to get a
-// usable access token for orgID's connection to service (workflow 5).
+// usable, decrypted Token for orgID's connection to service (workflow 5).
 // Deliberately collapses "never connected" and "row exists but not
 // usable" into two distinct sentinel errors rather than one generic
 // failure, since the MCP gateway needs to tell the founder "connect X"
-// apart from "reconnect X."
-func GetIntegrationToken(ctx context.Context, pool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, service string) (string, error) {
+// apart from "reconnect X." Returns the full Token, not just AccessToken
+// — the MCP Gateway needs Token.Extra too (Discord's `webhook.incoming`
+// grant, e.g., has no usable AccessToken at all for posting a message;
+// the webhook URL in Extra is the only credential that works).
+func GetIntegrationToken(ctx context.Context, pool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, service string) (Token, error) {
 	conn, err := GetConnection(ctx, pool, encryptionKey, orgID, service)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return "", ErrNotConnected
+			return Token{}, ErrNotConnected
 		}
-		return "", err
+		return Token{}, err
 	}
 	if !conn.IsActive || conn.OAuthStatus != "connected" {
-		return "", ErrTokenUnavailable
+		return Token{}, ErrTokenUnavailable
 	}
-	return conn.Token.AccessToken, nil
+	return conn.Token, nil
 }
 
 func encodeToken(tok Token, key []byte) (encrypted string, scopesJSON []byte, err error) {

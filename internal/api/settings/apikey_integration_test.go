@@ -1,15 +1,3 @@
-//go:build integration
-
-// Integration tests for the BYOK settings endpoints, run through the real
-// HTTP stack: middleware.RequireAuth (via the dev-token fallback path —
-// there's no way to obtain a genuinely Clerk-signed JWT in a test
-// environment, so the auth middleware's Clerk-verification branch is
-// covered by auth_test.go's jwkCache unit tests plus manual verification
-// instead; everything downstream of "a caller is authenticated as user X"
-// — including RequireAuth's own DB resolution logic — is fully exercised
-// here) through real Postgres, using both app_system (fixture setup,
-// mirroring how the auth middleware itself resolves identity) and
-// app_user (the actual tenant-scoped business logic under test).
 package settings
 
 import (
@@ -71,9 +59,9 @@ func testEncryptionKey(t *testing.T) []byte {
 func testConfig(t *testing.T) *config.Config {
 	t.Helper()
 	return &config.Config{
-		AppEnv:                    "development",
-		DevTokenSecret:            "test-dev-token-secret",
-		AnthropicAPIKeyMockPrefix: "sk-ant-test-",
+		AppEnv:           "development",
+		DevTokenSecret:   "test-dev-token-secret",
+		APIKeyMockPrefix: "mock-test-key-",
 	}
 }
 
@@ -118,7 +106,7 @@ func testRouter(t *testing.T, systemPool, appPool *pgxpool.Pool, cfg *config.Con
 	r.Use(middleware.RequestID())
 	rg := r.Group("/api/v1/settings")
 	rg.Use(middleware.RequireAuth(systemPool, cfg))
-	NewHandler(appPool, encryptionKey, cfg.AnthropicAPIKeyMockPrefix).Register(rg)
+	NewHandler(appPool, encryptionKey, cfg.APIKeyMockPrefix).Register(rg)
 	return r
 }
 
@@ -193,7 +181,7 @@ func TestSettingsAPIKey_FullLifecycle(t *testing.T) {
 
 	t.Run("submitting a mock-prefixed key succeeds and encrypts at rest", func(t *testing.T) {
 		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/settings/api-key",
-			map[string]string{"api_key": "sk-ant-test-abcdefghijklmnop"})
+			map[string]string{"api_key": "mock-test-key-abcdefghijklmnop"})
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
 		if rec.Code != http.StatusCreated {
@@ -242,8 +230,8 @@ func TestSettingsAPIKey_FullLifecycle(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 			t.Fatal(err)
 		}
-		if got.Data.Provider != "anthropic" || !got.Data.IsValid || got.Data.KeyPrefix != "sk-ant-..." {
-			t.Fatalf("status data = %+v, want provider=anthropic is_valid=true key_prefix=sk-ant-...", got.Data)
+		if got.Data.Provider != "anthropic" || !got.Data.IsValid || got.Data.KeyPrefix != "mock-tes..." {
+			t.Fatalf("status data = %+v, want provider=anthropic is_valid=true key_prefix=mock-tes...", got.Data)
 		}
 	})
 
@@ -289,7 +277,7 @@ func TestSettingsAPIKey_CrossOrgIsolation(t *testing.T) {
 
 	// Org A submits a key.
 	reqA := authedRequest(t, cfg, userA, http.MethodPost, "/api/v1/settings/api-key",
-		map[string]string{"api_key": "sk-ant-test-org-a-only-key"})
+		map[string]string{"api_key": "mock-test-key-org-a-only-key"})
 	recA := httptest.NewRecorder()
 	router.ServeHTTP(recA, reqA)
 	if recA.Code != http.StatusCreated {
@@ -331,5 +319,254 @@ func TestSettingsAPIKey_UnsyncedUserRejected(t *testing.T) {
 	}
 	if !bytes.Contains(rec.Body.Bytes(), []byte("USER_NOT_SYNCHRONIZED")) {
 		t.Fatalf("body = %s, want it to contain USER_NOT_SYNCHRONIZED", rec.Body.String())
+	}
+}
+
+// TestSettingsAPIKey_MultiProvider covers the 2026-08-21 generalization
+// from Anthropic-only to 5 providers: multiple providers' keys coexisting
+// per org, status lookups scoped by provider (not "whichever is active"),
+// and the real bug this generalization could easily have introduced —
+// deleting a non-active provider's key must not clobber a different,
+// still-active provider's pointer on organizations.
+func TestSettingsAPIKey_MultiProvider(t *testing.T) {
+	systemPool := testSystemPool(t)
+	appPool := testAppPool(t)
+	cfg := testConfig(t)
+	encKey := testEncryptionKey(t)
+	router := testRouter(t, systemPool, appPool, cfg, encKey)
+	clerkUserID := testOrgAndUser(t, systemPool)
+
+	activeProvider := func(t *testing.T) *string {
+		t.Helper()
+		var p *string
+		err := systemPool.QueryRow(context.Background(),
+			`select o.llm_provider from organizations o
+			 join users u on u.org_id = o.id
+			 where u.clerk_user_id = $1`, clerkUserID,
+		).Scan(&p)
+		if err != nil {
+			t.Fatalf("query llm_provider: %v", err)
+		}
+		return p
+	}
+
+	t.Run("rejects an unknown provider", func(t *testing.T) {
+		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/settings/api-key",
+			map[string]string{"provider": "made-up-llm", "api_key": "mock-test-key-whatever"})
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("submits an Anthropic key with no provider field (backward compat)", func(t *testing.T) {
+		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/settings/api-key",
+			map[string]string{"api_key": "mock-test-key-anthropic-key"})
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+		}
+		if p := activeProvider(t); p == nil || *p != "anthropic" {
+			t.Fatalf("active provider = %v, want anthropic", p)
+		}
+	})
+
+	t.Run("submits an OpenAI key alongside it", func(t *testing.T) {
+		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/settings/api-key",
+			map[string]string{"provider": "openai", "api_key": "mock-test-key-openai-key"})
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+		}
+		if p := activeProvider(t); p == nil || *p != "openai" {
+			t.Fatalf("active provider = %v, want openai (most recently submitted)", p)
+		}
+	})
+
+	t.Run("both providers' keys coexist independently", func(t *testing.T) {
+		for _, provider := range []string{"anthropic", "openai"} {
+			req := authedRequest(t, cfg, clerkUserID, http.MethodGet,
+				"/api/v1/settings/api-key/status?provider="+provider, nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			var got struct {
+				Data struct {
+					Provider string `json:"provider"`
+					IsValid  bool   `json:"is_valid"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Data.Provider != provider || !got.Data.IsValid {
+				t.Fatalf("provider %s status = %+v, want provider=%s is_valid=true", provider, got.Data, provider)
+			}
+		}
+	})
+
+	t.Run("an unrecognized provider on status is rejected, not treated as no-key", func(t *testing.T) {
+		req := authedRequest(t, cfg, clerkUserID, http.MethodGet,
+			"/api/v1/settings/api-key/status?provider=made-up-llm", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("deleting the non-active provider's key does not clobber the active one", func(t *testing.T) {
+		// OpenAI is currently active (submitted last, above). Deleting
+		// Anthropic's key must leave organizations.llm_provider untouched.
+		req := authedRequest(t, cfg, clerkUserID, http.MethodDelete, "/api/v1/settings/api-key?provider=anthropic", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204; body = %s", rec.Code, rec.Body.String())
+		}
+		if p := activeProvider(t); p == nil || *p != "openai" {
+			t.Fatalf("active provider = %v, want openai (deleting anthropic must not clear it)", p)
+		}
+	})
+
+	t.Run("deleting the active provider's key does clear the org's active pointer", func(t *testing.T) {
+		req := authedRequest(t, cfg, clerkUserID, http.MethodDelete, "/api/v1/settings/api-key?provider=openai", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204; body = %s", rec.Code, rec.Body.String())
+		}
+		if p := activeProvider(t); p != nil {
+			t.Fatalf("active provider = %v, want nil after deleting the active provider's key", *p)
+		}
+	})
+}
+
+type providerListEntry struct {
+	Provider      string  `json:"provider"`
+	Name          string  `json:"name"`
+	KeyPrefixHint string  `json:"key_prefix_hint"`
+	IsConfigured  bool    `json:"is_configured"`
+	IsValid       bool    `json:"is_valid"`
+	IsActive      bool    `json:"is_active"`
+	KeyPrefix     *string `json:"key_prefix"`
+}
+
+func TestSettingsAPIKey_ListProviders(t *testing.T) {
+	systemPool := testSystemPool(t)
+	appPool := testAppPool(t)
+	cfg := testConfig(t)
+	encKey := testEncryptionKey(t)
+	router := testRouter(t, systemPool, appPool, cfg, encKey)
+	clerkUserID := testOrgAndUser(t, systemPool)
+
+	fetchProviders := func(t *testing.T) []providerListEntry {
+		t.Helper()
+		req := authedRequest(t, cfg, clerkUserID, http.MethodGet, "/api/v1/settings/api-key/providers", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+		}
+		var got struct {
+			Data []providerListEntry `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got.Data
+	}
+
+	t.Run("lists all 5 catalog providers before any key is configured", func(t *testing.T) {
+		providers := fetchProviders(t)
+		if len(providers) != 5 {
+			t.Fatalf("len(providers) = %d, want 5; got %+v", len(providers), providers)
+		}
+		want := map[string]bool{"anthropic": false, "openai": false, "gemini": false, "qwen": false, "deepseek": false}
+		for _, p := range providers {
+			if _, ok := want[p.Provider]; !ok {
+				t.Errorf("unexpected provider %q in list", p.Provider)
+			}
+			want[p.Provider] = true
+			if p.IsConfigured || p.IsValid || p.IsActive || p.KeyPrefix != nil {
+				t.Errorf("provider %q = %+v, want all-false/nil before any submission", p.Provider, p)
+			}
+			if p.Name == "" || p.KeyPrefixHint == "" {
+				t.Errorf("provider %q missing catalog metadata: %+v", p.Provider, p)
+			}
+		}
+		for provider, seen := range want {
+			if !seen {
+				t.Errorf("provider %q missing from list", provider)
+			}
+		}
+	})
+
+	t.Run("reflects submitted keys and which one is active", func(t *testing.T) {
+		for _, body := range []map[string]string{
+			{"api_key": "mock-test-key-anthropic"}, // no provider field -> defaults anthropic
+			{"provider": "openai", "api_key": "mock-test-key-openai-here"},
+		} {
+			req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/settings/api-key", body)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("submit %v: status = %d, want 201; body = %s", body, rec.Code, rec.Body.String())
+			}
+		}
+
+		byProvider := make(map[string]providerListEntry)
+		for _, p := range fetchProviders(t) {
+			byProvider[p.Provider] = p
+		}
+
+		anthropic := byProvider["anthropic"]
+		if !anthropic.IsConfigured || !anthropic.IsValid || anthropic.IsActive || anthropic.KeyPrefix == nil {
+			t.Errorf("anthropic = %+v, want configured+valid, not active (openai submitted after it)", anthropic)
+		}
+		openai := byProvider["openai"]
+		if !openai.IsConfigured || !openai.IsValid || !openai.IsActive || openai.KeyPrefix == nil {
+			t.Errorf("openai = %+v, want configured+valid+active (submitted most recently)", openai)
+		}
+		gemini := byProvider["gemini"]
+		if gemini.IsConfigured || gemini.KeyPrefix != nil {
+			t.Errorf("gemini = %+v, want untouched", gemini)
+		}
+	})
+}
+
+func TestSettingsAPIKey_ListProviders_CrossOrgIsolation(t *testing.T) {
+	systemPool := testSystemPool(t)
+	appPool := testAppPool(t)
+	cfg := testConfig(t)
+	encKey := testEncryptionKey(t)
+	router := testRouter(t, systemPool, appPool, cfg, encKey)
+
+	userA := testOrgAndUser(t, systemPool)
+	userB := testOrgAndUser(t, systemPool)
+
+	reqA := authedRequest(t, cfg, userA, http.MethodPost, "/api/v1/settings/api-key",
+		map[string]string{"api_key": "mock-test-key-org-a-isolation"})
+	recA := httptest.NewRecorder()
+	router.ServeHTTP(recA, reqA)
+	if recA.Code != http.StatusCreated {
+		t.Fatalf("org A submit: status = %d, want 201; body = %s", recA.Code, recA.Body.String())
+	}
+
+	reqB := authedRequest(t, cfg, userB, http.MethodGet, "/api/v1/settings/api-key/providers", nil)
+	recB := httptest.NewRecorder()
+	router.ServeHTTP(recB, reqB)
+	var got struct {
+		Data []providerListEntry `json:"data"`
+	}
+	if err := json.Unmarshal(recB.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range got.Data {
+		if p.IsConfigured {
+			t.Fatalf("org B sees provider %q as configured — cross-tenant leak: %+v", p.Provider, got.Data)
+		}
 	}
 }

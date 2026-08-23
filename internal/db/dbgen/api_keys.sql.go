@@ -11,35 +11,55 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const clearOrganizationActiveApiKey = `-- name: ClearOrganizationActiveApiKey :exec
-UPDATE organizations SET active_api_key_id = NULL WHERE id = $1
+const clearOrganizationActiveApiKeyForProvider = `-- name: ClearOrganizationActiveApiKeyForProvider :exec
+UPDATE organizations SET active_api_key_id = NULL, llm_provider = NULL
+WHERE id = $1 AND llm_provider = $2
 `
 
-func (q *Queries) ClearOrganizationActiveApiKey(ctx context.Context, id pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, clearOrganizationActiveApiKey, id)
+type ClearOrganizationActiveApiKeyForProviderParams struct {
+	ID          pgtype.UUID `json:"id"`
+	LlmProvider *string     `json:"llm_provider"`
+}
+
+// Only clears active_api_key_id/llm_provider when provider is the org's
+// *currently active* provider — with multiple providers now storable per
+// org, deactivating a non-active provider's key must not clobber a
+// different, still-active provider's pointer.
+func (q *Queries) ClearOrganizationActiveApiKeyForProvider(ctx context.Context, arg ClearOrganizationActiveApiKeyForProviderParams) error {
+	_, err := q.db.Exec(ctx, clearOrganizationActiveApiKeyForProvider, arg.ID, arg.LlmProvider)
 	return err
 }
 
-const deactivateAnthropicKey = `-- name: DeactivateAnthropicKey :execrows
-UPDATE api_key_registry SET is_valid = false WHERE org_id = $1 AND provider = 'anthropic'
+const deactivateKeyByProvider = `-- name: DeactivateKeyByProvider :execrows
+UPDATE api_key_registry SET is_valid = false WHERE org_id = $1 AND provider = $2
 `
 
-func (q *Queries) DeactivateAnthropicKey(ctx context.Context, orgID pgtype.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, deactivateAnthropicKey, orgID)
+type DeactivateKeyByProviderParams struct {
+	OrgID    pgtype.UUID `json:"org_id"`
+	Provider string      `json:"provider"`
+}
+
+func (q *Queries) DeactivateKeyByProvider(ctx context.Context, arg DeactivateKeyByProviderParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deactivateKeyByProvider, arg.OrgID, arg.Provider)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
 }
 
-const getActiveAnthropicKeyByOrgID = `-- name: GetActiveAnthropicKeyByOrgID :one
+const getActiveKeyByOrgIDAndProvider = `-- name: GetActiveKeyByOrgIDAndProvider :one
 
 SELECT id, encrypted_key, key_prefix, is_valid
 FROM api_key_registry
-WHERE org_id = $1 AND provider = 'anthropic' AND is_valid = true
+WHERE org_id = $1 AND provider = $2 AND is_valid = true
 `
 
-type GetActiveAnthropicKeyByOrgIDRow struct {
+type GetActiveKeyByOrgIDAndProviderParams struct {
+	OrgID    pgtype.UUID `json:"org_id"`
+	Provider string      `json:"provider"`
+}
+
+type GetActiveKeyByOrgIDAndProviderRow struct {
 	ID           pgtype.UUID `json:"id"`
 	EncryptedKey string      `json:"encrypted_key"`
 	KeyPrefix    string      `json:"key_prefix"`
@@ -48,10 +68,13 @@ type GetActiveAnthropicKeyByOrgIDRow struct {
 
 // Queries backing BYOK API key management (workflow 3). Run through
 // app_user via tenant.WithTx — this is genuinely tenant-scoped data, not a
-// system-context lookup like clerk_sync.sql or auth.sql.
-func (q *Queries) GetActiveAnthropicKeyByOrgID(ctx context.Context, orgID pgtype.UUID) (GetActiveAnthropicKeyByOrgIDRow, error) {
-	row := q.db.QueryRow(ctx, getActiveAnthropicKeyByOrgID, orgID)
-	var i GetActiveAnthropicKeyByOrgIDRow
+// system-context lookup like clerk_sync.sql or auth.sql. Provider is a
+// caller-supplied parameter (llm.ProviderID), not baked into the SQL —
+// generalized 2026-08-21 from an Anthropic-only literal to support all 5
+// catalog providers (see internal/core/llm/catalog.go).
+func (q *Queries) GetActiveKeyByOrgIDAndProvider(ctx context.Context, arg GetActiveKeyByOrgIDAndProviderParams) (GetActiveKeyByOrgIDAndProviderRow, error) {
+	row := q.db.QueryRow(ctx, getActiveKeyByOrgIDAndProvider, arg.OrgID, arg.Provider)
+	var i GetActiveKeyByOrgIDAndProviderRow
 	err := row.Scan(
 		&i.ID,
 		&i.EncryptedKey,
@@ -61,13 +84,18 @@ func (q *Queries) GetActiveAnthropicKeyByOrgID(ctx context.Context, orgID pgtype
 	return i, err
 }
 
-const getAnthropicKeyStatus = `-- name: GetAnthropicKeyStatus :one
+const getKeyStatusByProvider = `-- name: GetKeyStatusByProvider :one
 SELECT provider, is_valid, key_prefix, updated_at, last_used_at
 FROM api_key_registry
-WHERE org_id = $1 AND provider = 'anthropic'
+WHERE org_id = $1 AND provider = $2
 `
 
-type GetAnthropicKeyStatusRow struct {
+type GetKeyStatusByProviderParams struct {
+	OrgID    pgtype.UUID `json:"org_id"`
+	Provider string      `json:"provider"`
+}
+
+type GetKeyStatusByProviderRow struct {
 	Provider   string             `json:"provider"`
 	IsValid    *bool              `json:"is_valid"`
 	KeyPrefix  string             `json:"key_prefix"`
@@ -75,9 +103,9 @@ type GetAnthropicKeyStatusRow struct {
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 }
 
-func (q *Queries) GetAnthropicKeyStatus(ctx context.Context, orgID pgtype.UUID) (GetAnthropicKeyStatusRow, error) {
-	row := q.db.QueryRow(ctx, getAnthropicKeyStatus, orgID)
-	var i GetAnthropicKeyStatusRow
+func (q *Queries) GetKeyStatusByProvider(ctx context.Context, arg GetKeyStatusByProviderParams) (GetKeyStatusByProviderRow, error) {
+	row := q.db.QueryRow(ctx, getKeyStatusByProvider, arg.OrgID, arg.Provider)
+	var i GetKeyStatusByProviderRow
 	err := row.Scan(
 		&i.Provider,
 		&i.IsValid,
@@ -88,23 +116,81 @@ func (q *Queries) GetAnthropicKeyStatus(ctx context.Context, orgID pgtype.UUID) 
 	return i, err
 }
 
+const listKeyStatuses = `-- name: ListKeyStatuses :many
+SELECT
+    r.provider,
+    r.is_valid,
+    r.key_prefix,
+    r.updated_at,
+    r.last_used_at,
+    COALESCE(o.llm_provider = r.provider AND o.active_api_key_id = r.id, false)::bool AS is_active
+FROM api_key_registry r
+JOIN organizations o ON o.id = r.org_id
+WHERE r.org_id = $1
+ORDER BY r.provider
+`
+
+type ListKeyStatusesRow struct {
+	Provider   string             `json:"provider"`
+	IsValid    *bool              `json:"is_valid"`
+	KeyPrefix  string             `json:"key_prefix"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
+	IsActive   bool               `json:"is_active"`
+}
+
+// Every provider the org has ever submitted a key for (valid or not),
+// annotated with whether it's the org's *currently active* provider —
+// backs GET /api/v1/settings/api-key/providers, which merges this with
+// llm.Catalog so the frontend gets one request for "every supported
+// provider, plus this org's status for each." COALESCE forces a real
+// false (not SQL NULL) when llm_provider is unset, so the generated Go
+// field is a plain bool, not a nullable pointer.
+func (q *Queries) ListKeyStatuses(ctx context.Context, orgID pgtype.UUID) ([]ListKeyStatusesRow, error) {
+	rows, err := q.db.Query(ctx, listKeyStatuses, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListKeyStatusesRow
+	for rows.Next() {
+		var i ListKeyStatusesRow
+		if err := rows.Scan(
+			&i.Provider,
+			&i.IsValid,
+			&i.KeyPrefix,
+			&i.UpdatedAt,
+			&i.LastUsedAt,
+			&i.IsActive,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setOrganizationActiveApiKey = `-- name: SetOrganizationActiveApiKey :exec
-UPDATE organizations SET active_api_key_id = $2, onboarding_completed = true WHERE id = $1
+UPDATE organizations SET active_api_key_id = $2, llm_provider = $3, onboarding_completed = true WHERE id = $1
 `
 
 type SetOrganizationActiveApiKeyParams struct {
 	ID             pgtype.UUID `json:"id"`
 	ActiveApiKeyID pgtype.UUID `json:"active_api_key_id"`
+	LlmProvider    *string     `json:"llm_provider"`
 }
 
 func (q *Queries) SetOrganizationActiveApiKey(ctx context.Context, arg SetOrganizationActiveApiKeyParams) error {
-	_, err := q.db.Exec(ctx, setOrganizationActiveApiKey, arg.ID, arg.ActiveApiKeyID)
+	_, err := q.db.Exec(ctx, setOrganizationActiveApiKey, arg.ID, arg.ActiveApiKeyID, arg.LlmProvider)
 	return err
 }
 
-const upsertAnthropicKey = `-- name: UpsertAnthropicKey :one
+const upsertAPIKey = `-- name: UpsertAPIKey :one
 INSERT INTO api_key_registry (org_id, provider, key_prefix, encrypted_key, kms_key_id, is_valid)
-VALUES ($1, 'anthropic', $2, $3, $4, true)
+VALUES ($1, $2, $3, $4, $5, true)
 ON CONFLICT (org_id, provider) DO UPDATE SET
     key_prefix = EXCLUDED.key_prefix,
     encrypted_key = EXCLUDED.encrypted_key,
@@ -113,16 +199,18 @@ ON CONFLICT (org_id, provider) DO UPDATE SET
 RETURNING id
 `
 
-type UpsertAnthropicKeyParams struct {
+type UpsertAPIKeyParams struct {
 	OrgID        pgtype.UUID `json:"org_id"`
+	Provider     string      `json:"provider"`
 	KeyPrefix    string      `json:"key_prefix"`
 	EncryptedKey string      `json:"encrypted_key"`
 	KmsKeyID     string      `json:"kms_key_id"`
 }
 
-func (q *Queries) UpsertAnthropicKey(ctx context.Context, arg UpsertAnthropicKeyParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, upsertAnthropicKey,
+func (q *Queries) UpsertAPIKey(ctx context.Context, arg UpsertAPIKeyParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, upsertAPIKey,
 		arg.OrgID,
+		arg.Provider,
 		arg.KeyPrefix,
 		arg.EncryptedKey,
 		arg.KmsKeyID,
