@@ -11,6 +11,9 @@ import (
 	"syscall"
 	"time"
 
+	coherecli "github.com/cohere-ai/cohere-go/v2/client"
+	coreoption "github.com/cohere-ai/cohere-go/v2/option"
+
 	"github.com/clerk/clerk-sdk-go/v2"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -18,6 +21,7 @@ import (
 	"github.com/pinecone-io/go-pinecone/v5/pinecone"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/founderstack/api/internal/api/documents"
 	"github.com/founderstack/api/internal/api/identity"
 	integrationsapi "github.com/founderstack/api/internal/api/integrations"
 	"github.com/founderstack/api/internal/api/middleware"
@@ -25,6 +29,7 @@ import (
 	v1 "github.com/founderstack/api/internal/api/v1"
 	"github.com/founderstack/api/internal/api/webhooks"
 	"github.com/founderstack/api/internal/config"
+	coredocs "github.com/founderstack/api/internal/core/documents"
 	"github.com/founderstack/api/internal/core/integrations"
 	"github.com/founderstack/api/internal/core/integrations/providers"
 	coremcp "github.com/founderstack/api/internal/core/mcp"
@@ -112,7 +117,28 @@ func run() error {
 		logger.Info("mcp tool registry ready", "services", len(tools), "tools", count)
 	}
 
-	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry)
+	// Workflow 6 (document upload / RAG). Pinecone is required here (unlike
+	// newPineconeClient's nil-if-unconfigured fallback for the health
+	// check) — a document upload with no vector store to index into isn't
+	// a degraded mode, it's a broken one, so a missing PINECONE_API_KEY
+	// fails boot via the required-fields check in config.Load, and this
+	// constructor assumes pineconeClient is non-nil.
+	docsStore, err := coredocs.NewStore(ctx, cfg.AWSRegion, cfg.AWSAccessKeyID, cfg.AWSSecretAccessKey.Expose(), cfg.AWSS3EndpointURL, cfg.S3BucketDocuments)
+	if err != nil {
+		return fmt.Errorf("build documents s3 store: %w", err)
+	}
+	docsProcessor, err := newDocumentsProcessor(ctx, cfg, dbPool, docsStore, pineconeClient)
+	if err != nil {
+		return fmt.Errorf("build documents processor: %w", err)
+	}
+
+	// One-time sweep for any document whose processing/purge goroutine was
+	// lost to a prior process restart — see RecoverStuckJobs's doc comment
+	// for why this is the accepted tradeoff of goroutines over a durable
+	// job queue.
+	docsProcessor.RecoverStuckJobs(ctx, systemPool)
+
+	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor)
 
 	// Runs until ctx is cancelled (same SIGINT/SIGTERM signal the HTTP
 	// server shuts down on) — see integrations.RunRefreshJob's doc comment
@@ -189,7 +215,7 @@ func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	return client, nil
 }
 
-func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry) *gin.Engine {
+func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor) *gin.Engine {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -229,6 +255,10 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiIntegrationsCallback := router.Group("/api/v1/integrations")
 	intHandler.RegisterCallback(apiIntegrationsCallback)
 
+	apiDocuments := router.Group("/api/v1")
+	apiDocuments.Use(middleware.RequireAuth(systemDB, cfg))
+	documents.NewHandler(db, docsStore, docsProcessor).Register(apiDocuments)
+
 	return router
 }
 
@@ -261,6 +291,35 @@ func newIntegrationsRegistry(cfg *config.Config) *integrations.Registry {
 // package doc for why.
 func newMCPRegistry(ctx context.Context) (*coremcp.Registry, error) {
 	return coremcp.NewRegistry(ctx, mcpservers.AllServers())
+}
+
+// newDocumentsProcessor builds workflow 6's Cohere + Pinecone-backed
+// Processor. pineconeClient is assumed non-nil — see its call site's
+// comment for why documents treats Pinecone as required rather than
+// optional the way the health check does.
+func newDocumentsProcessor(ctx context.Context, cfg *config.Config, appPool *pgxpool.Pool, store *coredocs.Store, pineconeClient *pinecone.Client) (*coredocs.Processor, error) {
+	// WithMaxAttempts(7): found live, not from Cohere's docs — a small test
+	// upload (28 chunks, one partial batch) embedded fine, but a real 27MB
+	// PDF (480+ chunks, several full batches) started failing partway
+	// through with Cohere's trial-tier "100000 tokens per minute" 429. The
+	// SDK's own retrier (internal/retrier.go) already backs off
+	// exponentially (1s/2s/4s/8s/16s/32s, capped at 60s, ±10% jitter,
+	// Retry-After-aware) but only retries twice by default — nowhere near
+	// enough to survive a per-minute rate-limit window. 7 attempts gives
+	// ~63s of cumulative backoff, comfortably covering one full window
+	// reset without failing the whole document over a transient cap.
+	cohereClient := coherecli.NewClient(coreoption.WithToken(cfg.CohereAPIKey.Expose()), coreoption.WithMaxAttempts(7))
+
+	idx, err := pineconeClient.DescribeIndex(ctx, cfg.PineconeIndexRAG)
+	if err != nil {
+		return nil, fmt.Errorf("describe pinecone rag index %q: %w", cfg.PineconeIndexRAG, err)
+	}
+	idxConn, err := pineconeClient.Index(pinecone.NewIndexConnParams{Host: idx.Host})
+	if err != nil {
+		return nil, fmt.Errorf("connect to pinecone rag index: %w", err)
+	}
+
+	return coredocs.NewProcessor(appPool, store, coredocs.NewCohereEmbedder(cohereClient), coredocs.NewPineconeIndex(idxConn)), nil
 }
 
 // corsConfig mirrors app/main.py's CORS policy: wide open in development,

@@ -66,6 +66,7 @@ jobs:
         run: >
           make coverage
           SYSTEM_DATABASE_URL="postgresql://app_system:app_system_password@localhost:5432/founderstack?sslmode=disable"
+          APP_DATABASE_URL="postgresql://app_user:app_password@localhost:5432/founderstack?sslmode=disable"
 
       - name: Upload coverage report
         if: always()

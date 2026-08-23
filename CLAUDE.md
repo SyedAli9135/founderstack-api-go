@@ -21,11 +21,12 @@ BYOK is **not** Claude-only: `internal/core/llm` validates and stores keys for 5
 Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 from an
 Anthropic-only original). See "BYOK API Keys" below.
 
-**Only workflows 1 (bootstrap), 2 (Clerk org/user sync), 3 (BYOK API key management), and 4
-(connect integration — OAuth/API-key) are implemented.** Don't assume routes, tables, or
-packages from later workflows in `WORKFLOW_PLAN_GO.md` exist yet — check `internal/api/v1/`,
-`internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`, and
-`internal/api/integrations/` for what's actually registered. Workflow 4's code is complete and
+**Only workflows 1 (bootstrap), 2 (Clerk org/user sync), 3 (BYOK API key management), 4 (connect
+integration — OAuth/API-key), 5 (MCP tool gateway), and 6 (document upload / RAG) are
+implemented.** Don't assume routes, tables, or packages from later workflows in
+`WORKFLOW_PLAN_GO.md` exist yet — check `internal/api/v1/`, `internal/api/webhooks/`,
+`internal/api/settings/`, `internal/api/identity/`, `internal/api/integrations/`, and
+`internal/api/documents/` for what's actually registered. Workflow 4's code is complete and
 tested, but nothing will actually connect to a live third party until real OAuth app credentials
 are registered on each provider's dashboard and put in `.env` — see "Third-Party Integrations
 (workflow 4)" below and its "Status" note in `WORKFLOW_PLAN_GO.md`.
@@ -501,6 +502,99 @@ a real Stripe/Slack call) to prove the token fetch/decrypt/delivery plumbing wor
 depending on any third-party API accepting a fake token. 2 more (`internal/core/integrations/providers/oauth_flow_test.go`)
 cover Discord's webhook-extraction fix specifically.
 
+### Document Upload / RAG (workflow 6) — `internal/core/documents`, `internal/api/documents`
+
+Founder-uploaded documents (legal agreements, financial reports, SOPs) go through
+upload → S3 store → text extraction → chunk → Cohere-embed → Pinecone-upsert, the same
+Cohere/Pinecone pair workflow 5's `cmd/seedtools` uses for tool descriptions — but a different
+model (`embed-multilingual-v3.0`, not `embed-english-v3.0`): tool descriptions are English by
+construction, a founder's documents aren't. `internal/core/documents.Processor` (built once in
+`cmd/api/main.go::newDocumentsProcessor`) owns the whole pipeline; `internal/api/documents.Handler`
+is a thin HTTP layer over it — `Upload`/`Delete`/`Reindex` each kick off `go processor.Process(...)`
+/`Purge(...)`/`Reindex(...)` on a detached `context.Background()`, not `c.Request.Context()`,
+since the goroutine needs to keep running well past the request that started it.
+
+**Background jobs are plain goroutines + a boot-time recovery sweep, not `riverqueue/river`** —
+the same tradeoff workflow 5's design note discusses for tool execution, made explicitly here
+too (founder's choice when asked, 2026-08-23): `Store`s the whole pipeline needs — S3
+(`aws-sdk-go-v2/service/s3`, LocalStack-compatible via `BaseEndpoint`+`UsePathStyle` when
+`AWS_S3_ENDPOINT_URL` is set), text extraction (`ledongthuc/pdf` for PDF; hand-rolled
+`archive/zip`+`encoding/xml` for DOCX — no dependency needed, matches this codebase's
+dependency-minimalism policy; direct read for TXT/MD), and a hand-written recursive splitter
+(`internal/core/documents/splitter.go`, 1024 chars/128 overlap, cascading
+`["\n\n", "\n", ". ", " "]` separators, mirroring `RecursiveCharacterTextSplitter`). What a
+durable queue buys over this — surviving a process restart mid-job — is covered instead by
+`Processor.RecoverStuckJobs` (`internal/core/documents/recover.go`), run once at boot on
+`app_system` (cross-tenant scan, same reasoning as the integrations refresh job): any document
+still `pending`/`processing`/`deleting` after a 10-minute `stuckThreshold` gets re-dispatched.
+
+**Cohere's real batch cap is 96 texts, not the 100 the original spec sketched** — caught live,
+not from documentation: a small test upload (28 chunks, under one batch) passed fine at 100, but
+a real 27MB PDF (480+ chunks, multiple full batches) failed on its second batch with Cohere's
+actual `"total number of texts must be at most 96 - received 100"`. `embedBatchSize` in
+`internal/core/documents/processor.go` is `96`.
+
+**Large documents can outlast Cohere's per-minute rate limit — caught live, fixed by
+configuring the SDK's own retrier, not by writing a new one.** The same 27MB PDF that found the
+96-cap bug then failed differently once past it: several batches in, a 429 with
+`"trial token rate limit exceeded, limit is 100000 tokens per minute"`. cohere-go/v2 already
+retries 429/408/5xx internally with jittered exponential backoff and `Retry-After` support
+(`internal/retrier.go` in the SDK) — but only 2 attempts by default, nowhere near enough to
+survive a per-minute window. The fix is one line in `cmd/api/main.go::newDocumentsProcessor`:
+`coherecli.NewClient(..., coreoption.WithMaxAttempts(7))`, giving ~63s of cumulative backoff
+(1s/2s/4s/8s/16s/32s between the 7 attempts) — comfortably past one window reset. An
+outer hand-rolled retry loop was tried first and reverted: it just duplicated (worse — no
+jitter, no `Retry-After` awareness) what the SDK already does, and layering it on top of the
+SDK's own retrier made every outer attempt itself retry internally, which is what
+`internal/core/documents/deps_test.go`'s `TestCohereEmbedder_*` tests actually pin down against
+a fake `httptest` server standing in for Cohere.
+
+**Processor depends on 3 small interfaces, not the concrete S3/Cohere/Pinecone SDK types**
+(`internal/core/documents/deps.go`: `BlobStore`, `Embedder`, `VectorIndex`) — the same
+interface-segregation reasoning `internal/core/integrations` documents for its
+`Provider`/`OAuthProvider`/... split, added specifically so the pipeline could be integration-
+tested against fakes instead of needing LocalStack, a real Cohere key, and a real Pinecone index
+in CI (none of which `.github/workflows/ci.yml` provisions — only a throwaway Postgres). `*Store`
+satisfies `BlobStore` structurally; `Embedder`/`VectorIndex` wrap the Cohere and Pinecone clients
+via `NewCohereEmbedder`/`NewPineconeIndex` (the latter needed because `*pinecone.IndexConnection`'s
+own `WithNamespace` returns a concrete type, not an interface, so a thin adapter is what makes
+per-namespace chaining (`.Namespace(ns).Upsert(...)`) fake-able at all).
+
+**Purge order matters and is deliberate** (`internal/core/documents/purge.go`): Pinecone vectors,
+then the S3 object, then the Postgres rows — external deletions before local ones, and only
+after both externals actually succeed, so a failure never leaves a `documents` row with nothing
+behind it or (worse) orphaned vectors/files nothing points at anymore. Each external delete gets
+one retry, not a full backoff loop (`retryOnce`, matches the Python original's actual behavior
+per `WORKFLOW_PLAN_GO.md`). `Reindex` (`internal/core/documents/reindex.go`) clears
+`document_chunks` and best-effort deletes the old Pinecone vectors (logged via `slog.Warn`, not
+fatal to the reindex — the `pinecone_id` scheme is `{doc_id}-{chunk_index}`, so a fresh
+`Process` run overwrites every old id as long as the new chunk count isn't smaller) before
+re-running `Process` from scratch.
+
+**Verified twice: once by hand against real infra, once as a real automated suite.** The first
+pass (2026-08-23) was a live, manual pass against real Postgres + LocalStack S3 + real Cohere +
+real Pinecone — full upload → poll → indexed → reindex → delete → purge cycle for a `.txt`, a
+real 27MB PDF, and a real LibreOffice-generated `.docx`, confirming via direct queries (not just
+trusting a 200) that S3 object count and `document_chunks` row count both hit 0 after delete.
+That pass is what found both the 96-batch-cap bug and the rate-limit bug above — but it wasn't
+captured as a test, so it caught bugs once and would never catch a regression. The second pass
+closed that gap: `internal/core/documents/processor_integration_test.go` (5 tests — `Process`
+success and embed-failure, `Purge` full-cleanup and idempotent-no-op, `Reindex`) and
+`internal/api/documents/handler_integration_test.go` (one `t.Run`-subtested full HTTP lifecycle
+— auth, validation, upload, background-processing, list, reindex, delete+purge, plus 404/400
+error paths) both run against real Postgres but fakes for `BlobStore`/`Embedder`/`VectorIndex` —
+same "don't depend on a live third-party service to keep the suite green" reasoning as every
+other integration test in this codebase, and what makes these runnable in CI at all (see
+"Testing Strategy & CI" below for the coverage-gate story this fixed). One real bug the *test*
+itself had, worth knowing if you touch these files: an early version of the reindex subtest
+polled for `processing_status == "indexed"` without checking whether that was the *new* run or
+a stale reading of the *previous* run's terminal state — it could pass while the actual reindex
+was still in flight (or had already failed) in the background. Fixed by comparing `indexed_at`
+before/after (`waitForFreshIndexed`), not just the status string. Unit tests
+(`internal/core/documents/splitter_test.go`, `extract_test.go`, `deps_test.go`) cover the pure
+chunking/extraction logic and the Cohere retry configuration without any live dependency, same
+split as every other package in this codebase.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -677,6 +771,24 @@ target, and none is needed yet (see conversation history: no budget, no deployme
 exists currently). Costs nothing at this project's scale (GitHub Actions' free tier is 2,000
 minutes/month for private repos; this suite runs in well under a minute).
 
+**Real bug, found and fixed 2026-08-23: the coverage step only ever passed `SYSTEM_DATABASE_URL`
+to `make coverage`, never `APP_DATABASE_URL`.** Every integration test needing the RLS-scoped
+`app_user` pool (`TEST_APP_DATABASE_URL` — settings, integrations, tenant, mcp, llm, and now
+documents) opens with `if dsn == "" { t.Skip(...) }`, so this didn't fail loudly, it just quietly
+skipped a large fraction of the suite. Locally this was invisible: the `Makefile`'s
+`APP_DATABASE_URL ?= $(shell grep ... .env)` fallback means a developer's own `.env` (present on
+every dev machine, never in the repo) silently filled the gap, so `make coverage` run by hand
+always looked fine. CI has no `.env` — so the exact same command that passes locally dropped
+real coverage from ~64% to as low as ~44% there, with `internal/api/settings` and
+`internal/api/integrations` specifically showing `0.0%`. Fixed by adding
+`APP_DATABASE_URL="postgresql://app_user:app_password@localhost:5432/founderstack?sslmode=disable"`
+alongside the existing `SYSTEM_DATABASE_URL` line in the "Test with coverage" step — matching
+`app_user`'s password from `internal/db/migrations/000002_enable_rls.up.sql`, same as the existing
+`app_system` line already did for `000003`. The general lesson: any Makefile default that falls
+back to reading a gitignored, dev-only `.env` file is invisible in CI by construction — a CI
+step invoking that target must pass every variable the target needs explicitly, not just the
+ones that happened to matter for whatever was being tested when the step was first written.
+
 **Coverage gate** (`make coverage`, `COVERAGE_THRESHOLD` in the `Makefile`, currently `60`):
 runs the full tagged suite with `-coverprofile`, strips `internal/db/dbgen` (sqlc-generated —
 testing generated code directly isn't meaningful; it's already exercised indirectly through
@@ -716,9 +828,10 @@ machine — CI runs the authoritative version of the same check regardless.
 | `/api/webhooks/clerk` | `internal/api/webhooks/clerk.go` | Svix signature, not `RequireAuth` | Clerk org/user sync (workflow 2) |
 | `/api/v1/integrations`, `/api/v1/integrations/{service}/connect` (all auth types), `.../status`, `DELETE .../{service}` | `internal/api/integrations/handler.go` | `middleware.RequireAuth` | Connect/manage third-party integrations (workflow 4) |
 | `/api/v1/integrations/{service}/callback` | `internal/api/integrations/handler.go` | none — org/service recovered from `state`, not a JWT | OAuth provider redirect target (workflow 4) |
+| `/api/v1/documents/upload`, `GET /documents`, `GET /documents/{id}`, `DELETE /documents/{id}`, `POST /documents/{id}/reindex` | `internal/api/documents/handler.go` | `middleware.RequireAuth` | Upload/list/reindex/delete founder documents for RAG (workflow 6) |
 
-(Everything else in `WORKFLOW_PLAN_GO.md` — documents, agents, workflows, runs — is unbuilt.
-Add rows here as routers land.)
+(Everything else in `WORKFLOW_PLAN_GO.md` — agents, workflows, runs — is unbuilt. Add rows here
+as routers land.)
 
 ### Dependency policy
 
@@ -742,8 +855,12 @@ verification, idempotency-key retry logic), not just "more endpoints."
 `modelcontextprotocol/go-sdk` and `cohere-ai/cohere-go/v2` were added in workflow 5, exactly when
 first used (the MCP tool servers/gateway, and `cmd/seedtools`'s embeddings, respectively) —
 `pinecone-io/go-pinecone` was already present (health check's `ListIndexes`), workflow 5 is just
-its second real caller (`UpsertVectors`). `sentry-go` and `otel` are still planned but not yet in
-`go.mod` — add each when its workflow lands.
+its second real caller (`UpsertVectors`). `aws-sdk-go-v2/{config,credentials,service/s3}` and
+`ledongthuc/pdf` were added in workflow 6, exactly when first used (S3 storage and PDF text
+extraction, respectively) — DOCX extraction deliberately got no new dependency (hand-rolled
+`archive/zip`+`encoding/xml` in `internal/core/documents/extract.go` instead), same reasoning as
+Slack's hand-rolled OAuth and Stripe's plain `net/http`. `sentry-go` and `otel` are still planned
+but not yet in `go.mod` — add each when its workflow lands.
 
 ## Environment Variables
 

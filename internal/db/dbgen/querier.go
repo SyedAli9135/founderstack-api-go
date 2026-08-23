@@ -17,6 +17,7 @@ type Querier interface {
 	// different, still-active provider's pointer.
 	ClearOrganizationActiveApiKeyForProvider(ctx context.Context, arg ClearOrganizationActiveApiKeyForProviderParams) error
 	DeactivateKeyByProvider(ctx context.Context, arg DeactivateKeyByProviderParams) (int64, error)
+	DeleteDocumentChunks(ctx context.Context, docID pgtype.UUID) error
 	// Queries backing BYOK API key management (workflow 3). Run through
 	// app_user via tenant.WithTx — this is genuinely tenant-scoped data, not a
 	// system-context lookup like clerk_sync.sql or auth.sql. Provider is a
@@ -32,9 +33,32 @@ type Querier interface {
 	// chicken-and-egg reasoning as the Clerk webhook's org creation.
 	GetActiveUserByClerkUserID(ctx context.Context, clerkUserID string) (GetActiveUserByClerkUserIDRow, error)
 	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
+	GetDocument(ctx context.Context, arg GetDocumentParams) (GetDocumentRow, error)
 	GetKeyStatusByProvider(ctx context.Context, arg GetKeyStatusByProviderParams) (GetKeyStatusByProviderRow, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
+	// Only called after purgeDocumentJob has successfully removed the
+	// Pinecone vectors and the S3 object — see internal/core/documents/purge.go.
+	HardDeleteDocument(ctx context.Context, arg HardDeleteDocumentParams) error
+	// Queries backing workflow 6 (document upload / RAG). Tenant-scoped reads
+	// and writes run through app_user via tenant.WithTx, same convention as
+	// every other feature area in this file set. The recovery-sweep query
+	// (ListStuckDocuments) is the one deliberate exception — it scans across
+	// every org's documents, so it runs on app_system, matching
+	// internal/core/integrations/refresh.go's RunRefreshJob precedent for
+	// the same "this is inherently cross-tenant" reasoning.
+	// id is application-generated (not the column's gen_random_uuid()
+	// default) so the handler knows the S3 key (documents/{org_id}/{doc_id}/{filename})
+	// before uploading, rather than uploading first and updating s3_path
+	// after — one INSERT instead of an insert-then-update dance.
+	InsertDocument(ctx context.Context, arg InsertDocumentParams) error
+	InsertDocumentChunk(ctx context.Context, arg InsertDocumentChunkParams) error
 	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
+	ListDocumentChunkPineconeIDs(ctx context.Context, docID pgtype.UUID) ([]string, error)
+	// Excludes 'deleting': once DELETE .../{id} has been called, the
+	// document shouldn't reappear in a normal list view while
+	// purgeDocumentJob finishes removing it (the row itself is only ever
+	// hard-deleted after that succeeds — see HardDeleteDocument).
+	ListDocuments(ctx context.Context, orgID pgtype.UUID) ([]ListDocumentsRow, error)
 	// Used only by the background refresh job (app_system pool). Scoped to
 	// oauth_status = 'connected' so a already-expired or revoked connection
 	// isn't retried every 30 minutes forever.
@@ -47,10 +71,19 @@ type Querier interface {
 	// false (not SQL NULL) when llm_provider is unset, so the generated Go
 	// field is a plain bool, not a nullable pointer.
 	ListKeyStatuses(ctx context.Context, orgID pgtype.UUID) ([]ListKeyStatusesRow, error)
+	// Documents whose background job (processDocument or purgeDocumentJob)
+	// may have been running in a process that restarted mid-job — the
+	// goroutine-based tradeoff internal/core/documents.RecoverStuckJobs
+	// exists to cover. olderThan guards against re-kicking a job that's
+	// still genuinely in flight in *this* process, not actually stuck.
+	ListStuckDocuments(ctx context.Context, updatedAt pgtype.Timestamptz) ([]ListStuckDocumentsRow, error)
 	MarkConnectionExpired(ctx context.Context, arg MarkConnectionExpiredParams) (int64, error)
 	MarkConnectionExpiredByIDSystem(ctx context.Context, id pgtype.UUID) (int64, error)
+	MarkDocumentFailed(ctx context.Context, arg MarkDocumentFailedParams) error
+	MarkDocumentIndexed(ctx context.Context, arg MarkDocumentIndexedParams) error
 	RevokeConnection(ctx context.Context, arg RevokeConnectionParams) (int64, error)
 	SetOrganizationActiveApiKey(ctx context.Context, arg SetOrganizationActiveApiKeyParams) error
+	SoftDeleteDocument(ctx context.Context, arg SoftDeleteDocumentParams) error
 	SoftDeleteOrganizationByClerkOrgID(ctx context.Context, clerkOrgID string) (int64, error)
 	SoftDeleteUserByClerkUserID(ctx context.Context, clerkUserID string) (int64, error)
 	UpdateConnectionTokens(ctx context.Context, arg UpdateConnectionTokensParams) (int64, error)
@@ -58,6 +91,7 @@ type Querier interface {
 	// specific connection by id, already scoped to the right org by virtue of
 	// having come from ListExpiringConnectionsSystem's own row.
 	UpdateConnectionTokensByIDSystem(ctx context.Context, arg UpdateConnectionTokensByIDSystemParams) (int64, error)
+	UpdateDocumentProcessing(ctx context.Context, arg UpdateDocumentProcessingParams) error
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (int64, error)
 	UpsertAPIKey(ctx context.Context, arg UpsertAPIKeyParams) (pgtype.UUID, error)
 	// Queries backing third-party integration connections (workflow 4),
