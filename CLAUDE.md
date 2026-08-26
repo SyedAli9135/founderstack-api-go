@@ -931,6 +931,31 @@ cancel in-flight/not-in-flight, stream, 404s). The two soft-latency acceptance c
 assumed: `Preflight` ~7ms, `Launch()`'s synchronous call ~14µs, first `node_start` SSE event ~9ms
 after `Launch()` returns — both 2+ orders of magnitude under budget.
 
+**Manual verification without a real BYOK key**: `MOCK_LLM_MODE=true` (dev-only, asserted off
+in production — see `Config.MockLLMMode`) swaps the Launcher's `ChatClientResolver` for
+`llm.MockScenarioResolver`, driving the whole harness through the real HTTP API and real
+Postgres with zero live provider calls. See `MOCK_LLM_TESTING.md` for the full step-by-step
+guide (scenario catalog, SSE-watching notes, cleanup) — it also documents two real bugs this
+approach caught that the existing test suite hadn't: `mock:approval`'s canned-response design
+breaking across the `Engine.Resume` boundary (fixed via a conversation-aware mock client,
+`approvalScenarioClient`), and a genuine pre-existing production bug where `Launcher.Launch`'s
+error fallback unconditionally overwrote a correctly-checkpointed `'cancelled'` status back to
+`'failed'` (fixed in `launch.go` — the fallback now only fires when the run is still `'pending'`,
+i.e. resolution failed before `Engine.Run` ever started). `graph.Launcher.Resume` (new) is the
+same dependency-resolution-then-drive-the-engine shape as `Launch`, just re-entering via
+`Engine.Resume` — it's what a real workflow 10 `POST /approvals/{id}/approve`/`reject` handler
+will call; today it's also reachable via the dev-only `POST /runs/{id}/dev-resume` route
+(`internal/api/runs/devresume.go`), registered only when `MOCK_LLM_MODE` is on.
+
+**Known gap surfaced while building the mock-testing guide, not yet fixed**:
+`policy_scope.max_cost_per_run_usd` cannot currently trip — `RunState.CostSoFarUSD` is never
+incremented anywhere in `internal/core/graph` (every `cost_ledger` row is written with
+`EstimatedCostUsd: 0`, real per-token/per-tool pricing being explicitly deferred to workflow 11),
+so `PolicyScope.CheckCaps`'s cost check reads a counter that never moves. `policy_scope.
+max_tool_calls` is unaffected and works correctly — only the cost cap is dead in practice today.
+Needs a decision: add a rough interim per-token cost estimate now so the cap is real, or leave it
+unenforced and make sure no UI implies otherwise before workflow 11 lands real pricing.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,

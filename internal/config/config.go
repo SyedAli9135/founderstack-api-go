@@ -85,6 +85,19 @@ type Config struct {
 	// production, should simply leave it unset, which disables the dev
 	// token fallback path entirely rather than requiring it be configured.
 	DevTokenSecret secret.Value `mapstructure:"DEV_TOKEN_SECRET"`
+
+	// MockLLMMode swaps every workflow-9 run's real BYOK ChatClient for a
+	// scripted llm.MockScenarioResolver (see that file's doc comment for
+	// the full scenario catalog) and enables a dev-only approval-resume
+	// debug route — lets a founder exercise the whole agent execution
+	// engine (guardrails, approval suspend/resume, SSE events) against
+	// real Postgres with zero live LLM provider calls, for exactly the
+	// "I don't have a real API key yet" situation. Same deliberately-
+	// optional, never-in-production pattern as DevTokenSecret above —
+	// main.go additionally asserts !cfg.IsProduction() before honoring
+	// this, so a misconfigured production environment can't silently run
+	// every agent against canned responses instead of a real model.
+	MockLLMMode bool `mapstructure:"MOCK_LLM_MODE"`
 }
 
 // requiredFields lists the mapstructure keys that must resolve to a
@@ -163,6 +176,7 @@ func Load() (*Config, error) {
 		"OAUTH_STATE_SECRET":     "",
 		"API_KEY_MOCK_PREFIX":    "mock-test-key-",
 		"DEV_TOKEN_SECRET":       "",
+		"MOCK_LLM_MODE":          false,
 	}
 	for key, def := range defaults {
 		v.SetDefault(key, def)

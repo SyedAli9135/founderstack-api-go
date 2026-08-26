@@ -64,6 +64,28 @@ func (q *Queries) GetOrgRunSettings(ctx context.Context, id pgtype.UUID) (GetOrg
 	return i, err
 }
 
+const getRunAgentID = `-- name: GetRunAgentID :one
+SELECT w.agent_id
+FROM workflow_runs wr
+JOIN workflows w ON w.id = wr.workflow_id
+WHERE wr.org_id = $1 AND wr.id = $2
+`
+
+type GetRunAgentIDParams struct {
+	OrgID pgtype.UUID `json:"org_id"`
+	ID    pgtype.UUID `json:"id"`
+}
+
+// Resolves a run's agent_id via its workflow — Launcher.Resume needs this
+// before it can rebuild the RunDeps/Nodes a suspended run's checkpoint
+// alone doesn't carry (agent_id isn't part of RunState's own JSON).
+func (q *Queries) GetRunAgentID(ctx context.Context, arg GetRunAgentIDParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getRunAgentID, arg.OrgID, arg.ID)
+	var agent_id pgtype.UUID
+	err := row.Scan(&agent_id)
+	return agent_id, err
+}
+
 const getRunCheckpoint = `-- name: GetRunCheckpoint :one
 SELECT checkpoint_state, current_node, cost_so_far_usd, tool_call_count, status
 FROM workflow_runs

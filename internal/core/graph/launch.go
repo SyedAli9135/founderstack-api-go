@@ -140,12 +140,22 @@ func (l *Launcher) Launch(orgID, agentID, workflowID, runID uuid.UUID, input str
 		runPg := pgtype.UUID{Bytes: runID, Valid: true}
 
 		if err := l.run(ctx, orgID, agentID, runID, input); err != nil {
-			// Resolution failed before Engine.Run ever started (e.g. the
-			// agent fetch or policy_scope unmarshal errored) — there's no
-			// checkpoint for Engine itself to have written, so mark the
-			// run failed directly rather than leaving it stuck at
-			// 'pending' forever.
-			_ = markRunFailedNoCheckpoint(ctx, l.appPool, orgPg, runPg)
+			// Real bug caught by actually cancelling an in-flight mock run
+			// end to end (not just reading the code): this used to fire
+			// markRunFailedNoCheckpoint whenever l.run returned ANY error,
+			// but engine.Run returns a non-nil error for a *correctly*
+			// cancelled run too — Engine's own checkpoint() had already
+			// written status='cancelled' by then, and this unconditional
+			// overwrite silently clobbered it back to 'failed' every time.
+			// markRunFailedNoCheckpoint is only correct for the case its
+			// own doc comment describes — resolution failed *before*
+			// Engine.Run ever started, so no checkpoint exists yet — which
+			// is exactly the one case where the row is still 'pending'.
+			// Anything else means Engine's checkpoint already wrote the
+			// real terminal status; trust it, don't touch it again.
+			if status, statusErr := getRunStatus(ctx, l.appPool, orgPg, runPg); statusErr == nil && status == "pending" {
+				_ = markRunFailedNoCheckpoint(ctx, l.appPool, orgPg, runPg)
+			}
 		}
 	}()
 }
@@ -155,51 +165,10 @@ func (l *Launcher) run(ctx context.Context, orgID, agentID, runID uuid.UUID, inp
 	agentPg := pgtype.UUID{Bytes: agentID, Valid: true}
 	runPg := pgtype.UUID{Bytes: runID, Valid: true}
 
-	var agentRow dbgen.GetAgentRow
-	var settings dbgen.GetOrgRunSettingsRow
-	err := tenant.WithTx(ctx, l.appPool, orgPg, func(ctx context.Context, q *dbgen.Queries) error {
-		var err error
-		agentRow, err = q.GetAgent(ctx, dbgen.GetAgentParams{OrgID: orgPg, ID: agentPg})
-		if err != nil {
-			return fmt.Errorf("fetch agent: %w", err)
-		}
-		settings, err = q.GetOrgRunSettings(ctx, orgPg)
-		if err != nil {
-			return fmt.Errorf("fetch org settings: %w", err)
-		}
-		return nil
-	})
+	agentRow, nodes, err := l.buildNodesForRun(ctx, orgPg, agentPg)
 	if err != nil {
-		return fmt.Errorf("graph: %w", err)
+		return err
 	}
-	if settings.LlmProvider == nil || *settings.LlmProvider == "" {
-		return fmt.Errorf("graph: %w", llm.ErrNoActiveKey)
-	}
-	if agentRow.Model == nil || *agentRow.Model == "" {
-		return errors.New("graph: agent has no model configured")
-	}
-
-	var policy PolicyScope
-	if err := json.Unmarshal(agentRow.PolicyScope, &policy); err != nil {
-		return fmt.Errorf("graph: unmarshal policy_scope: %w", err)
-	}
-
-	chatClient, err := l.resolveChatClient(ctx, l.appPool, l.encryptionKey, orgPg, llm.ProviderID(*settings.LlmProvider), *agentRow.Model)
-	if err != nil {
-		return fmt.Errorf("graph: resolve chat client: %w", err)
-	}
-
-	tools, err := ResolveTools(ctx, l.registry, policy)
-	if err != nil {
-		return fmt.Errorf("graph: resolve tools: %w", err)
-	}
-
-	deps := RunDeps{
-		Engine: l.engine, ChatClient: chatClient, Gateway: l.gateway,
-		Tools: tools, Policy: policy, SystemPrompt: agentRow.SystemPrompt, OrgID: orgPg,
-		AppPool: l.appPool, Model: *agentRow.Model,
-	}
-	nodes := BuildNodes(deps)
 	state := &RunState{OrgID: orgID, AgentID: agentID, AgentName: agentRow.Name, WorkflowRunID: runID, Input: input}
 
 	if err := markRunStarted(ctx, l.appPool, orgPg, runPg); err != nil {
@@ -219,6 +188,132 @@ func (l *Launcher) run(ctx context.Context, orgID, agentID, runID uuid.UUID, inp
 		slog.Error("graph: finalize run failed", "run_id", runID, "engine_err", runErr, "finalize_err", err)
 	}
 	return runErr
+}
+
+// Resume continues a run suspended at approval_gate — the same
+// dependency-resolution-then-drive-the-engine shape as Launch/run above,
+// just re-entering via Engine.Resume instead of Engine.Run. This is what
+// a real POST /approvals/{id}/approve|reject handler (workflow 10, not
+// built yet) will call; today it's also reachable from the dev-only mock
+// approval route registered when config.MockLLMMode is set (see
+// cmd/api/main.go), so the whole suspend→resume guardrail can be
+// exercised manually before workflow 10's human-facing half exists.
+// Fire-and-forget, same reasoning as Launch: detached context, launched
+// in its own goroutine, caller gets no return value — poll the run's
+// status via GET /runs/{id} instead.
+func (l *Launcher) Resume(orgID, runID uuid.UUID, approved bool, reason string) {
+	go func() {
+		ctx := context.Background()
+		orgPg := pgtype.UUID{Bytes: orgID, Valid: true}
+		runPg := pgtype.UUID{Bytes: runID, Valid: true}
+
+		if err := l.resume(ctx, orgID, runID, approved, reason); err != nil {
+			slog.Error("graph: resume run failed", "run_id", runID, "err", err)
+			// Same reasoning as Launch's fallback above: only mark the run
+			// failed directly when dependency resolution failed *before*
+			// Engine.Resume ever ran (the row is still stuck at
+			// 'awaiting_approval', its pre-resume status, since
+			// nothing else has written a new checkpoint yet). If
+			// Engine.Resume itself returned an error, its own checkpoint
+			// already recorded the real terminal status — never overwrite it.
+			if status, statusErr := getRunStatus(ctx, l.appPool, orgPg, runPg); statusErr == nil && status == "awaiting_approval" {
+				_ = markRunFailedNoCheckpoint(ctx, l.appPool, orgPg, runPg)
+			}
+		}
+	}()
+}
+
+func (l *Launcher) resume(ctx context.Context, orgID, runID uuid.UUID, approved bool, reason string) error {
+	orgPg := pgtype.UUID{Bytes: orgID, Valid: true}
+	runPg := pgtype.UUID{Bytes: runID, Valid: true}
+
+	// Resume() itself only reloads RunState — it has no way to rebuild
+	// the Nodes/RunDeps (chat client, tool catalog, policy) that produced
+	// them in the first place, since that needs the run's agent_id, which
+	// isn't part of a checkpoint. Resolved via the run's workflow, the
+	// same join a real approval-details endpoint would need anyway.
+	var agentPg pgtype.UUID
+	if err := tenant.WithTx(ctx, l.appPool, orgPg, func(ctx context.Context, q *dbgen.Queries) error {
+		var err error
+		agentPg, err = q.GetRunAgentID(ctx, dbgen.GetRunAgentIDParams{OrgID: orgPg, ID: runPg})
+		return err
+	}); err != nil {
+		return fmt.Errorf("graph: resolve run's agent: %w", err)
+	}
+
+	_, nodes, err := l.buildNodesForRun(ctx, orgPg, agentPg)
+	if err != nil {
+		return err
+	}
+
+	resumeErr := l.engine.Resume(ctx, nodes, orgID, runID, ResumeData{Approved: approved, Reason: reason})
+
+	// Engine.Resume operates on its own freshly-reloaded RunState
+	// internally (never the caller's) — reload the checkpoint again here
+	// purely to read back Output/TokenUsage for finalizeIfTerminal, same
+	// as Launch's own state pointer (there, Engine.Run mutates the
+	// caller's pointer in place, so no reload is needed) gives it.
+	if finalState, _, loadErr := loadCheckpoint(ctx, l.appPool, orgID, runID); loadErr == nil {
+		if err := finalizeIfTerminal(ctx, l.appPool, orgPg, runPg, finalState); err != nil {
+			slog.Error("graph: finalize resumed run failed", "run_id", runID, "resume_err", resumeErr, "finalize_err", err)
+		}
+	} else {
+		slog.Error("graph: reload checkpoint after resume failed", "run_id", runID, "err", loadErr)
+	}
+	return resumeErr
+}
+
+// buildNodesForRun resolves everything one run/resume needs beyond
+// RunState itself — the agent's config, its BYOK chat client, and its
+// resolved tool catalog — shared by both run() and resume() so they stay
+// in lockstep (a run resumed after approval must see the exact same
+// tool/policy/model configuration it started with).
+func (l *Launcher) buildNodesForRun(ctx context.Context, orgPg, agentPg pgtype.UUID) (dbgen.GetAgentRow, Nodes, error) {
+	var agentRow dbgen.GetAgentRow
+	var settings dbgen.GetOrgRunSettingsRow
+	err := tenant.WithTx(ctx, l.appPool, orgPg, func(ctx context.Context, q *dbgen.Queries) error {
+		var err error
+		agentRow, err = q.GetAgent(ctx, dbgen.GetAgentParams{OrgID: orgPg, ID: agentPg})
+		if err != nil {
+			return fmt.Errorf("fetch agent: %w", err)
+		}
+		settings, err = q.GetOrgRunSettings(ctx, orgPg)
+		if err != nil {
+			return fmt.Errorf("fetch org settings: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return dbgen.GetAgentRow{}, nil, fmt.Errorf("graph: %w", err)
+	}
+	if settings.LlmProvider == nil || *settings.LlmProvider == "" {
+		return dbgen.GetAgentRow{}, nil, fmt.Errorf("graph: %w", llm.ErrNoActiveKey)
+	}
+	if agentRow.Model == nil || *agentRow.Model == "" {
+		return dbgen.GetAgentRow{}, nil, errors.New("graph: agent has no model configured")
+	}
+
+	var policy PolicyScope
+	if err := json.Unmarshal(agentRow.PolicyScope, &policy); err != nil {
+		return dbgen.GetAgentRow{}, nil, fmt.Errorf("graph: unmarshal policy_scope: %w", err)
+	}
+
+	chatClient, err := l.resolveChatClient(ctx, l.appPool, l.encryptionKey, orgPg, llm.ProviderID(*settings.LlmProvider), *agentRow.Model)
+	if err != nil {
+		return dbgen.GetAgentRow{}, nil, fmt.Errorf("graph: resolve chat client: %w", err)
+	}
+
+	tools, err := ResolveTools(ctx, l.registry, policy)
+	if err != nil {
+		return dbgen.GetAgentRow{}, nil, fmt.Errorf("graph: resolve tools: %w", err)
+	}
+
+	deps := RunDeps{
+		Engine: l.engine, ChatClient: chatClient, Gateway: l.gateway,
+		Tools: tools, Policy: policy, SystemPrompt: agentRow.SystemPrompt, OrgID: orgPg,
+		AppPool: l.appPool, Model: *agentRow.Model,
+	}
+	return agentRow, BuildNodes(deps), nil
 }
 
 // markRunFailedNoCheckpoint handles the pre-Engine.Run failure path —

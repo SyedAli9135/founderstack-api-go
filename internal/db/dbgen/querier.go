@@ -58,6 +58,10 @@ type Querier interface {
 	GetOrgRunSettings(ctx context.Context, id pgtype.UUID) (GetOrgRunSettingsRow, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
 	GetOrganizationMaxAgents(ctx context.Context, id pgtype.UUID) (*int32, error)
+	// Resolves a run's agent_id via its workflow — Launcher.Resume needs this
+	// before it can rebuild the RunDeps/Nodes a suspended run's checkpoint
+	// alone doesn't carry (agent_id isn't part of RunState's own JSON).
+	GetRunAgentID(ctx context.Context, arg GetRunAgentIDParams) (pgtype.UUID, error)
 	GetRunCheckpoint(ctx context.Context, arg GetRunCheckpointParams) (GetRunCheckpointRow, error)
 	GetRunDetail(ctx context.Context, arg GetRunDetailParams) (GetRunDetailRow, error)
 	// Read back the definitive status Engine's own checkpoint() already

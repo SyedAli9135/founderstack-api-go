@@ -36,6 +36,7 @@ import (
 	"github.com/founderstack/api/internal/core/graph"
 	"github.com/founderstack/api/internal/core/integrations"
 	"github.com/founderstack/api/internal/core/integrations/providers"
+	corellm "github.com/founderstack/api/internal/core/llm"
 	coremcp "github.com/founderstack/api/internal/core/mcp"
 	mcpservers "github.com/founderstack/api/internal/core/mcp/servers"
 	coreworkflows "github.com/founderstack/api/internal/core/workflows"
@@ -128,7 +129,22 @@ func run() error {
 	// an executing one.
 	mcpGateway := coremcp.NewGateway(dbPool, encryptionKey, mcpRegistry, redisClient)
 	graphEngine := graph.NewEngine(dbPool)
-	launcher := graph.NewLauncher(graphEngine, dbPool, encryptionKey, mcpRegistry, mcpGateway)
+
+	var launcher *graph.Launcher
+	if cfg.MockLLMMode {
+		// Never honor this in production, regardless of what's in the
+		// environment — see Config.MockLLMMode's doc comment. A
+		// misconfigured MOCK_LLM_MODE=true in a real deployment must fail
+		// loud at boot, not silently run every agent against canned
+		// responses instead of a real model.
+		if cfg.IsProduction() {
+			return fmt.Errorf("MOCK_LLM_MODE=true is not allowed when APP_ENV=production")
+		}
+		logger.Warn("MOCK_LLM_MODE enabled — every workflow run will use a scripted MockChatClient, no real LLM provider will be called")
+		launcher = graph.NewLauncherWithResolver(graphEngine, dbPool, encryptionKey, mcpRegistry, mcpGateway, corellm.MockScenarioResolver)
+	} else {
+		launcher = graph.NewLauncher(graphEngine, dbPool, encryptionKey, mcpRegistry, mcpGateway)
+	}
 
 	// Workflow 6 (document upload / RAG). Pinecone is required here (unlike
 	// newPineconeClient's nil-if-unconfigured fallback for the health
@@ -289,6 +305,14 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiRuns := router.Group("/api/v1")
 	apiRuns.Use(middleware.RequireAuth(systemDB, cfg))
 	runsapi.NewHandler(db, graphEngine).Register(apiRuns)
+
+	// Dev-only stand-in for workflow 10's real approve/reject endpoints —
+	// see runsapi.DevResumeHandler's doc comment. Only ever registered
+	// when MOCK_LLM_MODE is on, matching the same gate that swapped
+	// launcher's ChatClientResolver for the scripted one above.
+	if cfg.MockLLMMode {
+		runsapi.NewDevResumeHandler(db, launcher).Register(apiRuns)
+	}
 
 	return router
 }

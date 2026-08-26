@@ -60,6 +60,15 @@ SELECT id, workflow_id, status, triggered_by, output, input_tokens, output_token
 FROM workflow_runs
 WHERE org_id = $1 AND id = $2;
 
+-- name: GetRunAgentID :one
+-- Resolves a run's agent_id via its workflow — Launcher.Resume needs this
+-- before it can rebuild the RunDeps/Nodes a suspended run's checkpoint
+-- alone doesn't carry (agent_id isn't part of RunState's own JSON).
+SELECT w.agent_id
+FROM workflow_runs wr
+JOIN workflows w ON w.id = wr.workflow_id
+WHERE wr.org_id = $1 AND wr.id = $2;
+
 -- name: ListRunsForOrg :many
 SELECT id, workflow_id, status, output, cost_so_far_usd, started_at, completed_at,
        duration_ms, created_at
