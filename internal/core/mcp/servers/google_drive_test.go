@@ -104,6 +104,70 @@ func TestGoogleDrive_ReadFile(t *testing.T) {
 	}
 }
 
+func TestGoogleDrive_ReadFile_RetriesOnServerErrorThenSucceeds(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte("recovered content"))
+	}))
+	defer srv.Close()
+	defer swapDriveAPIBases(srv.URL, srv.URL)()
+
+	session := connectGoogleDriveServer(t)
+	result, err := session.CallTool(context.Background(), &gomcp.CallToolParams{
+		Name:      "read_file",
+		Arguments: map[string]any{"file_id": "f1"},
+		Meta:      mcp.WithToken("drive-test-token"),
+	})
+	if err != nil {
+		t.Fatalf("CallTool error = %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("tool reported an error: %+v", result.Content)
+	}
+	if calls != 2 {
+		t.Fatalf("server received %d requests, want 2 (1 retry after the 500)", calls)
+	}
+
+	var out driveReadFileOutput
+	if err := unmarshalStructured(result, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Content != "recovered content" {
+		t.Fatalf("content = %q, want %q", out.Content, "recovered content")
+	}
+}
+
+func TestGoogleDrive_ReadFile_DoesNotRetryTerminalStatus(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	defer swapDriveAPIBases(srv.URL, srv.URL)()
+
+	session := connectGoogleDriveServer(t)
+	result, err := session.CallTool(context.Background(), &gomcp.CallToolParams{
+		Name:      "read_file",
+		Arguments: map[string]any{"file_id": "does-not-exist"},
+		Meta:      mcp.WithToken("drive-test-token"),
+	})
+	if err != nil {
+		t.Fatalf("CallTool error = %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("result.IsError = false, want true for a 404")
+	}
+	if calls != 1 {
+		t.Fatalf("server received %d requests, want exactly 1 (a 404 must not retry)", calls)
+	}
+}
+
 func TestGoogleDrive_CreateFile(t *testing.T) {
 	var gotContentType string
 	var gotMetaName, gotContent string

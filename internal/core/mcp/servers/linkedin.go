@@ -2,6 +2,7 @@ package servers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -40,6 +41,11 @@ func NewLinkedInServer() *gomcp.Server {
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "draft_post",
 		Description: "Compose and publish a post to LinkedIn. LinkedIn has no API-accessible draft state — this publishes immediately.",
+		// Destructive-tier despite not moving money: a public, permanent,
+		// brand-visible post published with no draft/undo step is exactly
+		// the kind of irreversible external action the risk model treats
+		// the same as a financial one — see internal/core/mcp/risk.go.
+		Annotations: mcp.DestructiveOrFinancial(),
 	}, linkedinDraftPost)
 
 	return server
@@ -96,25 +102,41 @@ func linkedinDraftPost(ctx context.Context, req *gomcp.CallToolRequest, in linke
 // header — the Posts API returns 201 with an empty body and the new
 // post's URN in that header, not in a JSON body like every other
 // provider here.
+// doLinkedInCreate is always a POST (publishing a post has no read
+// variant), so — same reasoning as doAndDecode's isWrite guard — a
+// network-level failure never auto-retries here: the post may have
+// already gone live before the response was lost, and retrying could
+// double-publish. Only an explicit 429/5xx response (the server
+// rejected the request outright, without applying it) retries.
 func doLinkedInCreate(ctx context.Context, endpoint, token string, payload any) (string, error) {
-	req, err := newRequestWithBody(ctx, "POST", endpoint, payload)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("LinkedIn-Version", linkedinAPIVersion)
-	req.Header.Set("X-Restli-Protocol-Version", "2.0.0")
-	req.Header.Set("Content-Type", "application/json")
+	var lastErr error
+	for attempt := 1; attempt <= toolCallMaxAttempts; attempt++ {
+		req, err := newRequestWithBody(ctx, "POST", endpoint, payload)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("LinkedIn-Version", linkedinAPIVersion)
+		req.Header.Set("X-Restli-Protocol-Version", "2.0.0")
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("servers: request %s: %w", req.URL, err)
-	}
-	defer resp.Body.Close()
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("%w: %s: %w", mcp.ErrToolRetryable, req.URL, err)
+		}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return "", fmt.Errorf("servers: %s returned %d: %s", req.URL, resp.StatusCode, truncate(body, 500))
+		resp.Body.Close()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			classified := mcp.ClassifyToolHTTPError(resp.StatusCode, fmt.Sprintf("%s returned: %s", req.URL, truncate(body, 500)))
+			if errors.Is(classified, mcp.ErrToolRetryable) && attempt < toolCallMaxAttempts && sleepBackoff(ctx, attempt) {
+				lastErr = classified
+				continue
+			}
+			return "", classified
+		}
+		return resp.Header.Get("x-restli-id"), nil
 	}
-	return resp.Header.Get("x-restli-id"), nil
+	return "", lastErr
 }

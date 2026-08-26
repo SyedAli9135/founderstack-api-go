@@ -23,16 +23,19 @@ func NewGitHubServer() *gomcp.Server {
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "review_pr",
 		Description: "Fetch a pull request's metadata and per-file diffs, for the agent to review.",
+		Annotations: mcp.ReadOnly(),
 	}, githubReviewPR)
 
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "search_code",
 		Description: "Search code across GitHub (or a specific repo) using GitHub's code search syntax.",
+		Annotations: mcp.ReadOnly(),
 	}, githubSearchCode)
 
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "create_issue",
 		Description: "Create an issue in a GitHub repository.",
+		Annotations: mcp.ReversibleWrite(),
 	}, githubCreateIssue)
 
 	return server

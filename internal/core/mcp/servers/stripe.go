@@ -30,21 +30,29 @@ func NewStripeServer() *gomcp.Server {
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "list_subscriptions",
 		Description: "List active Stripe subscriptions for the connected account.",
+		Annotations: mcp.ReadOnly(),
 	}, stripeListSubscriptions)
 
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "create_invoice",
 		Description: "Create a draft Stripe invoice for a customer. Set finalize=true to also finalize it immediately.",
+		// Reversible, not financial-destructive: this creates/finalizes a
+		// bill but doesn't itself move money (no auto-charge unless the
+		// org's own Stripe collection settings do that), and a draft/open
+		// invoice can still be voided.
+		Annotations: mcp.ReversibleWrite(),
 	}, stripeCreateInvoice)
 
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "refund_payment",
 		Description: "Refund a Stripe payment intent, fully or for a specific amount (in the smallest currency unit, e.g. cents).",
+		Annotations: mcp.DestructiveOrFinancial(),
 	}, stripeRefundPayment)
 
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "get_mrr",
 		Description: "Estimate current Monthly Recurring Revenue from active subscriptions.",
+		Annotations: mcp.ReadOnly(),
 	}, stripeGetMRR)
 
 	return server
@@ -83,7 +91,7 @@ func stripeListSubscriptions(ctx context.Context, req *gomcp.CallToolRequest, in
 
 	endpoint := fmt.Sprintf("%s/subscriptions?status=active&limit=%d", stripeAPIBase, limit)
 	var resp stripeSubscriptionListResponse
-	if err := doStripeForm(ctx, "GET", endpoint, token, nil, &resp); err != nil {
+	if err := doStripeForm(ctx, "GET", endpoint, token, "", nil, &resp); err != nil {
 		return nil, stripeListSubscriptionsOutput{}, fmt.Errorf("stripe: list subscriptions: %w", err)
 	}
 
@@ -118,6 +126,11 @@ func stripeCreateInvoice(ctx context.Context, req *gomcp.CallToolRequest, in str
 	if in.CustomerID == "" {
 		return nil, stripeCreateInvoiceOutput{}, fmt.Errorf("stripe: customer_id is required")
 	}
+	// idempotencyKey, if any, protects this whole logical tool call from
+	// double-executing on a retry — see doStripeForm's doc comment. The
+	// finalize sub-step gets its own derived key (a distinct Stripe
+	// write, not covered by the create call's key).
+	idempotencyKey, _ := mcp.IdempotencyKeyFromRequest(req)
 
 	form := url.Values{"customer": {in.CustomerID}}
 	if in.Description != "" {
@@ -125,14 +138,18 @@ func stripeCreateInvoice(ctx context.Context, req *gomcp.CallToolRequest, in str
 	}
 
 	var invoice stripeInvoiceResponse
-	if err := doStripeForm(ctx, "POST", stripeAPIBase+"/invoices", token, form, &invoice); err != nil {
+	if err := doStripeForm(ctx, "POST", stripeAPIBase+"/invoices", token, idempotencyKey, form, &invoice); err != nil {
 		return nil, stripeCreateInvoiceOutput{}, fmt.Errorf("stripe: create invoice: %w", err)
 	}
 
 	if in.Finalize {
 		var finalized stripeInvoiceResponse
 		finalizeURL := fmt.Sprintf("%s/invoices/%s/finalize", stripeAPIBase, invoice.ID)
-		if err := doStripeForm(ctx, "POST", finalizeURL, token, url.Values{}, &finalized); err != nil {
+		finalizeKey := idempotencyKey
+		if finalizeKey != "" {
+			finalizeKey += "-finalize"
+		}
+		if err := doStripeForm(ctx, "POST", finalizeURL, token, finalizeKey, url.Values{}, &finalized); err != nil {
 			return nil, stripeCreateInvoiceOutput{}, fmt.Errorf("stripe: finalize invoice %s: %w", invoice.ID, err)
 		}
 		invoice = finalized
@@ -166,6 +183,7 @@ func stripeRefundPayment(ctx context.Context, req *gomcp.CallToolRequest, in str
 	if in.PaymentIntentID == "" {
 		return nil, stripeRefundPaymentOutput{}, fmt.Errorf("stripe: payment_intent_id is required")
 	}
+	idempotencyKey, _ := mcp.IdempotencyKeyFromRequest(req)
 
 	form := url.Values{"payment_intent": {in.PaymentIntentID}}
 	if in.AmountCents > 0 {
@@ -173,7 +191,7 @@ func stripeRefundPayment(ctx context.Context, req *gomcp.CallToolRequest, in str
 	}
 
 	var refund stripeRefundResponse
-	if err := doStripeForm(ctx, "POST", stripeAPIBase+"/refunds", token, form, &refund); err != nil {
+	if err := doStripeForm(ctx, "POST", stripeAPIBase+"/refunds", token, idempotencyKey, form, &refund); err != nil {
 		return nil, stripeRefundPaymentOutput{}, fmt.Errorf("stripe: refund payment: %w", err)
 	}
 
@@ -215,7 +233,7 @@ func stripeGetMRR(ctx context.Context, req *gomcp.CallToolRequest, _ stripeGetMR
 		}
 
 		var resp stripeSubscriptionListResponse
-		if err := doStripeForm(ctx, "GET", endpoint, token, nil, &resp); err != nil {
+		if err := doStripeForm(ctx, "GET", endpoint, token, "", nil, &resp); err != nil {
 			return nil, stripeGetMRROutput{}, fmt.Errorf("stripe: list subscriptions for MRR: %w", err)
 		}
 

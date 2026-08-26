@@ -20,6 +20,10 @@ import (
 
 	"github.com/founderstack/api/internal/api/middleware"
 	"github.com/founderstack/api/internal/config"
+	"github.com/founderstack/api/internal/core/graph"
+	"github.com/founderstack/api/internal/core/llm"
+	coremcp "github.com/founderstack/api/internal/core/mcp"
+	mcpservers "github.com/founderstack/api/internal/core/mcp/servers"
 	"github.com/founderstack/api/internal/db/dbgen"
 	"github.com/founderstack/api/internal/db/tenant"
 	"github.com/founderstack/api/internal/pkg/devtoken"
@@ -120,13 +124,51 @@ func testConfig(t *testing.T) *config.Config {
 	return &config.Config{AppEnv: "development", DevTokenSecret: "test-dev-token-secret"}
 }
 
+// testBYOKKey satisfies Launcher.Preflight's key-presence check — a real
+// row must exist for Run's new 202-vs-400 behavior to be testable at
+// all, even though nothing in this file exercises a real chat completion
+// (testRouter's launcher uses a fake ChatClientResolver, never a real
+// network call — see that function's doc comment).
+func testBYOKKey(t *testing.T, systemPool *pgxpool.Pool, orgID pgtype.UUID) {
+	t.Helper()
+	if _, err := systemPool.Exec(context.Background(),
+		"update organizations set llm_provider = 'anthropic' where id = $1", orgID,
+	); err != nil {
+		t.Fatalf("set org llm_provider: %v", err)
+	}
+	if _, err := systemPool.Exec(context.Background(),
+		`insert into api_key_registry (org_id, provider, key_prefix, encrypted_key, kms_key_id, is_valid)
+		 values ($1, 'anthropic', 'sk-ant-...', 'not-a-real-ciphertext', 'local-aes-gcm', true)`,
+		orgID,
+	); err != nil {
+		t.Fatalf("insert test key: %v", err)
+	}
+}
+
 func testRouter(t *testing.T, systemPool, appPool *pgxpool.Pool, cfg *config.Config) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(middleware.RequestID())
 
-	h := NewHandler(appPool)
+	// A real MCP registry/gateway/engine (matching production wiring),
+	// but a fake ChatClientResolver — this suite tests workflow CRUD +
+	// the Run endpoint's synchronous response (Preflight, 202, the
+	// queued row), never a real chat completion. Launch's background
+	// goroutine may run to a quick "failed" in the background using the
+	// empty MockChatClient below; nothing here waits on or asserts that.
+	registry, err := coremcp.NewRegistry(context.Background(), mcpservers.AllServers())
+	if err != nil {
+		t.Fatalf("build mcp registry: %v", err)
+	}
+	gateway := coremcp.NewGateway(appPool, make([]byte, 32), registry, nil)
+	engine := graph.NewEngine(appPool)
+	launcher := graph.NewLauncherWithResolver(engine, appPool, make([]byte, 32), registry, gateway,
+		func(ctx context.Context, appPool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, provider llm.ProviderID, model string) (llm.ChatClient, error) {
+			return llm.NewMockChatClient(), nil
+		})
+
+	h := NewHandler(appPool, launcher)
 	authed := r.Group("/api/v1")
 	authed.Use(middleware.RequireAuth(systemPool, cfg))
 	h.Register(authed)
@@ -170,6 +212,7 @@ func TestWorkflowsHandler_FullLifecycle(t *testing.T) {
 	cfg := testConfig(t)
 	orgID, userID, clerkUserID := testOrgAndUser(t, systemPool)
 	agentID := testAgent(t, appPool, orgID, userID, "Test Agent")
+	testBYOKKey(t, systemPool, orgID)
 	router := testRouter(t, systemPool, appPool, cfg)
 
 	t.Run("unauthenticated list is rejected", func(t *testing.T) {
@@ -409,6 +452,15 @@ func TestWorkflowsHandler_FullLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Only confirms the row exists, not its exact status — launcher.Launch
+		// runs the rest of the pipeline in its own detached goroutine (see
+		// graph.Launcher's doc comment), which this test's fake
+		// ChatClientResolver returns an empty llm.MockChatClient from; that
+		// goroutine can race ahead to 'failed' (the mock has zero canned
+		// responses) before this assertion runs. The synchronous HTTP
+		// response's own status="pending" field, asserted above, is what
+		// actually tests this endpoint's queuing behavior — it's a literal
+		// in the handler, not a DB read, so it isn't racy.
 		var dbStatus string
 		err = tenant.WithTx(context.Background(), appPool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
 			run, err := q.GetWorkflowRun(ctx, dbgen.GetWorkflowRunParams{OrgID: orgID, ID: pgtype.UUID{Bytes: runUUID, Valid: true}})
@@ -418,8 +470,8 @@ func TestWorkflowsHandler_FullLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("workflow_runs row not found: %v", err)
 		}
-		if dbStatus != "pending" {
-			t.Fatalf("workflow_runs.status = %q, want pending", dbStatus)
+		if dbStatus == "" {
+			t.Fatal("workflow_runs row exists but has no status at all")
 		}
 	})
 
@@ -467,4 +519,84 @@ func TestWorkflowsHandler_FullLifecycle(t *testing.T) {
 			t.Fatalf("status = %d, want 404", rec.Code)
 		}
 	})
+}
+
+// TestWorkflowsHandler_Run_Preflight covers graph.Launcher.Preflight's
+// two fast-failing conditions as exercised through the real HTTP
+// endpoint — separate from TestWorkflowsHandler_FullLifecycle, which
+// deliberately sets up a valid BYOK key so its own "run now" subtest can
+// assert the 202 happy path.
+func TestWorkflowsHandler_Run_Preflight(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg)
+
+	t.Run("no BYOK key returns 400", func(t *testing.T) {
+		orgID, userID, clerkUserID := testOrgAndUser(t, systemPool)
+		agentID := testAgent(t, appPool, orgID, userID, "No Key Agent")
+		wfID := createTestWorkflow(t, cfg, router, clerkUserID, agentID)
+
+		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/workflows/"+wfID+"/run", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+		}
+		var env apiEnvelope
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatal(err)
+		}
+		if env.Error.Code != "NO_BYOK_KEY" {
+			t.Fatalf("error.code = %q, want NO_BYOK_KEY", env.Error.Code)
+		}
+	})
+
+	t.Run("agents_paused returns 400", func(t *testing.T) {
+		orgID, userID, clerkUserID := testOrgAndUser(t, systemPool)
+		agentID := testAgent(t, appPool, orgID, userID, "Paused Org Agent")
+		testBYOKKey(t, systemPool, orgID)
+		if _, err := systemPool.Exec(context.Background(), "update organizations set agents_paused = true where id = $1", orgID); err != nil {
+			t.Fatal(err)
+		}
+		wfID := createTestWorkflow(t, cfg, router, clerkUserID, agentID)
+
+		req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/workflows/"+wfID+"/run", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+		}
+		var env apiEnvelope
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatal(err)
+		}
+		if env.Error.Code != "AGENTS_PAUSED" {
+			t.Fatalf("error.code = %q, want AGENTS_PAUSED", env.Error.Code)
+		}
+	})
+}
+
+// createTestWorkflow is a small helper for tests that only need a
+// workflow to exist, not to exercise Create's own validation — that's
+// TestWorkflowsHandler_FullLifecycle's job.
+func createTestWorkflow(t *testing.T, cfg *config.Config, router *gin.Engine, clerkUserID string, agentID pgtype.UUID) string {
+	t.Helper()
+	req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/workflows", map[string]any{
+		"agent_id": agentID.String(), "name": "Preflight Test Workflow", "trigger_type": "manual",
+	})
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create workflow status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	var env apiEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	var created workflowView
+	if err := json.Unmarshal(env.Data, &created); err != nil {
+		t.Fatal(err)
+	}
+	return created.ID
 }

@@ -82,6 +82,7 @@ type Approval struct {
 	OrgID       pgtype.UUID        `json:"org_id"`
 	Status      *string            `json:"status"`
 	ContextData []byte             `json:"context_data"`
+	RiskLevel   *string            `json:"risk_level"`
 }
 
 type ApprovalDecision struct {
@@ -190,6 +191,7 @@ type Organization struct {
 	Settings             []byte             `json:"settings"`
 	OnboardingCompleted  *bool              `json:"onboarding_completed"`
 	IsActive             *bool              `json:"is_active"`
+	AgentsPaused         bool               `json:"agents_paused"`
 }
 
 type Session struct {
@@ -258,14 +260,25 @@ type Workflow struct {
 }
 
 type WorkflowRun struct {
-	ID          pgtype.UUID        `json:"id"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
-	WorkflowID  pgtype.UUID        `json:"workflow_id"`
-	OrgID       pgtype.UUID        `json:"org_id"`
-	TriggeredBy pgtype.UUID        `json:"triggered_by"`
-	Status      string             `json:"status"`
-	RunTrace    []byte             `json:"run_trace"`
+	ID              pgtype.UUID        `json:"id"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	WorkflowID      pgtype.UUID        `json:"workflow_id"`
+	OrgID           pgtype.UUID        `json:"org_id"`
+	TriggeredBy     pgtype.UUID        `json:"triggered_by"`
+	Status          string             `json:"status"`
+	RunTrace        []byte             `json:"run_trace"`
+	CheckpointState []byte             `json:"checkpoint_state"`
+	CurrentNode     *string            `json:"current_node"`
+	CostSoFarUsd    float64            `json:"cost_so_far_usd"`
+	ToolCallCount   int32              `json:"tool_call_count"`
+	StartedAt       pgtype.Timestamptz `json:"started_at"`
+	CompletedAt     pgtype.Timestamptz `json:"completed_at"`
+	Output          *string            `json:"output"`
+	InputTokens     int32              `json:"input_tokens"`
+	OutputTokens    int32              `json:"output_tokens"`
+	CachedTokens    int32              `json:"cached_tokens"`
+	DurationMs      *int32             `json:"duration_ms"`
 }
 
 type WorkflowStep struct {

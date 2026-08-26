@@ -24,6 +24,7 @@ func NewDiscordServer() *gomcp.Server {
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "send_message",
 		Description: "Post a message to the Discord channel this integration's incoming webhook is bound to.",
+		Annotations: mcp.ReversibleWrite(),
 	}, discordSendMessage)
 
 	return server

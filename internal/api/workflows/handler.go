@@ -21,6 +21,7 @@ import (
 
 	"github.com/founderstack/api/internal/api/authctx"
 	"github.com/founderstack/api/internal/api/response"
+	"github.com/founderstack/api/internal/core/graph"
 	"github.com/founderstack/api/internal/db/dbgen"
 	"github.com/founderstack/api/internal/db/tenant"
 )
@@ -32,15 +33,20 @@ var validTriggerTypes = map[string]bool{"manual": true, "scheduled": true, "webh
 // why this isn't user-configurable.
 var standardGraphDefinition = []byte(`{"nodes":["planner","rag_retriever","executor","validator","reporter"]}`)
 
-// Handler implements workflow 8's 6 endpoints.
+// Handler implements workflow 8's 6 endpoints, plus workflow 9's Run
+// endpoint (Run itself dates from workflow 8 — "queue a pending row" —
+// but now actually starts execution via launcher).
 type Handler struct {
-	appPool *pgxpool.Pool
+	appPool  *pgxpool.Pool
+	launcher *graph.Launcher
 }
 
 // NewHandler builds a Handler. appPool must be the app_user (RLS-enforced)
-// pool — every DB operation here goes through tenant.WithTx.
-func NewHandler(appPool *pgxpool.Pool) *Handler {
-	return &Handler{appPool: appPool}
+// pool — every DB operation here goes through tenant.WithTx. launcher is
+// what turns a queued run into a real, executing one — see
+// internal/core/graph/launch.go.
+func NewHandler(appPool *pgxpool.Pool, launcher *graph.Launcher) *Handler {
+	return &Handler{appPool: appPool, launcher: launcher}
 }
 
 // Register mounts all 6 routes on rg. rg's group must already have
@@ -406,11 +412,14 @@ func (h *Handler) Delete(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// Run queues a workflow run — POST /api/v1/workflows/{id}/run. Only
-// inserts a 'pending' workflow_runs row; nothing processes it yet (see
-// package doc comment). A founder clicking "Run Now" today gets a real,
-// durable queued-run record, not a fake success — workflow 9 is what will
-// make it actually execute.
+// Run starts a workflow run — POST /api/v1/workflows/{id}/run. Checks
+// launcher.Preflight (org kill switch, BYOK key presence) synchronously
+// before queuing anything, so a founder gets a real 4xx instead of a 202
+// that silently fails moments later — see graph.Launcher's own doc
+// comment. Once queued, launches execution via launcher.Launch on a
+// detached context (context.Background(), not c.Request.Context() —
+// this request has already returned its 202 by the time that goroutine
+// does real work).
 func (h *Handler) Run(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -422,7 +431,19 @@ func (h *Handler) Run(c *gin.Context) {
 		return
 	}
 
-	var runID string
+	if err := h.launcher.Preflight(c.Request.Context(), user.OrgID); err != nil {
+		var pe *graph.PreflightError
+		if errors.As(err, &pe) {
+			response.Fail(c, http.StatusBadRequest, pe.Code, pe.Message)
+			return
+		}
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not check run preflight")
+		return
+	}
+
+	var runID uuid.UUID
+	var agentID uuid.UUID
+	var input string
 	var notFound bool
 	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		wf, err := q.GetWorkflow(ctx, dbgen.GetWorkflowParams{OrgID: user.OrgID, ID: id})
@@ -433,13 +454,17 @@ func (h *Handler) Run(c *gin.Context) {
 			}
 			return err
 		}
+		if wf.TaskInputTemplate != nil {
+			input = *wf.TaskInputTemplate
+		}
 		run, err := q.InsertWorkflowRun(ctx, dbgen.InsertWorkflowRunParams{
 			WorkflowID: wf.ID, OrgID: user.OrgID, TriggeredBy: user.ID,
 		})
 		if err != nil {
 			return err
 		}
-		runID = run.ID.String()
+		runID = uuid.UUID(run.ID.Bytes)
+		agentID = uuid.UUID(wf.AgentID.Bytes)
 		return nil
 	})
 	if err != nil {
@@ -451,7 +476,11 @@ func (h *Handler) Run(c *gin.Context) {
 		return
 	}
 
-	response.OK(c, http.StatusAccepted, "Run queued", gin.H{"run_id": runID, "status": "pending"})
+	h.launcher.Launch(uuid.UUID(user.OrgID.Bytes), agentID, uuid.UUID(id.Bytes), runID, input)
+
+	response.OK(c, http.StatusAccepted, "Run started", gin.H{
+		"run_id": runID.String(), "status": "pending", "stream_url": "/api/v1/runs/" + runID.String() + "/stream",
+	})
 }
 
 // computeSchedule validates triggerType and, for "scheduled", parses

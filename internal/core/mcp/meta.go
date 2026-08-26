@@ -82,3 +82,29 @@ func ExtraFromRequest(req *gomcp.CallToolRequest) (map[string]string, bool) {
 		return nil, false
 	}
 }
+
+// idempotencyKeyMetaKey carries a deterministic per-tool-call key
+// (`{run_id}-{tool_call_index}`, set by graph.executeOneToolCall) for
+// tool handlers whose provider natively supports idempotent writes
+// (Stripe's `Idempotency-Key` header, e.g.) — protects a financial call
+// from double-executing if the same logical tool call is ever retried
+// (an approval batch re-Resume()'d, a crash-recovery replay) by letting
+// the provider itself recognize the retry and return the original
+// result instead of re-applying the effect. Additive, same reasoning as
+// extraMetaKey: most tool handlers ignore this key entirely.
+const idempotencyKeyMetaKey = "founderstack.idempotency_key"
+
+// WithIdempotencyKey returns CallToolParams.Meta carrying key.
+func WithIdempotencyKey(key string) gomcp.Meta {
+	return gomcp.Meta{idempotencyKeyMetaKey: key}
+}
+
+// IdempotencyKeyFromRequest returns the idempotency key
+// Gateway.ExecuteTool attached to this call's _meta, if any.
+func IdempotencyKeyFromRequest(req *gomcp.CallToolRequest) (string, bool) {
+	if req == nil || req.Params == nil {
+		return "", false
+	}
+	key, ok := req.Params.Meta[idempotencyKeyMetaKey].(string)
+	return key, ok
+}

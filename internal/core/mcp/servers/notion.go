@@ -30,11 +30,13 @@ func NewNotionServer() *gomcp.Server {
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "read_page",
 		Description: "Read a Notion page's title and text content.",
+		Annotations: mcp.ReadOnly(),
 	}, notionReadPage)
 
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "write_page",
 		Description: "Create a new Notion page (e.g. an SOP or blog draft) under a parent page.",
+		Annotations: mcp.ReversibleWrite(),
 	}, notionWritePage)
 
 	return server

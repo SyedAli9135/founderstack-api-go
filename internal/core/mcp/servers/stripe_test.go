@@ -89,6 +89,58 @@ func TestStripe_RefundPayment_MissingIDIsToolError(t *testing.T) {
 	}
 }
 
+func TestStripe_RefundPayment_ForwardsIdempotencyKey(t *testing.T) {
+	var gotHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("Idempotency-Key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"re_1","status":"succeeded"}`))
+	}))
+	defer srv.Close()
+	defer swapStripeAPIBase(srv.URL)()
+
+	session := connectStripeServer(t)
+	meta := mcp.WithToken("sk_test_whatever")
+	for k, v := range mcp.WithIdempotencyKey("run-abc-2") {
+		meta[k] = v
+	}
+
+	if _, err := session.CallTool(context.Background(), &gomcp.CallToolParams{
+		Name:      "refund_payment",
+		Arguments: map[string]any{"payment_intent_id": "pi_1"},
+		Meta:      meta,
+	}); err != nil {
+		t.Fatalf("CallTool error = %v", err)
+	}
+	if gotHeader != "run-abc-2" {
+		t.Fatalf("Idempotency-Key header = %q, want %q", gotHeader, "run-abc-2")
+	}
+}
+
+func TestStripe_RefundPayment_NoIdempotencyKeyMeansNoHeader(t *testing.T) {
+	var gotHeader string
+	var sawHeader bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader, sawHeader = r.Header.Get("Idempotency-Key"), r.Header.Get("Idempotency-Key") != ""
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"re_1","status":"succeeded"}`))
+	}))
+	defer srv.Close()
+	defer swapStripeAPIBase(srv.URL)()
+
+	session := connectStripeServer(t)
+	if _, err := session.CallTool(context.Background(), &gomcp.CallToolParams{
+		Name:      "refund_payment",
+		Arguments: map[string]any{"payment_intent_id": "pi_1"},
+		Meta:      mcp.WithToken("sk_test_whatever"), // no idempotency key set
+	}); err != nil {
+		t.Fatalf("CallTool error = %v", err)
+	}
+	if sawHeader {
+		t.Fatalf("Idempotency-Key header = %q, want no header at all when no key was supplied", gotHeader)
+	}
+}
+
 func TestStripe_RefundPayment_FullVsPartial(t *testing.T) {
 	var gotForm string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

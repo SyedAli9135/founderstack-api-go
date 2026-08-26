@@ -90,9 +90,9 @@ func TestGateway_ExecuteTool_FetchesAndDeliversRealToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build registry: %v", err)
 	}
-	gateway := NewGateway(appPool, encKey, registry)
+	gateway := NewGateway(appPool, encKey, registry, nil)
 
-	result, err := gateway.ExecuteTool(ctx, orgID, "echo", "echo_token", nil)
+	result, err := gateway.ExecuteTool(ctx, orgID, "echo", "echo_token", nil, "")
 	if err != nil {
 		t.Fatalf("ExecuteTool() error = %v", err)
 	}
@@ -115,7 +115,7 @@ func TestGateway_ExecuteTool_UnknownServiceIsError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build registry: %v", err)
 	}
-	gateway := NewGateway(appPool, make([]byte, 32), registry)
+	gateway := NewGateway(appPool, make([]byte, 32), registry, nil)
 
 	var orgID pgtype.UUID
 	if err := systemPool.QueryRow(ctx,
@@ -127,7 +127,7 @@ func TestGateway_ExecuteTool_UnknownServiceIsError(t *testing.T) {
 		_, _ = systemPool.Exec(context.Background(), "delete from organizations where id = $1", orgID)
 	})
 
-	if _, err := gateway.ExecuteTool(ctx, orgID, "not-a-real-service", "whatever", nil); err == nil {
+	if _, err := gateway.ExecuteTool(ctx, orgID, "not-a-real-service", "whatever", nil, ""); err == nil {
 		t.Fatal("ExecuteTool() error = nil, want ErrUnknownTool")
 	}
 }

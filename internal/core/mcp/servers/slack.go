@@ -27,11 +27,13 @@ func NewSlackServer() *gomcp.Server {
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "send_message",
 		Description: "Send a message to a Slack channel.",
+		Annotations: mcp.ReversibleWrite(),
 	}, slackSendMessage)
 
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "list_channels",
 		Description: "List channels the bot can see in the connected Slack workspace.",
+		Annotations: mcp.ReadOnly(),
 	}, slackListChannels)
 
 	return server

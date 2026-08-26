@@ -116,3 +116,60 @@ func TestLinkedIn_DraftPost_APIErrorSurfacesBody(t *testing.T) {
 		t.Fatal("result.IsError = false, want true for a 403 from LinkedIn")
 	}
 }
+
+func TestLinkedIn_DraftPost_RetriesOnExplicitServerErrorThenSucceeds(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("x-restli-id", "urn:li:share:retry-ok")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	defer swapLinkedInAPIBase(srv.URL)()
+
+	session := connectLinkedInServer(t)
+	result, err := session.CallTool(context.Background(), &gomcp.CallToolParams{
+		Name:      "draft_post",
+		Arguments: map[string]any{"author_urn": "urn:li:person:abc123", "text": "Hello"},
+		Meta:      mcp.WithToken("linkedin_test_token"),
+	})
+	if err != nil {
+		t.Fatalf("CallTool protocol error = %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("result.IsError = true, want the retry to have recovered: %+v", result.Content)
+	}
+	if calls != 2 {
+		t.Fatalf("server received %d requests, want 2 (1 retry after the 503)", calls)
+	}
+}
+
+func TestLinkedIn_DraftPost_DoesNotRetryTerminalStatus(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	defer swapLinkedInAPIBase(srv.URL)()
+
+	session := connectLinkedInServer(t)
+	result, err := session.CallTool(context.Background(), &gomcp.CallToolParams{
+		Name:      "draft_post",
+		Arguments: map[string]any{"author_urn": "urn:li:person:abc123", "text": "Hello"},
+		Meta:      mcp.WithToken("linkedin_test_token"),
+	})
+	if err != nil {
+		t.Fatalf("CallTool protocol error = %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("result.IsError = false, want true for a 403")
+	}
+	if calls != 1 {
+		t.Fatalf("server received %d requests, want exactly 1 (a 403 must not retry)", calls)
+	}
+}

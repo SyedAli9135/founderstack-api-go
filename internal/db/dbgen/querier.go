@@ -29,6 +29,10 @@ type Querier interface {
 	// separate "really gone" state the way documents/agents effectively do.
 	DeactivateWorkflow(ctx context.Context, arg DeactivateWorkflowParams) (int64, error)
 	DeleteDocumentChunks(ctx context.Context, docID pgtype.UUID) error
+	// Fills in the completion-summary fields checkpoint() itself doesn't own
+	// (status stays checkpoint()'s alone) — only called once a run reaches a
+	// genuinely terminal status, never for awaiting_approval.
+	FinalizeRun(ctx context.Context, arg FinalizeRunParams) error
 	// Queries backing BYOK API key management (workflow 3). Run through
 	// app_user via tenant.WithTx — this is genuinely tenant-scoped data, not a
 	// system-context lookup like clerk_sync.sql or auth.sql. Provider is a
@@ -47,8 +51,20 @@ type Querier interface {
 	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
 	GetDocument(ctx context.Context, arg GetDocumentParams) (GetDocumentRow, error)
 	GetKeyStatusByProvider(ctx context.Context, arg GetKeyStatusByProviderParams) (GetKeyStatusByProviderRow, error)
+	// graph.Launcher's run lifecycle (POST /workflows/{id}/run's async goroutine
+	// — see internal/core/graph/launch.go) and the read-only HTTP endpoints
+	// (GET /runs, GET /runs/{id}).
+	// Preflight (kill switch) + provider resolution for Launcher.Launch.
+	GetOrgRunSettings(ctx context.Context, id pgtype.UUID) (GetOrgRunSettingsRow, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
 	GetOrganizationMaxAgents(ctx context.Context, id pgtype.UUID) (*int32, error)
+	GetRunCheckpoint(ctx context.Context, arg GetRunCheckpointParams) (GetRunCheckpointRow, error)
+	GetRunDetail(ctx context.Context, arg GetRunDetailParams) (GetRunDetailRow, error)
+	// Read back the definitive status Engine's own checkpoint() already
+	// wrote (completed/failed/cancelled/awaiting_approval) — Launcher can't
+	// infer this from Engine.Run's returned error alone, since a suspended
+	// run also returns a nil error.
+	GetRunStatus(ctx context.Context, arg GetRunStatusParams) (string, error)
 	GetWorkflow(ctx context.Context, arg GetWorkflowParams) (GetWorkflowRow, error)
 	GetWorkflowRun(ctx context.Context, arg GetWorkflowRunParams) (GetWorkflowRunRow, error)
 	// Only called after purgeDocumentJob has successfully removed the
@@ -59,6 +75,14 @@ type Querier interface {
 	// rows (pgx.ErrNoRows on the :one Scan), which the handler translates to a
 	// 400 DUPLICATE_AGENT_NAME rather than a generic 500.
 	InsertAgent(ctx context.Context, arg InsertAgentParams) (InsertAgentRow, error)
+	// Written from internal/core/graph/observability.go — every tool call
+	// and every LLM call the executor makes writes one row to each of these,
+	// closing the "nothing existing to reuse" gap flagged in the Workflow 9
+	// harness planning notes. Real per-token dollar pricing is workflow 11's
+	// job (see WORKFLOW_PLAN_GO.md) — estimated_cost_usd is written as 0 for
+	// now; token counts themselves are real and useful on their own.
+	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
+	InsertCostLedgerEntry(ctx context.Context, arg InsertCostLedgerEntryParams) error
 	// Queries backing workflow 6 (document upload / RAG). Tenant-scoped reads
 	// and writes run through app_user via tenant.WithTx, same convention as
 	// every other feature area in this file set. The recovery-sweep query
@@ -115,6 +139,7 @@ type Querier interface {
 	// false (not SQL NULL) when llm_provider is unset, so the generated Go
 	// field is a plain bool, not a nullable pointer.
 	ListKeyStatuses(ctx context.Context, orgID pgtype.UUID) ([]ListKeyStatusesRow, error)
+	ListRunsForOrg(ctx context.Context, arg ListRunsForOrgParams) ([]ListRunsForOrgRow, error)
 	// Documents whose background job (processDocument or purgeDocumentJob)
 	// may have been running in a process that restarted mid-job — the
 	// goroutine-based tradeoff internal/core/documents.RecoverStuckJobs
@@ -133,6 +158,12 @@ type Querier interface {
 	MarkConnectionExpiredByIDSystem(ctx context.Context, id pgtype.UUID) (int64, error)
 	MarkDocumentFailed(ctx context.Context, arg MarkDocumentFailedParams) error
 	MarkDocumentIndexed(ctx context.Context, arg MarkDocumentIndexedParams) error
+	// Used only when dependency resolution itself fails before Engine.Run
+	// ever starts (a bad policy_scope, a registry error, ...) — there's no
+	// checkpoint yet for a normal Engine-driven "failed" transition to have
+	// written, so this writes the terminal status directly.
+	MarkRunFailedPreflight(ctx context.Context, arg MarkRunFailedPreflightParams) error
+	MarkRunStarted(ctx context.Context, arg MarkRunStartedParams) error
 	RevokeConnection(ctx context.Context, arg RevokeConnectionParams) (int64, error)
 	SetOrganizationActiveApiKey(ctx context.Context, arg SetOrganizationActiveApiKeyParams) error
 	SoftDeleteDocument(ctx context.Context, arg SoftDeleteDocumentParams) error
@@ -156,6 +187,12 @@ type Querier interface {
 	// having come from ListExpiringConnectionsSystem's own row.
 	UpdateConnectionTokensByIDSystem(ctx context.Context, arg UpdateConnectionTokensByIDSystemParams) (int64, error)
 	UpdateDocumentProcessing(ctx context.Context, arg UpdateDocumentProcessingParams) error
+	// internal/core/graph's checkpoint read/write — the engine.Run/Resume/checkpoint
+	// calls added workflow9_engine_guardrails.up.sql for. Always run through
+	// tenant.WithTx (a fresh transaction per call, org-scoped) — never held open across
+	// a node's tool-call loop or an approval-gate pause. See WORKFLOW_PLAN_GO.md's
+	// Workflow 9 harness planning notes for the full reasoning.
+	UpdateRunCheckpoint(ctx context.Context, arg UpdateRunCheckpointParams) error
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (int64, error)
 	// Partial update via COALESCE, same convention as UpdateAgent — but
 	// trigger_type/cron_expression/next_run_at are 3 fields the *handler*

@@ -28,11 +28,13 @@ func NewGoogleCalendarServer() *gomcp.Server {
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "list_events",
 		Description: "List upcoming events on the founder's primary Google Calendar.",
+		Annotations: mcp.ReadOnly(),
 	}, calendarListEvents)
 
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "create_event",
 		Description: "Create an event on the founder's primary Google Calendar.",
+		Annotations: mcp.ReversibleWrite(),
 	}, calendarCreateEvent)
 
 	return server

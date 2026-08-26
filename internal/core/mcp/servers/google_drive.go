@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -40,16 +41,19 @@ func NewGoogleDriveServer() *gomcp.Server {
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "list_files",
 		Description: "List Drive files this integration can see (drive.file scope: only files this app created or the founder explicitly shared with it).",
+		Annotations: mcp.ReadOnly(),
 	}, driveListFiles)
 
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "read_file",
 		Description: "Read a Drive file's raw content. Plain text/binary files only — Google-native Docs/Sheets/Slides need the export API, not implemented here.",
+		Annotations: mcp.ReadOnly(),
 	}, driveReadFile)
 
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "create_file",
 		Description: "Create a new file in Drive with the given text content.",
+		Annotations: mcp.ReversibleWrite(),
 	}, driveCreateFile)
 
 	return server
@@ -124,29 +128,47 @@ func driveReadFile(ctx context.Context, req *gomcp.CallToolRequest, in driveRead
 	}
 
 	// alt=media returns the file's raw bytes, not a JSON envelope, so
-	// this can't go through doJSON — it needs the response body verbatim.
+	// this can't go through doJSON/doAndDecode — it needs the response
+	// body verbatim. Always a GET (a read), so — unlike doAndDecode's
+	// isWrite guard — both a network-level failure and an explicit
+	// 429/5xx response are safe to retry here.
 	endpoint := fmt.Sprintf("%s/files/%s?alt=media", driveAPIBase, in.FileID)
-	httpReq, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
-	if err != nil {
-		return nil, driveReadFileOutput{}, fmt.Errorf("servers: build request: %w", err)
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := httpClient.Do(httpReq)
-	if err != nil {
-		return nil, driveReadFileOutput{}, fmt.Errorf("google_drive: read file: %w", err)
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 1; attempt <= toolCallMaxAttempts; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+		if err != nil {
+			return nil, driveReadFileOutput{}, fmt.Errorf("servers: build request: %w", err)
+		}
+		httpReq.Header.Set("Authorization", "Bearer "+token)
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20)) // 5 MiB cap
-	if err != nil {
-		return nil, driveReadFileOutput{}, fmt.Errorf("google_drive: read response: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, driveReadFileOutput{}, fmt.Errorf("google_drive: %s returned %d: %s", endpoint, resp.StatusCode, truncate(body, 500))
-	}
+		resp, err := httpClient.Do(httpReq)
+		if err != nil {
+			lastErr = fmt.Errorf("%w: %s: %w", mcp.ErrToolRetryable, endpoint, err)
+			if attempt < toolCallMaxAttempts && sleepBackoff(ctx, attempt) {
+				continue
+			}
+			return nil, driveReadFileOutput{}, lastErr
+		}
 
-	return nil, driveReadFileOutput{Content: string(body)}, nil
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 5<<20)) // 5 MiB cap
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, driveReadFileOutput{}, fmt.Errorf("google_drive: read response: %w", readErr)
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			classified := mcp.ClassifyToolHTTPError(resp.StatusCode, fmt.Sprintf("%s returned: %s", endpoint, truncate(body, 500)))
+			if errors.Is(classified, mcp.ErrToolRetryable) && attempt < toolCallMaxAttempts && sleepBackoff(ctx, attempt) {
+				lastErr = classified
+				continue
+			}
+			return nil, driveReadFileOutput{}, classified
+		}
+
+		return nil, driveReadFileOutput{Content: string(body)}, nil
+	}
+	return nil, driveReadFileOutput{}, lastErr
 }
 
 type driveCreateFileInput struct {

@@ -26,12 +26,14 @@ import (
 	"github.com/founderstack/api/internal/api/identity"
 	integrationsapi "github.com/founderstack/api/internal/api/integrations"
 	"github.com/founderstack/api/internal/api/middleware"
+	runsapi "github.com/founderstack/api/internal/api/runs"
 	"github.com/founderstack/api/internal/api/settings"
 	v1 "github.com/founderstack/api/internal/api/v1"
 	"github.com/founderstack/api/internal/api/webhooks"
 	workflowsapi "github.com/founderstack/api/internal/api/workflows"
 	"github.com/founderstack/api/internal/config"
 	coredocs "github.com/founderstack/api/internal/core/documents"
+	"github.com/founderstack/api/internal/core/graph"
 	"github.com/founderstack/api/internal/core/integrations"
 	"github.com/founderstack/api/internal/core/integrations/providers"
 	coremcp "github.com/founderstack/api/internal/core/mcp"
@@ -101,13 +103,9 @@ func run() error {
 
 	integrationsRegistry := newIntegrationsRegistry(cfg)
 
-	// Not wired to any HTTP route or Gateway yet — tool execution is
-	// workflow 9's job (the executor node, once internal/core/graph
-	// exists; that's also when coremcp.NewGateway(dbPool, encryptionKey,
-	// mcpRegistry) actually gets called). Building the registry here
-	// anyway means a wiring bug (a malformed tool schema, a missing
-	// registration) fails the process at boot, not silently the first
-	// time something tries to call a tool.
+	// Building the registry here means a wiring bug (a malformed tool
+	// schema, a missing registration) fails the process at boot, not
+	// silently the first time something tries to call a tool.
 	mcpRegistry, err := newMCPRegistry(ctx)
 	if err != nil {
 		return fmt.Errorf("build mcp tool registry: %w", err)
@@ -119,6 +117,18 @@ func run() error {
 		}
 		logger.Info("mcp tool registry ready", "services", len(tools), "tools", count)
 	}
+
+	// Workflow 9: the execution engine. mcpGateway is registry's paired
+	// executor — the one call site that fetches+decrypts an org's
+	// integration token and attaches it to a tool call (see
+	// coremcp.Gateway's own doc comment). engine is a singleton shared by
+	// every run this process ever starts, since its EventBus/cancel map
+	// are process-wide by design. launcher is what
+	// workflowsapi.Handler.Run calls to actually turn a queued run into
+	// an executing one.
+	mcpGateway := coremcp.NewGateway(dbPool, encryptionKey, mcpRegistry, redisClient)
+	graphEngine := graph.NewEngine(dbPool)
+	launcher := graph.NewLauncher(graphEngine, dbPool, encryptionKey, mcpRegistry, mcpGateway)
 
 	// Workflow 6 (document upload / RAG). Pinecone is required here (unlike
 	// newPineconeClient's nil-if-unconfigured fallback for the health
@@ -141,7 +151,7 @@ func run() error {
 	// job queue.
 	docsProcessor.RecoverStuckJobs(ctx, systemPool)
 
-	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, mcpRegistry)
+	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, mcpRegistry, graphEngine, launcher)
 
 	// Runs until ctx is cancelled (same SIGINT/SIGTERM signal the HTTP
 	// server shuts down on) — see integrations.RunRefreshJob's doc comment
@@ -224,7 +234,7 @@ func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	return client, nil
 }
 
-func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, mcpRegistry *coremcp.Registry) *gin.Engine {
+func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, mcpRegistry *coremcp.Registry, graphEngine *graph.Engine, launcher *graph.Launcher) *gin.Engine {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -274,7 +284,11 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 
 	apiWorkflows := router.Group("/api/v1")
 	apiWorkflows.Use(middleware.RequireAuth(systemDB, cfg))
-	workflowsapi.NewHandler(db).Register(apiWorkflows)
+	workflowsapi.NewHandler(db, launcher).Register(apiWorkflows)
+
+	apiRuns := router.Group("/api/v1")
+	apiRuns.Use(middleware.RequireAuth(systemDB, cfg))
+	runsapi.NewHandler(db, graphEngine).Register(apiRuns)
 
 	return router
 }
