@@ -92,7 +92,7 @@ func executorNode(deps RunDeps) NodeFunc {
 			if err != nil {
 				return "", fmt.Errorf("graph: executor chat call: %w", err)
 			}
-			accumulateUsage(state, resp.Usage)
+			accumulateUsage(state, deps.Model, resp.Usage)
 			if err := writeCostLedgerLLMCall(ctx, deps, state, deps.Model, resp.Usage); err != nil {
 				slog.Error("graph: write cost_ledger for LLM call failed", "run_id", state.WorkflowRunID, "err", err)
 			}
@@ -402,11 +402,17 @@ func marshalOrQuote(s string) []byte {
 }
 
 // accumulateUsage folds one Send call's token usage into the run's
-// running total.
-func accumulateUsage(state *RunState, u llm.TokenUsage) {
+// running total, plus a rough dollar estimate (llm.EstimateCostUSD, keyed
+// by model — see its doc comment for why this is an estimate, not
+// billing-grade) into CostSoFarUSD, which policy_scope.max_cost_per_run_usd
+// is actually enforced against. Before this, CostSoFarUSD was never
+// incremented anywhere, so that cap could never trip — found and fixed
+// while building MOCK_LLM_TESTING.md's manual verification guide.
+func accumulateUsage(state *RunState, model string, u llm.TokenUsage) {
 	state.TokenUsage.InputTokens += u.InputTokens
 	state.TokenUsage.OutputTokens += u.OutputTokens
 	state.TokenUsage.CachedTokens += u.CachedTokens
+	state.CostSoFarUSD += llm.EstimateCostUSD(model, u)
 }
 
 // toolCallBatchSignature is order-independent within a batch (the model

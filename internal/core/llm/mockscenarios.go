@@ -72,10 +72,10 @@ type approvalScenarioClient struct{}
 func (approvalScenarioClient) Send(ctx context.Context, systemPrompt string, messages []Message, tools []ToolSchema) (ChatResponse, error) {
 	for _, m := range messages {
 		if m.Role == RoleTool && m.Name == "stripe.refund_payment" {
-			return ChatResponse{StopReason: StopReasonEndTurn, Content: "Refund processed. Task complete."}, nil
+			return ChatResponse{StopReason: StopReasonEndTurn, Content: "Refund processed. Task complete.", Usage: turnUsage}, nil
 		}
 	}
-	return ChatResponse{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{
+	return ChatResponse{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{
 		{ID: "call_1", Name: "stripe.refund_payment", Args: toolCallArgs(`{"payment_intent_id":"pi_mock_123","amount_cents":500}`)},
 	}}, nil
 }
@@ -104,20 +104,32 @@ type mockScenario struct {
 
 func toolCallArgs(jsonArgs string) json.RawMessage { return json.RawMessage(jsonArgs) }
 
+// turnUsage is a representative per-turn token count applied to every
+// scenario response below — realistic enough that CostSoFarUSD actually
+// accumulates something (see llm.EstimateCostUSD), which is what makes
+// "mock:cost-cap" below able to exercise
+// policy_scope.max_cost_per_run_usd at all. A MockChatClient response
+// otherwise defaults its Usage to the zero value, which is why this
+// guardrail looked untestable at first — cost never moved because these
+// scenarios never reported any token usage, not just because
+// RunState.CostSoFarUSD itself wasn't wired up (that was the other half
+// of the same bug — see accumulateUsage's doc comment).
+var turnUsage = TokenUsage{InputTokens: 500, OutputTokens: 150}
+
 var mockScenarios = map[string]mockScenario{
 	"mock:happy": {
 		description: "single turn, no tool calls — proves node sequencing (planner→executor→validator→reporter) and the complete SSE event end to end",
 		responses: []ChatResponse{
-			{StopReason: StopReasonEndTurn, Content: "Task complete — no tools were needed for this run."},
+			{StopReason: StopReasonEndTurn, Content: "Task complete — no tools were needed for this run.", Usage: turnUsage},
 		},
 	},
 	"mock:tool-call": {
 		description: "requests notion.read_page once, reacts to whatever comes back (a real result if Notion is connected for this org, a terminal tool error otherwise) — proves tool_call/tool_result SSE events, per-tool-call checkpointing, and the cost_ledger/audit_logs writes",
 		responses: []ChatResponse{
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{
 				{ID: "call_1", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-test-page"}`)},
 			}},
-			{StopReason: StopReasonEndTurn, Content: "Finished reviewing the page."},
+			{StopReason: StopReasonEndTurn, Content: "Finished reviewing the page.", Usage: turnUsage},
 		},
 	},
 	// "mock:approval" is NOT in this map — see MockScenarioResolver's and
@@ -126,7 +138,7 @@ var mockScenarios = map[string]mockScenario{
 	"mock:policy-violation": {
 		description: "requests notion.write_page — configure the test agent's allowed_tools to exclude it, so CheckToolAllowed rejects the call and the run aborts",
 		responses: []ChatResponse{
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{
 				{ID: "call_1", Name: "notion.write_page", Args: toolCallArgs(`{"parent_page_id":"mock-parent","title":"Mock page","content":"hello"}`)},
 			}},
 		},
@@ -134,10 +146,10 @@ var mockScenarios = map[string]mockScenario{
 	"mock:stuck-loop": {
 		description: "requests the exact same notion.read_page call twice in a row — the stuck-loop detector aborts on the repeat",
 		responses: []ChatResponse{
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{
 				{ID: "call_1", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-test-page"}`)},
 			}},
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{
 				{ID: "call_2", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-test-page"}`)},
 			}},
 		},
@@ -145,22 +157,32 @@ var mockScenarios = map[string]mockScenario{
 	"mock:tool-call-cap": {
 		description: "requests notion.read_page 5 times in a row, each with a different page_id (so the stuck-loop detector never trips) — configure the test agent's policy_scope.max_tool_calls below 5 so CheckCaps aborts the run first",
 		responses: []ChatResponse{
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{{ID: "call_1", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-1"}`)}}},
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{{ID: "call_2", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-2"}`)}}},
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{{ID: "call_3", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-3"}`)}}},
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{{ID: "call_4", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-4"}`)}}},
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{{ID: "call_5", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-5"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{{ID: "call_1", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-1"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{{ID: "call_2", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-2"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{{ID: "call_3", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-3"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{{ID: "call_4", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-4"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{{ID: "call_5", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-5"}`)}}},
+		},
+	},
+	"mock:cost-cap": {
+		description: "same 5-distinct-calls shape as mock:tool-call-cap, but each turn reports 5000 input / 2000 output tokens — configure the test agent's policy_scope.max_cost_per_run_usd low enough (e.g. 0.05) that CheckCaps' cost check aborts the run before max_tool_calls would",
+		responses: []ChatResponse{
+			{StopReason: StopReasonToolUse, Usage: TokenUsage{InputTokens: 5000, OutputTokens: 2000}, ToolCalls: []ToolCall{{ID: "call_1", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-1"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: TokenUsage{InputTokens: 5000, OutputTokens: 2000}, ToolCalls: []ToolCall{{ID: "call_2", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-2"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: TokenUsage{InputTokens: 5000, OutputTokens: 2000}, ToolCalls: []ToolCall{{ID: "call_3", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-3"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: TokenUsage{InputTokens: 5000, OutputTokens: 2000}, ToolCalls: []ToolCall{{ID: "call_4", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-4"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: TokenUsage{InputTokens: 5000, OutputTokens: 2000}, ToolCalls: []ToolCall{{ID: "call_5", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-5"}`)}}},
 		},
 	},
 	"mock:cancel": {
 		description: "same shape as mock:tool-call-cap (5 distinct tool-call turns) but each Send call sleeps 5s first — gives a human time to POST /runs/{id}/cancel against a real in-flight run",
 		delay:       5 * time.Second,
 		responses: []ChatResponse{
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{{ID: "call_1", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-1"}`)}}},
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{{ID: "call_2", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-2"}`)}}},
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{{ID: "call_3", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-3"}`)}}},
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{{ID: "call_4", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-4"}`)}}},
-			{StopReason: StopReasonToolUse, ToolCalls: []ToolCall{{ID: "call_5", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-5"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{{ID: "call_1", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-1"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{{ID: "call_2", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-2"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{{ID: "call_3", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-3"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{{ID: "call_4", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-4"}`)}}},
+			{StopReason: StopReasonToolUse, Usage: turnUsage, ToolCalls: []ToolCall{{ID: "call_5", Name: "notion.read_page", Args: toolCallArgs(`{"page_id":"mock-page-5"}`)}}},
 		},
 	},
 }

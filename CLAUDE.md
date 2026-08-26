@@ -935,8 +935,8 @@ after `Launch()` returns — both 2+ orders of magnitude under budget.
 in production — see `Config.MockLLMMode`) swaps the Launcher's `ChatClientResolver` for
 `llm.MockScenarioResolver`, driving the whole harness through the real HTTP API and real
 Postgres with zero live provider calls. See `MOCK_LLM_TESTING.md` for the full step-by-step
-guide (scenario catalog, SSE-watching notes, cleanup) — it also documents two real bugs this
-approach caught that the existing test suite hadn't: `mock:approval`'s canned-response design
+guide (scenario catalog, SSE-watching notes, cleanup) — it also documents three real bugs/gaps
+this approach caught that the existing test suite hadn't: `mock:approval`'s canned-response design
 breaking across the `Engine.Resume` boundary (fixed via a conversation-aware mock client,
 `approvalScenarioClient`), and a genuine pre-existing production bug where `Launcher.Launch`'s
 error fallback unconditionally overwrote a correctly-checkpointed `'cancelled'` status back to
@@ -947,14 +947,21 @@ same dependency-resolution-then-drive-the-engine shape as `Launch`, just re-ente
 will call; today it's also reachable via the dev-only `POST /runs/{id}/dev-resume` route
 (`internal/api/runs/devresume.go`), registered only when `MOCK_LLM_MODE` is on.
 
-**Known gap surfaced while building the mock-testing guide, not yet fixed**:
-`policy_scope.max_cost_per_run_usd` cannot currently trip — `RunState.CostSoFarUSD` is never
-incremented anywhere in `internal/core/graph` (every `cost_ledger` row is written with
-`EstimatedCostUsd: 0`, real per-token/per-tool pricing being explicitly deferred to workflow 11),
-so `PolicyScope.CheckCaps`'s cost check reads a counter that never moves. `policy_scope.
-max_tool_calls` is unaffected and works correctly — only the cost cap is dead in practice today.
-Needs a decision: add a rough interim per-token cost estimate now so the cap is real, or leave it
-unenforced and make sure no UI implies otherwise before workflow 11 lands real pricing.
+**`policy_scope.max_cost_per_run_usd` gap, found and fixed the same pass**:
+`RunState.CostSoFarUSD` was never incremented anywhere in `internal/core/graph`, so
+`PolicyScope.CheckCaps`'s cost check read a counter that never moved — the cap could never
+actually trip. Fixed via `internal/core/llm/pricing.go`'s `EstimateCostUSD` (a deliberately rough,
+clearly-labeled-as-an-estimate per-token price table, keyed by loose substring match against the
+agent's `model` string, with a fallback rate for anything unmatched — same "estimate for planning
+purposes, not billing-grade" framing this codebase already uses for Stripe's `get_mrr`; **real,
+billing-grade per-token pricing is still workflow 11's job**), called from both
+`accumulateUsage` (adds to `RunState.CostSoFarUSD`, which `CheckCaps` reads) and
+`writeCostLedgerLLMCall` (the persisted `cost_ledger.estimated_cost_usd`, previously hardcoded
+`0`). `writeCostLedgerToolCall`'s `EstimatedCostUsd` stays `0` deliberately, not as a gap — none
+of the 8 tool servers this codebase calls charge per-API-call. Verified live via
+`MOCK_LLM_MODE`'s new `mock:cost-cap` scenario: a `$0.05` cap aborted a run at
+`cost_so_far_usd: 0.055` after 5 tool calls, the same "checked after every tool call" semantics
+`max_tool_calls` already had. `internal/core/llm/pricing_test.go` covers the pure pricing logic.
 
 ### No ORM — `pgx` + `sqlc`, not GORM
 

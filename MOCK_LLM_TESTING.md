@@ -4,7 +4,7 @@ This is the step-by-step guide for exercising the whole agent execution engine
 (`internal/core/graph`) against a real, running server and real Postgres —
 with **zero real LLM provider calls** — using `MOCK_LLM_MODE`. Every step below
 was actually run against a local dev server while writing this guide (not just
-written and assumed correct); two real bugs were found and fixed in the
+written and assumed correct); three real bugs/gaps were found and fixed in the
 process — see "Bugs found while writing this guide" at the bottom.
 
 ## Why this exists
@@ -243,6 +243,22 @@ so the stuck-loop detector never fires first).
 **Expected**: `status: "failed"`, `tool_call_count: 2` (aborts right at the
 cap, not before, not after).
 
+### `mock:cost-cap` — `max_cost_per_run_usd` enforcement
+
+**Proves**: `policy_scope.max_cost_per_run_usd` actually stops a run, using
+`llm.EstimateCostUSD`'s rough interim per-token estimate (real billing-grade
+pricing is workflow 11's job — see `internal/core/llm/pricing.go`'s doc
+comment).
+```
+policy_scope: {"allowed_tools": ["notion.read_page"], "max_cost_per_run_usd": 0.05}
+```
+Same 5-distinct-calls shape as `mock:tool-call-cap`, but each turn reports
+5000 input / 2000 output tokens (≈$0.011/turn at the fallback rate).
+**Expected**: `status: "failed"`, `tool_call_count: 5`, `cost_so_far_usd`
+just over `0.05` (confirmed live: `0.055`) — CheckCaps aborts right after the
+call that pushes cumulative cost over the cap, same "checked after every
+tool call" semantics as `max_tool_calls`.
+
 ### `mock:cancel` — mid-run cancellation
 
 **Proves**: `POST /runs/{id}/cancel` actually stops an in-flight run and
@@ -333,21 +349,6 @@ time curl -s -X POST localhost:8000/api/v1/workflows/$WF_ID/run -H "Authorizatio
 
 ## Known, deliberate gaps this guide does NOT cover
 
-- **`max_cost_per_run_usd` cannot currently be exercised — this is a real,
-  currently-unclosed gap, not a guide limitation.** `state.CostSoFarUSD` is
-  never incremented anywhere in `internal/core/graph` — every `cost_ledger`
-  row is written with `EstimatedCostUsd: 0` (real per-token/per-tool dollar
-  pricing is explicitly deferred to workflow 11), and nothing else updates
-  the run's running cost total either. `PolicyScope.CheckCaps`'s cost check
-  (`state.CostSoFarUSD >= *p.MaxCostPerRunUSD`) is real code, but the
-  counter it reads never moves — so today, no run can ever actually trip
-  this cap, regardless of what `max_cost_per_run_usd` is set to. Found
-  while building this guide, not previously known. Worth a real decision:
-  either add a rough interim per-token cost estimate now so the cap is
-  enforceable (clearly labeled as an estimate, same spirit as Stripe's MRR
-  estimate elsewhere in this codebase), or leave it unenforced until
-  workflow 11 and make sure the founder-facing UI doesn't imply the cap is
-  active today.
 - **The prompt-injection validator warning** (a tool result containing text
   like "ignore previous instructions") isn't reachable through this guide
   without a real connected integration whose actual data contains a trigger
@@ -382,9 +383,9 @@ Restart the server without `MOCK_LLM_MODE=true` (or with it explicitly
 
 ## Bugs found while writing this guide
 
-Both were caught by actually running the scenario end to end against a real
-server, not by reading the code — worth remembering as evidence for why this
-guide exists at all, not just a checklist.
+All three were caught by actually running the scenario end to end against a
+real server, not by reading the code — worth remembering as evidence for why
+this guide exists at all, not just a checklist.
 
 1. **`mock:approval`'s naive canned-response design broke across the
    suspend/resume boundary.** `Engine.Resume` triggers a brand-new
@@ -418,3 +419,20 @@ guide exists at all, not just a checklist.
    `Engine.Run` ever started) — the same fix was applied to the new
    `Launcher.Resume`'s equivalent fallback (checks for `'awaiting_approval'`
    instead of `'pending'`).
+3. **`policy_scope.max_cost_per_run_usd` could never actually trip.**
+   `RunState.CostSoFarUSD` was never incremented anywhere in
+   `internal/core/graph` — every mock scenario's canned `ChatResponse` also
+   defaulted `Usage` to the zero value, so even after the fix below, cost
+   wouldn't have moved without also giving the scenarios real token counts.
+   Two-part fix: `internal/core/llm/pricing.go`'s `EstimateCostUSD` (a
+   rough, clearly-labeled-as-an-estimate per-token price table — real
+   billing-grade pricing stays workflow 11's job) is now called from
+   `accumulateUsage` (adds to `RunState.CostSoFarUSD`) and from
+   `writeCostLedgerLLMCall` (the persisted `cost_ledger.estimated_cost_usd`,
+   previously hardcoded `0`); every scenario response in
+   `mockscenarios.go` now reports a representative `Usage` value (500
+   input / 150 output tokens per turn, or 5000/2000 for the new
+   `mock:cost-cap` scenario specifically). Verified live: a `$0.05` cap
+   against `mock:cost-cap`'s 5 calls aborted the run at `cost_so_far_usd:
+   0.055`, `tool_call_count: 5`, `status: "failed"` — exactly the "checked
+   after every tool call" semantics `max_tool_calls` already had.
