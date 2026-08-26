@@ -10,27 +10,28 @@ frontend (`../founderstack-web`, unchanged). See `../WORKFLOW_PLAN_GO.md` for th
 workflow-by-workflow spec this backend is built against; `../founderstack-api/CLAUDE.md`
 documents the Python original this mirrors.
 
-Orchestration will run on a **hand-rolled, provider-agnostic state machine** for the inner
+Orchestration runs on a **hand-rolled, provider-agnostic state machine** for the inner
 agent loop (decided 2026-08-21, after studying Goose AI's architecture — supersedes an earlier
 plan to use `anthropics/anthropic-sdk-go`'s built-in Tool Runner, which is Anthropic-specific
 and would have locked orchestration to one provider), plus a hand-rolled, Postgres-checkpointed
-`internal/core/graph` package for the outer planner → RAG → executor → approval → validator →
-reporter sequence (LangGraph's Go equivalent). Neither exists yet (workflow 9).
+`internal/core/graph` package for the outer planner → executor → approval_gate → validator →
+reporter sequence (LangGraph's Go equivalent). **Both are built as of workflow 9 (2026-08-26)**
+— see "Agent Execution Engine (workflow 9)" below.
 
 BYOK is **not** Claude-only: `internal/core/llm` validates and stores keys for 5 providers —
 Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 from an
 Anthropic-only original). See "BYOK API Keys" below.
 
-**Only workflows 1 (bootstrap), 2 (Clerk org/user sync), 3 (BYOK API key management), 4 (connect
-integration — OAuth/API-key), 5 (MCP tool gateway), 6 (document upload / RAG), 7 (agent
-configuration), and 8 (workflow config + scheduling) are implemented.** Don't assume routes,
-tables, or packages from later workflows in `WORKFLOW_PLAN_GO.md` exist yet — check
-`internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
-`internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`, and
-`internal/api/workflows/` for what's actually registered. Workflows 7 and 8 are configuration
-only — no agent actually runs, calls an LLM, or executes a tool yet, and a queued workflow run
-never advances past `status='pending'`; all of that is workflow 9's job (`internal/core/graph`,
-not built). Workflow 4's code is complete and tested, but nothing will actually connect to a live
+**Workflows 1 (bootstrap) through 9 (run a workflow / execution engine) are implemented.**
+Workflow 10 (human approval gates — Slack/email/push notifications, the `POST
+/approvals/{id}/approve`/`reject` endpoints, the frontend approval card) is not started; the
+run-suspends-at-an-approval-gate *mechanism* it will build on top of already exists and is
+tested (see "Agent Execution Engine" below), but nothing surfaces a pending approval to a human
+yet. Don't assume routes, tables, or packages from workflow 10+ in `WORKFLOW_PLAN_GO.md` exist —
+check `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`,
+`internal/api/identity/`, `internal/api/integrations/`, `internal/api/documents/`,
+`internal/api/agents/`, `internal/api/workflows/`, and `internal/api/runs/` for what's actually
+registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
 third party until real OAuth app credentials
 are registered on each provider's dashboard and put in `.env` — see "Third-Party Integrations
 (workflow 4)" below and its "Status" note in `WORKFLOW_PLAN_GO.md`.
@@ -730,6 +731,206 @@ unit-tests `computeSchedule` in isolation. `internal/api/workflows` lands at ~75
 loop itself isn't exercised, only the `tick`/`fireWorkflow` logic it calls each iteration, the
 same accepted gap `RunRefreshJob`'s own loop has.
 
+### Agent Execution Engine (workflow 9) — `internal/core/graph`, `internal/core/llm`, `internal/api/runs`
+
+`POST /api/v1/workflows/{id}/run` now actually runs a workflow — the point where workflows 7/8's
+"config only, no execution" boundary ends. `internal/core/graph` is a hand-rolled,
+Postgres-checkpointed state machine (LangGraph's Go equivalent, not a port of any Python code —
+`app/core/orchestration/` never existed in the Python original for this to mirror), driven by a
+hand-rolled, provider-agnostic `ChatClient` (`internal/core/llm`) rather than any one provider's
+SDK's bundled agentic loop. See `../WORKFLOW_PLAN_GO.md`'s Workflow 9 section (the harness
+planning notes above the User Stories) for the full guardrail-catalog reasoning this was built
+against — this section documents what actually got built, not the plan.
+
+**Design philosophy carried through the whole build**: the model does the reasoning (planning,
+tool choice, judging output); the harness only does mechanics (loop control, guardrail
+enforcement, checkpointing). No business judgment is encoded in Go — risk is a static per-tool
+property (see "risk tiers" below), never a runtime heuristic the harness computes.
+
+**`internal/core/graph`'s 5 nodes** (`nodes.go`), sequenced by `Engine.Run`/`Engine.Resume`
+(`engine.go`): `planner` → `executor` → (`approval_gate` →)\* `validator` → `reporter`.
+- `plannerNode` sends the run's input + tool schemas to the model, seeding `state.Conversation`.
+- `executorNode` is the inner ReAct loop — call the model, execute any requested tool calls
+  through the risk/policy gates, feed results back, repeat — bounded by
+  `policy_scope.max_tool_calls`, with the model's own "no tool calls returned" response as the
+  primary stop signal, not the harness guessing when it's done. Per requested tool call, in
+  order: `deps.Policy.CheckToolAllowed(tc.Name)` (enforces `agents.policy_scope.allowed_tools`
+  independently of what the planner asked for — planner intent isn't a security boundary), then
+  `RequiresApproval(deps.Tools.RiskLevel(tc.Name))` — a `write_destructive_or_financial` call
+  suspends the *whole current batch* and returns `NodeAwaitingApproval`, unconditionally,
+  regardless of amount (no threshold override, a founder-locked decision). A batch that clears
+  the risk check executes via `executeOneToolCall`, which computes an idempotency key for
+  financial-tier calls, calls the tool through `Gateway.ExecuteTool` (with retry — see "Terminal
+  vs. retryable tool errors" below), writes a `cost_ledger` row and an `audit_logs` row, and
+  checkpoints `RunState` (`deps.Engine.Checkpoint(ctx, state, "executor")`) — **after every
+  individual tool call, not just at node transitions**, closing the crash-mid-node
+  replay-from-tool-call-1 gap a coarser checkpoint granularity would have left. `deps.Policy.
+  CheckCaps(state)` runs after each call too, aborting the run if `max_tool_calls` or
+  `max_cost_per_run_usd` is exceeded. A stuck-loop detector
+  (`toolCallBatchSignature`) aborts if the model requests the exact same tool+args batch twice in
+  a row.
+- `approvalGateNode` only ever runs on `Engine.Resume` (a human's `Approved`/`Reason` decision
+  injected into a *freshly reloaded* `RunState`, not the caller's stale in-memory one) — it
+  executes (on approval) or discards (on rejection) `state.PendingToolCalls`, the batch
+  `executorNode` suspended on.
+- `validatorNode` runs a first-pass prompt-injection heuristic
+  (`suspiciousInstructionPatterns`) against tool *results* — tool output is untrusted input the
+  same way any external content is in an agentic system; a match adds to `state.Warnings`
+  (surfaced in the final output, never silently dropped), doesn't abort the run.
+- `reporterNode` produces the final `state.Output` and returns `NodeComplete`.
+
+**Checkpointing mechanics** (`checkpoint.go`): every checkpoint/audit/cost-ledger write is its
+own fresh `tenant.WithTx` call — never one transaction held open across `executorNode`'s
+tool-call loop or, especially, across an `approval_gate` pause (which can last up to 24 hours
+once workflow 10's expiry job exists) — that would be a real production bug (idle-in-transaction,
+connection pool exhaustion), not just style. Always the `app_user`/RLS-scoped pool: a single run
+always has exactly one concrete `org_id`, so there's never a reason for the engine itself to
+reach for `app_system`.
+
+**Detached execution context**: `graph.Launcher.Launch` (`launch.go`) fires
+`go l.run(context.Background(), ...)`, never `c.Request.Context()` — the same pattern
+`internal/api/documents/handler.go`'s background `Process`/`Purge`/`Reindex` goroutines already
+established. Gin cancels a request's context the instant its handler returns, which for a
+202-Accepted endpoint is almost immediately; passing the request context into the engine would
+cancel the run before it did any real work. `GET /runs/{id}/stream`'s own request context is the
+separate, correct place to detect an SSE client disconnecting.
+
+**`Launcher.Preflight`** (called synchronously by `POST /workflows/{id}/run`, before the
+`workflow_runs` row is even inserted) checks the two fast-failing conditions: the org kill switch
+(`organizations.agents_paused` — blocks *new* runs only, does not force-cancel anything already
+in flight, a founder-locked decision to avoid tearing down a half-executed tool call) and BYOK
+key presence (`ErrNoBYOKKey` → `400`, with the founder's provider choice and missing-key state
+both checked, not just "some key exists somewhere"). A `*graph.PreflightError`'s `Code` maps
+straight to the HTTP error code the workflows handler returns — no generic 500 for either
+condition.
+
+**Risk tiers, not just dollar thresholds** (`internal/core/mcp/risk.go`): every one of the 18 MCP
+tools across all 8 servers is tagged `read` / `write_reversible` /
+`write_destructive_or_financial` via MCP's own protocol-native `ToolAnnotations`
+(`ReadOnlyHint`/`DestructiveHint`) — not a second, parallel classification scheme, since every
+tool server here is first-party and in-process (the MCP spec's warning against trusting a remote
+server's self-reported annotations doesn't apply). `RiskLevelFor` **fails closed**: no
+annotations, or a `nil` `DestructiveHint`, lands on the most restrictive tier rather than silently
+skipping the approval gate — and `servers/risk_test.go`'s
+`TestAllServers_EveryToolHasRiskAnnotations` is a live regression guard (connects through a real
+MCP session), not a one-time check, so a 19th tool added later without an annotation fails CI
+immediately instead of silently auto-approving. Two deliberate judgment calls worth knowing:
+Stripe's `create_invoice` is `write_reversible` (no auto-charge, a draft/open invoice can still be
+voided); LinkedIn's `draft_post` is `write_destructive_or_financial` despite not being
+financial — a public, permanent, brand-visible publish with no undo step gets treated the same as
+an irreversible financial action.
+
+**Idempotency keys, financial-tier only** (`internal/core/mcp/meta.go`'s
+`WithIdempotencyKey`/`IdempotencyKeyFromRequest`): `{run_id}-{tool_call_index}`, carried via
+`_meta` — same channel as the credential token, never a tool argument — because
+`Engine.Resume()` after an approval, or a crash-recovery replay, can re-run the executor node's
+tool call. Only computed when `RequiresApproval(risk)` is true; Stripe's
+`create_invoice`/`refund_payment` are the two handlers that actually forward it, as Stripe's own
+native `Idempotency-Key` header (`refund_payment`'s multi-step finalize gets a `-finalize`
+suffix) — every other tool handler ignores it harmlessly.
+
+**Per-`(org_id, service)` Redis rate limiting** (`internal/core/mcp/ratelimit.go`): an `INCR`-based
+token bucket (30 calls/minute), checked in `Gateway.ExecuteTool` before dispatching. Reuses the
+same Redis client `internal/core/integrations/state.go` already uses for OAuth CSRF state.
+**Fails open**, not closed, on a nil client or a Redis error — a resource-protection measure, not
+a security guardrail, so a Redis outage shouldn't also take down every agent run. A tripped limit
+is `graph.ErrToolRetryable`-classified (see below), never run-ending on its own.
+
+**Terminal vs. retryable tool errors** (`internal/core/mcp/toolerrors.go`): `ErrToolTerminal`/
+`ErrToolRetryable`, classified by `ClassifyToolHTTPError(statusCode, detail)` — a 4xx is terminal,
+429/5xx/network timeout is retryable. **Real architectural finding, not assumed correct from the
+plan**: the original plan sketched classifying a tool error inside `internal/core/graph` via
+`errors.Is` against a graph-level sentinel — but MCP's `mcp.ToolHandlerFor` flattens a tool
+handler's returned Go `error` into `CallToolResult.Content`/`IsError` (plain text) the instant it
+crosses the real protocol boundary, confirmed via the SDK's own doc comment — a wrapped Go error
+sentinel does not survive that round trip. Classification has to happen *before* the MCP boundary,
+which means at the HTTP-call layer inside `internal/core/mcp`/`internal/core/mcp/servers`, not
+downstream in `graph`. Retry-with-backoff lives in `servers/http_helper.go`'s `doAndDecode` (one
+choke point covering 6 of 8 tool servers, bounded at 3 attempts) — with a write-safety guard: a
+network-level failure is never auto-retried for a non-GET method (only an explicit 429/5xx
+response is), to avoid double-executing a create/refund/publish call whose request may have
+already reached the server. Transient errors don't count against `max_tool_calls` — only actual
+tool executions do.
+
+**Provider-agnostic `ChatClient`** (`internal/core/llm/chatclient.go`): one interface
+(`Send(ctx, systemPrompt, messages, tools) (ChatResponse, error)`), 3 code paths covering all 5
+BYOK providers (mirroring `verify.go`'s existing split) — `AnthropicChatClient`,
+`OpenAICompatibleChatClient` (shared for OpenAI/Qwen/DeepSeek — identical real API across all 3),
+`GeminiChatClient` (its own — different roles, different tool-calling wire format, and no
+per-call tool-call ID at all unlike the other two, which is what `Message.Name` exists
+specifically to work around, matching a result back to its call by function name instead).
+**Zero SDK dependency, `anthropic-sdk-go` included** — plain `net/http` against each provider's
+real REST API for all 3, a founder-caught correction mid-build (a first draft had started
+reaching for the SDK's plain `Messages.New`, reasoning "no toolrunner" only ruled out the SDK's
+*bundled agentic loop*, not a single-call client; the founder's call was to drop the SDK
+entirely here, matching this codebase's existing "don't add a dependency a single REST call
+doesn't justify" policy and keeping all 3 adapters stylistically consistent with each other).
+Anthropic's wire shapes were confirmed via `go doc` against the SDK's own struct JSON tags, not
+guessed, before hand-rolling them. `internal/core/llm/verify.go`'s existing
+`verifyAnthropic`/`llm.GetClient` are unrelated, unchanged, already-shipped BYOK code — this
+correction applies only to the new `ChatClient` implementations. Anthropic prompt caching is
+real, not just planned: `cache_control: ephemeral` on the system-prompt block. `llm.ResolveChatClient`
+(`resolve.go`) is the new multi-provider dispatcher `graph.Launcher` actually calls —
+`llm.GetClient` stays Anthropic-only, untouched, still only used by BYOK key validation.
+
+**`MockChatClient`** (`chat_mock.go`): deterministic, canned `ChatResponse` sequences, no
+network, no live provider — built alongside the real adapters from day one, not bolted on later,
+since live BYOK keys weren't available for manual testing during this build. Kept as the default
+test harness for `internal/core/graph` going forward, not just a stopgap: every
+`internal/core/graph` integration test drives the full engine (checkpointing, guardrails,
+approval gate, SSE events) through it, no real provider or network call anywhere in the suite.
+
+**Context/compaction strategy**: no mid-run conversation compaction — runs are bounded
+(`max_tool_calls`/timeout) and unlikely to actually exhaust a context window. Instead,
+`truncateForContext` (`nodes.go`, 4000-byte cap) truncates only the copy of a large tool result
+appended to `state.Conversation` (what the next `ChatClient.Send` call sees) — the full-fidelity
+result is never truncated in `state.ToolResults`, `cost_ledger`, or `audit_logs`, since those are
+the audit trail the guardrails above depend on.
+
+**`internal/core/graph/observability.go`**: `writeAuditLog`/`writeCostLedgerToolCall`/
+`writeCostLedgerLLMCall` — the first helper package for either table anywhere in this codebase
+(checked before building: neither existed). Each is its own `tenant.WithTx` call; a write failure
+is logged via `slog.Error` and never aborts the run — an audit-trail write failing shouldn't take
+down the agent run it's trying to record.
+
+**`internal/api/runs`**: `List`/`Get`/`Cancel`/`Stream`, all org-scoped. `Cancel` looks up the run
+in the caller's org before calling `Engine.Cancel(runID)`, since `Cancel` itself is an in-memory,
+process-wide, unscoped `map[runID]context.CancelFunc` lookup — the org check is what actually
+enforces the tenant boundary here, not the engine call. `Stream` is SSE via Gin's `c.Stream`,
+subscribing to `Engine.Bus` for the run's `run_id`. `EventNodeStart`/`EventNodeEnd` carry
+`NodeTransitionData{Node, AgentName}` (`AgentName` denormalized onto `RunState` at `Launch` time
+purely so the engine — which only ever sees `RunState`, never the `agents` table — can include it
+in these events); `EventComplete` carries `CompleteData{Output, TokenUsage, CostSoFarUSD}`. A
+real testing gotcha, not a production bug: `gin.Context.Stream` requires `http.CloseNotifier`,
+which `httptest.ResponseRecorder` doesn't implement (confirmed by actually running it against a
+recorder first, not assumed) — the one test exercising this endpoint uses a real
+`httptest.NewServer` instead, unlike every other handler test in this codebase.
+
+**Schema gaps found and fixed along the way** (neither existed when workflow 9 planning started,
+verified against the actual migrations, not assumed from the plan): migration
+`000008_workflow9_engine_guardrails` adds `workflow_runs.{checkpoint_state jsonb, current_node,
+cost_so_far_usd, tool_call_count}`, `approvals.risk_level`, `organizations.agents_paused`.
+**No new `agents` columns** — `max_tool_calls`/`max_cost_per_run_usd`/`allowed_tools` already
+live inside `agents.policy_scope` JSONB (workflow 7), already validated there; the engine reads
+from that JSONB, not a second source of truth. Migration
+`000009_workflow_runs_completion_fields` adds `workflow_runs.{started_at, completed_at, output,
+input_tokens, output_tokens, cached_tokens, duration_ms}` — the run-summary fields `Launcher.run`
+writes on finalize, missing from the original schema entirely.
+
+**Testing**: `internal/core/graph` has both pure unit tests (`eventbus_test.go`, `policy_test.go`,
+`nodes_test.go`) and real-Postgres integration tests covering the full engine (suspend-at-approval
+-then-resume-on-approve/reject, policy-disallowed-tool abort, stuck-loop abort,
+tool-call-cap-exceeded abort, validator warning-flagging, idempotency-key-set-for-financial-only,
+audit/cost-ledger writes) plus `Launcher` (preflight blocks on `agents_paused`/no-key, a full
+launch-to-completion run against a `MockChatClient`). `internal/core/llm` has 12 unit tests
+against fake `httptest` servers per provider (wire-shape correctness, full tool-call round trips,
+per-provider error classification including Gemini's 400-not-401 quirk) — no live provider call
+anywhere. `internal/api/runs` has 9 integration tests (list/filter, get, cross-org isolation,
+cancel in-flight/not-in-flight, stream, 404s). The two soft-latency acceptance criteria from
+`WORKFLOW_PLAN_GO.md` ("202 within 500ms", "SSE first event within 3s") were measured, not
+assumed: `Preflight` ~7ms, `Launch()`'s synchronous call ~14µs, first `node_start` SSE event ~9ms
+after `Launch()` returns — both 2+ orders of magnitude under budget.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -965,10 +1166,11 @@ machine — CI runs the authoritative version of the same check regardless.
 | `/api/v1/integrations/{service}/callback` | `internal/api/integrations/handler.go` | none — org/service recovered from `state`, not a JWT | OAuth provider redirect target (workflow 4) |
 | `/api/v1/documents/upload`, `GET /documents`, `GET /documents/{id}`, `DELETE /documents/{id}`, `POST /documents/{id}/reindex` | `internal/api/documents/handler.go` | `middleware.RequireAuth` | Upload/list/reindex/delete founder documents for RAG (workflow 6) |
 | `GET/POST /api/v1/agents`, `GET /agents/tools`, `GET/PATCH/DELETE /agents/{id}` | `internal/api/agents/handler.go` | `middleware.RequireAuth` | Agent configuration CRUD — no execution (workflow 7) |
-| `GET/POST /api/v1/workflows`, `GET/PATCH/DELETE /workflows/{id}`, `POST /workflows/{id}/run` | `internal/api/workflows/handler.go` | `middleware.RequireAuth` | Workflow config CRUD + queuing a run — no execution (workflow 8) |
+| `GET/POST /api/v1/workflows`, `GET/PATCH/DELETE /workflows/{id}`, `POST /workflows/{id}/run` | `internal/api/workflows/handler.go` | `middleware.RequireAuth` | Workflow config CRUD + **launches a real run** (workflow 8 CRUD, workflow 9 execution) |
+| `GET /api/v1/runs`, `GET /runs/{id}`, `POST /runs/{id}/cancel`, `GET /runs/{id}/stream` (SSE) | `internal/api/runs/handler.go` | `middleware.RequireAuth` | List/inspect/cancel/live-stream a run (workflow 9) |
 
-(Everything else in `WORKFLOW_PLAN_GO.md` — runs (beyond queuing), approvals — is unbuilt. Add
-rows here as routers land.)
+(Everything else in `WORKFLOW_PLAN_GO.md` — approvals (workflow 10), run traces/cost breakdown
+(workflow 11) — is unbuilt. Add rows here as routers land.)
 
 ### Dependency policy
 
