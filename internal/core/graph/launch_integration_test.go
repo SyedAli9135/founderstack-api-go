@@ -185,7 +185,15 @@ func TestLauncher_LaunchRunsToCompletionAndFinalizes(t *testing.T) {
 	launcher.Launch(fx.orgID, fx.agentID, fx.workflowID, fx.runID, "look something up")
 
 	// Launch is async (its own detached goroutine) — poll briefly for the
-	// terminal status rather than assuming it's instantaneous.
+	// terminal status rather than assuming it's instantaneous. Real,
+	// genuinely racy CI flake caught here: Engine.runFrom's own checkpoint
+	// writes status='completed' *before* engine.Run returns, but
+	// Launcher.run only calls finalizeIfTerminal (which writes output/
+	// token counts/duration) *after* engine.Run returns — two separate
+	// writes, by design (Engine owns status, Launcher owns the summary).
+	// A poll loop that breaks on status=="completed" alone can win that
+	// race and read output as still nil. Wait for output to be populated
+	// too, not just the status flip.
 	var row struct {
 		status               string
 		output               *string
@@ -206,7 +214,7 @@ func TestLauncher_LaunchRunsToCompletionAndFinalizes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("query run row: %v", err)
 		}
-		if row.status == "completed" {
+		if row.status == "completed" && row.output != nil {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
