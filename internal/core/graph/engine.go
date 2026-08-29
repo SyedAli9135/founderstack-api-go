@@ -11,9 +11,7 @@ import (
 
 // NodeFunc is one node in the graph: given the current state, it does its
 // work and returns which node runs next (NodeComplete to end the run,
-// NodeAwaitingApproval to suspend it). Node implementations (planner_node,
-// executor_node, ...) land in later workflow 9 build steps — this package
-// only sequences whatever Nodes map it's given.
+// NodeAwaitingApproval to suspend it).
 type NodeFunc func(ctx context.Context, state *RunState) (next NodeName, err error)
 
 // Nodes maps a NodeName to the function implementing it.
@@ -21,8 +19,7 @@ type Nodes map[NodeName]NodeFunc
 
 // Engine walks a caller-supplied graph of nodes, checkpointing RunState to
 // Postgres as it goes, publishing SSE events on Bus, and supporting mid-run
-// cancellation and (via Resume) continuing a run suspended at an approval
-// gate.
+// cancellation and (via Resume) continuing a run suspended at an approval gate.
 type Engine struct {
 	pool *pgxpool.Pool
 	Bus  *EventBus
@@ -32,10 +29,7 @@ type Engine struct {
 }
 
 // NewEngine builds an Engine against pool, which must be the app_user
-// (RLS-scoped) pool — every checkpoint write goes through tenant.WithTx,
-// which requires it. A single run always has one concrete org_id, so there
-// is never a reason for the engine itself to use the cross-tenant
-// app_system pool.
+// (RLS-scoped) pool — every checkpoint write goes through tenant.WithTx, which requires it.
 func NewEngine(pool *pgxpool.Pool) *Engine {
 	return &Engine{
 		pool:    pool,
@@ -45,19 +39,14 @@ func NewEngine(pool *pgxpool.Pool) *Engine {
 }
 
 // Run executes state's workflow starting at startNode. Callers must pass a
-// context detached from any HTTP request — context.Background(), not
-// c.Request.Context() — since Gin cancels a request's context the moment
-// its handler returns, which for a 202-Accepted endpoint is almost
-// immediately; see internal/api/documents/handler.go for the existing
-// precedent this follows.
+// context detached from any HTTP request — context.Background(), not c.Request.Context()
 func (e *Engine) Run(ctx context.Context, nodes Nodes, state *RunState, startNode NodeName) error {
 	return e.runFrom(ctx, nodes, state, startNode)
 }
 
 // Resume reloads runID's checkpoint, applies resumeData (an approval
 // decision), and continues execution from wherever the run suspended — the
-// interrupt()/thread_id replacement. Returns an error if the run has no
-// resumable checkpoint (never started, or already finished).
+// interrupt()/thread_id replacement. Returns an error if the run has no resumable checkpoint
 func (e *Engine) Resume(ctx context.Context, nodes Nodes, orgID, runID uuid.UUID, resumeData ResumeData) error {
 	state, currentNode, err := loadCheckpoint(ctx, e.pool, orgID, runID)
 	if err != nil {
@@ -86,10 +75,7 @@ func (e *Engine) Cancel(runID uuid.UUID) bool {
 }
 
 // Checkpoint lets a node (or, once executor_node exists, its inner
-// tool-calling loop) persist state mid-node — e.g. after every individual
-// tool call — not just at the node-transition boundaries runFrom itself
-// guarantees. Status is always "running": a mid-node checkpoint is never
-// itself a terminal state.
+// tool-calling loop) persist state mid-node.
 func (e *Engine) Checkpoint(ctx context.Context, state *RunState, currentNode NodeName) error {
 	return checkpoint(ctx, e.pool, state, currentNode, "running")
 }

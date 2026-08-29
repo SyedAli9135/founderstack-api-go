@@ -20,11 +20,6 @@ import (
 
 // RunDeps bundles everything a run's nodes need beyond RunState itself —
 // built once per run, closed over by each node function via BuildNodes.
-// Node implementations live directly in this package (not a nodes/
-// subpackage, despite WORKFLOW_PLAN_GO.md's original sketch) — they're as
-// tightly coupled to RunState/Engine/PolicyScope as checkpoint.go/policy.go
-// already are, so keeping them flat matches this package's existing style
-// rather than splitting a genuinely cohesive unit across a package boundary.
 type RunDeps struct {
 	Engine       *Engine
 	ChatClient   llm.ChatClient
@@ -33,24 +28,13 @@ type RunDeps struct {
 	Policy       PolicyScope
 	SystemPrompt string
 	OrgID        pgtype.UUID
-	// Model is the agent's configured model string — carried separately
-	// from ChatClient (an opaque llm.ChatClient interface value) purely
-	// for labeling cost_ledger rows.
-	Model string
-	// AppPool backs the audit_logs/cost_ledger writes in
-	// observability.go — the app_user (RLS-enforced) pool, same as
-	// Engine's own. A separate field rather than an Engine accessor,
-	// since Engine deliberately has no opinion on cost_ledger/audit_logs
-	// schema — that's an orchestration-layer concern, not the engine's.
-	AppPool *pgxpool.Pool
+	Model        string
+	AppPool      *pgxpool.Pool
 }
 
 // BuildNodes wires the 4 nodes this build step implements — planner,
 // executor (the full ReAct inner loop), the approval_gate resume handler,
-// and validator/reporter. RAG retrieval and the human-facing side of
-// approval (notifications, HTTP endpoints — workflow 10) are later build
-// steps; see WORKFLOW_PLAN_GO.md's Workflow 9 checklist for what's still
-// open.
+// and validator/reporter. RAG retrieval and the human-facing side of approval
 func BuildNodes(deps RunDeps) Nodes {
 	return Nodes{
 		"planner":            plannerNode(deps),
@@ -63,10 +47,6 @@ func BuildNodes(deps RunDeps) Nodes {
 
 // plannerNode seeds the conversation from the run's input and hands off
 // to executor_node, which owns the actual call-model/execute-tools loop.
-// Per the harness plan's design philosophy (the model reasons, the
-// harness only does mechanics), planner doesn't itself decide anything —
-// once semantic tool discovery and RAG retrieval land (later build
-// steps), this is where they'll slot in, ahead of the first model call.
 func plannerNode(deps RunDeps) NodeFunc {
 	return func(ctx context.Context, state *RunState) (NodeName, error) {
 		state.Conversation = []llm.Message{{Role: llm.RoleUser, Content: state.Input}}
@@ -74,8 +54,7 @@ func plannerNode(deps RunDeps) NodeFunc {
 	}
 }
 
-// executorNode is the ReAct-style inner loop described in the harness
-// plan's "Loop engineering" notes: call the model, execute any requested
+// executorNode is the ReAct-style inner loop, execute any requested
 // tool calls through the risk/policy gates, feed results back, repeat —
 // bounded by policy_scope.max_tool_calls, with the model's own "no tool
 // calls returned" response as the stop signal. Every tool call is
@@ -100,6 +79,10 @@ func executorNode(deps RunDeps) NodeFunc {
 				Role: llm.RoleAssistant, Content: resp.Content, ToolCalls: resp.ToolCalls,
 			})
 
+			if resp.Content != "" {
+				deps.Engine.Bus.Publish(Event{Type: EventReasoning, RunID: state.WorkflowRunID, Data: map[string]any{"text": resp.Content}})
+			}
+
 			if resp.StopReason != llm.StopReasonToolUse || len(resp.ToolCalls) == 0 {
 				state.Output = resp.Content
 				return "validator", nil
@@ -114,8 +97,6 @@ func executorNode(deps RunDeps) NodeFunc {
 			// A batch is gated as a whole: if any call in it needs
 			// approval, nothing in the batch executes until a human
 			// decides — including the reversible calls alongside it.
-			// This is simpler and more predictable than partially
-			// executing a batch and suspending mid-way through it.
 			needsApproval := false
 			for _, tc := range resp.ToolCalls {
 				if err := deps.Policy.CheckToolAllowed(tc.Name); err != nil {
@@ -178,9 +159,8 @@ func approvalGateNode(deps RunDeps) NodeFunc {
 	}
 }
 
-// suspiciousInstructionPatterns is a first-pass heuristic for the harness
-// plan's prompt-injection guardrail: tool results are untrusted input
-// flowing back into the model's context the same way any external
+// suspiciousInstructionPatterns is a first-pass heuristic for prompt-injection guardrail:
+// tool results are untrusted input flowing back into the model's context the same way any external
 // content is in an agentic system. Deliberately a flag, not a hard
 // block — a substring heuristic has real false positives, and the
 // founder should see the warning and judge it, not have the run silently
@@ -196,10 +176,7 @@ var suspiciousInstructionPatterns = []string{
 }
 
 // validatorNode flags (not blocks) tool results that look like an
-// injected instruction. The original plan's "confirm output matches
-// goal, retry up to 2x" judgment call is deferred — that needs a
-// meaningful multi-turn goal-comparison capability, more naturally built
-// once RAG/full planning exist, not this read-only-tools proof pass.
+// injected instruction.
 func validatorNode(deps RunDeps) NodeFunc {
 	return func(ctx context.Context, state *RunState) (NodeName, error) {
 		for _, msg := range state.Conversation {
@@ -219,8 +196,7 @@ func validatorNode(deps RunDeps) NodeFunc {
 	}
 }
 
-// reporterNode composes the final output. Markdown/citations/cost-summary
-// formatting is workflow 11's job — this just makes sure validator's
+// reporterNode composes the final output.This just makes sure validator's
 // warnings, if any, are surfaced rather than silently dropped.
 func reporterNode(deps RunDeps) NodeFunc {
 	return func(ctx context.Context, state *RunState) (NodeName, error) {
@@ -232,21 +208,11 @@ func reporterNode(deps RunDeps) NodeFunc {
 	}
 }
 
-// --- shared helpers ---
-
 // executeOneToolCall runs tc via the MCP gateway, appends both the
 // model-facing tool-result message and the audit-facing ToolResult
 // record, increments ToolCallCount, and checkpoints — used by both
 // executorNode's normal loop and approvalGateNode's post-approval path,
 // so both go through identical bookkeeping.
-//
-// A tool execution error (the gateway call itself failing, or the tool
-// returning IsError) is recorded as an error result fed back to the
-// model, not returned as a Go error that aborts the run — the model
-// should get to see and react to a failed tool call, matching normal
-// agentic behavior. Only agent-loop-level failures (a policy violation,
-// a stuck loop, an exceeded cap, the LLM call itself failing after
-// retries) abort the run outright.
 func executeOneToolCall(ctx context.Context, deps RunDeps, state *RunState, tc llm.ToolCall) error {
 	service, toolName, ok := strings.Cut(tc.Name, ".")
 	if !ok {
@@ -293,13 +259,16 @@ func executeOneToolCall(ctx context.Context, deps RunDeps, state *RunState, tc l
 		slog.Error("graph: write audit_logs for tool call failed", "run_id", state.WorkflowRunID, "tool", tc.Name, "err", err)
 	}
 
-	deps.Engine.Bus.Publish(Event{Type: EventToolResult, RunID: state.WorkflowRunID, Data: map[string]any{"tool": tc.Name, "is_error": isError}})
+	// The result text (truncated for display, same limit as the
+	// model-context copy below) was already computed above and stored in
+	// state.ToolResults, but never actually shown to a human watching the
+	// run — the SSE event used to carry only a bare success/fail flag.
+	deps.Engine.Bus.Publish(Event{Type: EventToolResult, RunID: state.WorkflowRunID, Data: map[string]any{
+		"tool": tc.Name, "is_error": isError, "result": truncateForContext(resultText),
+	}})
 
 	// Truncated copy for the model's own context — the full,
-	// untruncated resultText still goes into ToolResults below (the
-	// audit-facing record cost_ledger/audit_logs and any future run
-	// trace UI read from), per the harness plan's "never truncate what's
-	// persisted" invariant.
+	// untruncated resultText still goes into ToolResults below
 	state.Conversation = append(state.Conversation, llm.Message{
 		Role: llm.RoleTool, Name: tc.Name, ToolCallID: tc.ID, Content: truncateForContext(resultText), IsError: isError,
 	})
@@ -315,11 +284,7 @@ func executeOneToolCall(ctx context.Context, deps RunDeps, state *RunState, tc l
 }
 
 // gatewayMaxAttempts bounds retry for a Gateway-level (not tool-handler-level)
-// retryable failure — currently just a tripped rate limit. Tool-handler
-// HTTP retries already happened, and gave up, before Gateway.ExecuteTool
-// ever returns (see internal/core/mcp/servers/http_helper.go's
-// doAndDecode) — this is a second, smaller retry budget for the one
-// failure mode that occurs *before* a tool handler is ever invoked.
+// retryable failure — currently just a tripped rate limit.
 const gatewayMaxAttempts = 3
 
 // gatewayCallWithRetry retries Gateway.ExecuteTool only when it returns
@@ -357,8 +322,7 @@ func gatewayCallWithRetry(ctx context.Context, gateway *coremcp.Gateway, orgID p
 // full, untruncated result is never affected — only the copy appended to
 // state.Conversation goes through this; state.ToolResults (the
 // audit-facing record) and the cost_ledger/audit_logs writes both still
-// see the complete text. See the harness plan's "never truncate what's
-// persisted" invariant.
+// see the complete text.
 const toolResultContextLimit = 4000
 
 func truncateForContext(text string) string {
@@ -405,9 +369,7 @@ func marshalOrQuote(s string) []byte {
 // running total, plus a rough dollar estimate (llm.EstimateCostUSD, keyed
 // by model — see its doc comment for why this is an estimate, not
 // billing-grade) into CostSoFarUSD, which policy_scope.max_cost_per_run_usd
-// is actually enforced against. Before this, CostSoFarUSD was never
-// incremented anywhere, so that cap could never trip — found and fixed
-// while building MOCK_LLM_TESTING.md's manual verification guide.
+// is actually enforced against.
 func accumulateUsage(state *RunState, model string, u llm.TokenUsage) {
 	state.TokenUsage.InputTokens += u.InputTokens
 	state.TokenUsage.OutputTokens += u.OutputTokens
@@ -437,13 +399,7 @@ func toolCallNames(calls []llm.ToolCall) string {
 
 // sendWithRetry bounds retries to llm.ErrChatUnavailable (transient —
 // rate limit, network, 5xx) with a short linear backoff; ErrChatRejected
-// and any other error are terminal and returned immediately. See the
-// harness plan's "transient errors get bounded retry-with-backoff"
-// guardrail — this covers the LLM call itself; tool-execution retries
-// (a Stripe 429, say) are a deliberately separate, not-yet-built piece,
-// since that needs a matching terminal/retryable classification threaded
-// through internal/core/mcp/servers' HTTP call helpers, not this pass's
-// scope.
+// and any other error are terminal and returned immediately.
 func sendWithRetry(ctx context.Context, client llm.ChatClient, systemPrompt string, messages []llm.Message, tools []llm.ToolSchema) (llm.ChatResponse, error) {
 	const maxAttempts = 3
 	var lastErr error

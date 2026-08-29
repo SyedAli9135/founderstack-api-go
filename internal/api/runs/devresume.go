@@ -17,17 +17,7 @@ import (
 	"github.com/founderstack/api/internal/db/tenant"
 )
 
-// DevResumeHandler exposes graph.Launcher.Resume over HTTP — a stand-in
-// for workflow 10's real POST /approvals/{id}/approve|reject, which
-// doesn't exist yet (no approvals table INSERT, no notification, no
-// approval_decisions row — this skips straight to the resume mechanism
-// itself). Registered by cmd/api/main.go ONLY when config.MockLLMMode is
-// set, so a founder without a real BYOK key yet can still manually
-// exercise the full suspend-then-resume approval-gate guardrail against
-// a real, running server — see WORKFLOW_PLAN_GO.md's Workflow 9 manual
-// verification guide. Never registered otherwise; there is no route to
-// disable in production, since main.go only calls Register at all inside
-// the same MockLLMMode-gated block that builds the mock Launcher.
+// DevResumeHandler exposes graph.Launcher.Resume over HTTP
 type DevResumeHandler struct {
 	appPool  *pgxpool.Pool
 	launcher *graph.Launcher
@@ -39,9 +29,7 @@ func NewDevResumeHandler(appPool *pgxpool.Pool, launcher *graph.Launcher) *DevRe
 }
 
 // Register mounts the one dev-only route on rg. rg's group must already
-// have middleware.RequireAuth applied — this still requires a real,
-// authenticated org member, it just skips the human-review UI/notification
-// half workflow 10 will build.
+// have middleware.RequireAuth applied
 func (h *DevResumeHandler) Register(rg *gin.RouterGroup) {
 	rg.POST("/runs/:id/dev-resume", h.Resume)
 }
@@ -53,8 +41,7 @@ type devResumeRequest struct {
 
 // Resume — POST /api/v1/runs/{id}/dev-resume. Confirms the run belongs to
 // the caller's org and is actually awaiting_approval before firing
-// Launcher.Resume (fire-and-forget, same as POST /workflows/{id}/run) —
-// poll GET /runs/{id} afterward to see the result.
+// Launcher.Resume
 func (h *DevResumeHandler) Resume(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {

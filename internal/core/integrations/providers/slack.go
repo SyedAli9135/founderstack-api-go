@@ -19,7 +19,16 @@ import (
 // 200 with an "ok": false body — x/oauth2's Exchange treats any 200 as
 // success and would silently return a token-shaped struct with an empty
 // access_token instead of an error.
-const slackScopes = "chat:write,channels:read"
+//
+// groups:read is required alongside channels:read — real bug caught by
+// live manual verification 2026-08-28: internal/core/mcp/servers/slack.go's
+// list_channels calls conversations.list with
+// types=public_channel,private_channel, and Slack requires the scope for
+// *every* requested type to be present or it rejects the whole call with
+// missing_scope, even though channels:read alone is enough for the
+// public_channel half. Without groups:read this tool could never
+// succeed for any org.
+const slackScopes = "chat:write,channels:read,groups:read"
 
 type Slack struct {
 	clientID     string

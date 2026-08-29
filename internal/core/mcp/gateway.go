@@ -22,11 +22,6 @@ type Gateway struct {
 }
 
 // NewGateway builds a Gateway. appPool must be the app_user (RLS-enforced)
-// pool — GetIntegrationToken's own query is tenant-scoped the same way
-// every other BYOK/integration read in this codebase is. rdb may be nil
-// (rate limiting fails open — see checkRateLimit's doc comment); pass the
-// real client in production, nil only where a test genuinely doesn't
-// need rate limiting exercised.
 func NewGateway(appPool *pgxpool.Pool, encryptionKey []byte, registry *Registry, rdb *redis.Client) *Gateway {
 	return &Gateway{appPool: appPool, encryptionKey: encryptionKey, registry: registry, rdb: rdb}
 }
@@ -38,17 +33,6 @@ func NewGateway(appPool *pgxpool.Pool, encryptionKey []byte, registry *Registry,
 // (see WithToken/TokenFromRequest), not a context.Value. Never pass a
 // credential as a tool argument: it would then be part of the JSON
 // schema the LLM sees and could plan around, echo back, or log.
-//
-// Token.Extra is merged in via WithExtra whenever it's non-empty —
-// most connections have none, but some (Discord's webhook.incoming
-// grant, e.g.) carry their real usable credential there instead of, or
-// alongside, AccessToken.
-//
-// idempotencyKey is attached via WithIdempotencyKey whenever non-empty —
-// only a handful of write handlers (Stripe's create_invoice/refund_payment)
-// actually use it; every other tool handler ignores it harmlessly. Pass
-// "" for tool calls where idempotency doesn't apply (reads, calls
-// graph.executeOneToolCall doesn't classify as financial).
 func (g *Gateway) ExecuteTool(ctx context.Context, orgID pgtype.UUID, service, toolName string, args map[string]any, idempotencyKey string) (*gomcp.CallToolResult, error) {
 	if err := checkRateLimit(ctx, g.rdb, orgID.String(), service); err != nil {
 		return nil, err

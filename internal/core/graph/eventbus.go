@@ -13,6 +13,7 @@ type EventType string
 const (
 	EventNodeStart        EventType = "node_start"
 	EventNodeEnd          EventType = "node_end"
+	EventReasoning        EventType = "reasoning"
 	EventToolCall         EventType = "tool_call"
 	EventToolResult       EventType = "tool_result"
 	EventApprovalRequired EventType = "approval_required"
@@ -29,17 +30,13 @@ type Event struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// NodeTransitionData is EventNodeStart/EventNodeEnd's Data — see
-// WORKFLOW_PLAN_GO.md's Workflow 9 acceptance criteria ("... with agent
-// name + node type").
+// NodeTransitionData is EventNodeStart/EventNodeEnd's Data
 type NodeTransitionData struct {
 	Node      string `json:"node"`
 	AgentName string `json:"agent_name"`
 }
 
-// CompleteData is EventComplete's Data — see WORKFLOW_PLAN_GO.md's
-// Workflow 9 acceptance criteria ("Final complete event includes the
-// full output + token counts + cost").
+// CompleteData is EventComplete's Data
 type CompleteData struct {
 	Output       string     `json:"output"`
 	TokenUsage   TokenUsage `json:"token_usage"`

@@ -119,9 +119,9 @@ func (q *Queries) GetRunCheckpoint(ctx context.Context, arg GetRunCheckpointPara
 }
 
 const getRunDetail = `-- name: GetRunDetail :one
-SELECT id, workflow_id, status, triggered_by, output, input_tokens, output_tokens,
-       cached_tokens, cost_so_far_usd, tool_call_count, started_at, completed_at,
-       duration_ms, created_at
+SELECT id, workflow_id, status, current_node, triggered_by, output, input_tokens,
+       output_tokens, cached_tokens, cost_so_far_usd, tool_call_count, started_at,
+       completed_at, duration_ms, created_at
 FROM workflow_runs
 WHERE org_id = $1 AND id = $2
 `
@@ -135,6 +135,7 @@ type GetRunDetailRow struct {
 	ID            pgtype.UUID        `json:"id"`
 	WorkflowID    pgtype.UUID        `json:"workflow_id"`
 	Status        string             `json:"status"`
+	CurrentNode   *string            `json:"current_node"`
 	TriggeredBy   pgtype.UUID        `json:"triggered_by"`
 	Output        *string            `json:"output"`
 	InputTokens   int32              `json:"input_tokens"`
@@ -155,6 +156,7 @@ func (q *Queries) GetRunDetail(ctx context.Context, arg GetRunDetailParams) (Get
 		&i.ID,
 		&i.WorkflowID,
 		&i.Status,
+		&i.CurrentNode,
 		&i.TriggeredBy,
 		&i.Output,
 		&i.InputTokens,

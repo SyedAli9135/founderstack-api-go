@@ -54,9 +54,9 @@ SET output = $3, input_tokens = $4, output_tokens = $5, cached_tokens = $6,
 WHERE org_id = $1 AND id = $2;
 
 -- name: GetRunDetail :one
-SELECT id, workflow_id, status, triggered_by, output, input_tokens, output_tokens,
-       cached_tokens, cost_so_far_usd, tool_call_count, started_at, completed_at,
-       duration_ms, created_at
+SELECT id, workflow_id, status, current_node, triggered_by, output, input_tokens,
+       output_tokens, cached_tokens, cost_so_far_usd, tool_call_count, started_at,
+       completed_at, duration_ms, created_at
 FROM workflow_runs
 WHERE org_id = $1 AND id = $2;
 

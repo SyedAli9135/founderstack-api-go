@@ -7,15 +7,8 @@ import (
 	coremcp "github.com/founderstack/api/internal/core/mcp"
 )
 
-// PolicyScope mirrors agents.policy_scope's JSON shape
-// (internal/api/agents/handler.go's policyScope struct — duplicated
-// deliberately, not imported: internal/api/agents owns validating and
-// storing this JSON at write time, internal/core/graph owns enforcing it
-// at run time, and a security-enforcement type staying in lockstep with
-// its storage type is worth a small duplication rather than a
-// cross-layer import from core into api). AllowedTools entries are
-// qualified "service.tool_name" strings, matching
-// internal/core/mcp.Registry's own naming convention.
+// PolicyScope mirrors agents.policy_scope's JSON shape internal/api/agents/handler.go's policyScope struct
+// — duplicated deliberately to avoid a circular import). It is used by the engine to enforce runtime
 type PolicyScope struct {
 	MaxToolCalls     *int32   `json:"max_tool_calls,omitempty"`
 	MaxCostPerRunUSD *float64 `json:"max_cost_per_run_usd,omitempty"`
@@ -23,27 +16,15 @@ type PolicyScope struct {
 }
 
 var (
-	// ErrToolNotAllowed means the requested tool isn't in the agent's
-	// policy_scope.allowed_tools. Must be checked at the executor node
-	// itself — planner intent is not a security boundary, so a
-	// hallucinated or otherwise out-of-scope tool call that made it into
-	// a plan is still refused here.
-	ErrToolNotAllowed = errors.New("graph: tool not allowed by agent's policy_scope")
-	// ErrToolCallCapExceeded / ErrCostCapExceeded mean the run tripped
-	// one of policy_scope's two runtime ceilings. The engine aborts the
-	// run when either fires — not silently, per the harness plan's
-	// guardrail catalog — reporter_node (once built) is responsible for
-	// composing a clear explanation from the returned error.
+	ErrToolNotAllowed      = errors.New("graph: tool not allowed by agent's policy_scope")
 	ErrToolCallCapExceeded = errors.New("graph: run exceeded agent's max_tool_calls policy")
 	ErrCostCapExceeded     = errors.New("graph: run exceeded agent's max_cost_per_run_usd policy")
 )
 
 // CheckToolAllowed enforces AllowedTools against a qualified tool name
-// ("service.tool_name"). An agent with an empty AllowedTools list allows
-// nothing — matches internal/api/agents/handler.go's own
-// validatePolicyScope, which already rejects an empty allowed_tools list
-// at write time, so an empty list reaching here would mean a data
-// integrity bug elsewhere, not a legitimate "allow everything" state.
+// ("service.tool_name"). An agent with an empty AllowedTools list allows noting
+// the default is to be conservative and deny everything unless explicitly allowed.
+// This is called at every node transition, before the engine even attempts to call the tool.
 func (p PolicyScope) CheckToolAllowed(qualifiedToolName string) error {
 	for _, allowed := range p.AllowedTools {
 		if allowed == qualifiedToolName {
@@ -54,11 +35,7 @@ func (p PolicyScope) CheckToolAllowed(qualifiedToolName string) error {
 }
 
 // CheckCaps enforces MaxToolCalls/MaxCostPerRunUSD against state's
-// running counters. Called after every tool call (not just at node
-// transitions), same granularity as the engine's own per-tool-call
-// checkpointing — see the harness plan's "checked after every LLM/tool
-// call" guardrail. A nil cap on either field means that particular limit
-// is unset for this agent, not zero.
+// running counters. Called after every tool call (not just at node transitions
 func (p PolicyScope) CheckCaps(state *RunState) error {
 	if p.MaxToolCalls != nil && int32(state.ToolCallCount) >= *p.MaxToolCalls {
 		return fmt.Errorf("%w: %d/%d tool calls", ErrToolCallCapExceeded, state.ToolCallCount, *p.MaxToolCalls)

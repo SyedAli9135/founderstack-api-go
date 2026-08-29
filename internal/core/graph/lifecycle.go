@@ -11,9 +11,7 @@ import (
 	"github.com/founderstack/api/internal/db/tenant"
 )
 
-// terminalStatuses are the statuses a run never comes back from without
-// a fresh Resume() — awaiting_approval is deliberately excluded, since
-// that run isn't finished, just paused.
+// terminalStatuses are the statuses a run never comes back from without a fresh Resume()
 var terminalStatuses = map[string]bool{"completed": true, "failed": true, "cancelled": true}
 
 func markRunStarted(ctx context.Context, pool *pgxpool.Pool, orgID, runID pgtype.UUID) error {
@@ -35,10 +33,7 @@ func getRunStatus(ctx context.Context, pool *pgxpool.Pool, orgID, runID pgtype.U
 // finalizeIfTerminal fills in the completion-summary fields (output,
 // token counts, duration) once — and only once — a run reaches a
 // genuinely terminal status. Called by Launcher after Engine.Run
-// returns; whatever eventually calls Engine.Resume() for a suspended run
-// (workflow 10, not built yet) is responsible for calling this again
-// after its own leg finishes, since a resumed run can itself reach a
-// terminal status Launcher's own call here never saw.
+// returns, and by Engine.Resume after a run resumes and reaches a terminal status.
 func finalizeIfTerminal(ctx context.Context, pool *pgxpool.Pool, orgID, runID pgtype.UUID, state *RunState) error {
 	status, err := getRunStatus(ctx, pool, orgID, runID)
 	if err != nil {

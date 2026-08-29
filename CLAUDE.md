@@ -336,7 +336,12 @@ a replayed callback fails on its second attempt (covered by an integration test)
 - **Slack** (`providers/slack.go`) is hand-implemented with `net/http`, not
   `golang.org/x/oauth2` — every Slack Web API response, including a *failed* token exchange, is
   HTTP 200 with an `"ok": false` body, which `x/oauth2`'s `Exchange` would silently treat as a
-  successful (empty) token.
+  successful (empty) token. `slackScopes` is `chat:write,channels:read,groups:read` — **real bug
+  found and fixed 2026-08-28**: `groups:read` was missing, so workflow 5's `slack.list_channels`
+  (which requests `types=public_channel,private_channel` from `conversations.list`) always failed
+  with `missing_scope`, since Slack requires the scope for *every* requested type, not just one of
+  them. A connection made before this fix needs a one-time reconnect to actually pick up the new
+  scope.
 - **Notion** has no public revoke endpoint — `providers/notion.go` doesn't implement `Revocable`,
   so `DELETE .../notion` deactivates locally only (best-effort, by design, via the type
   assertion in the handler — not a gap).
@@ -437,6 +442,13 @@ silently the first time something tries to call a tool; confirmed live via the b
   item's billing interval to a monthly-equivalent amount — documented as an estimate for planning
   purposes, not a billing-grade reconciliation figure, since calendar months aren't a fixed
   length (weeks/days use the standard average-per-month approximation any such estimate makes).
+  `create_invoice` **real bug found and fixed 2026-08-28**: it originally called
+  `POST /v1/invoices` with only `customer`+`description` — Stripe requires at least one *pending
+  invoice item* to exist for the customer before it will create anything (`400
+  invoice_no_customer_line_items` otherwise), so this tool could never have succeeded for any
+  org, and had zero test coverage before this was caught live. Fixed by calling
+  `POST /v1/invoiceitems` first, which needed a new required `amount_cents` input field —
+  `TestStripe_CreateInvoice`/`_MissingAmountIsToolError` now cover it.
 - **Slack** (`slack.go`) hits the same HTTP-200-with-`ok:false` convention workflow 4's
   `providers/slack.go` already documented — handled via a shared `slackEnvelope`/`checkSlackOK`,
   not a bare status-code check, covered by a test proving a 200-with-`ok:false` response becomes
@@ -962,6 +974,48 @@ of the 8 tool servers this codebase calls charge per-API-call. Verified live via
 `MOCK_LLM_MODE`'s new `mock:cost-cap` scenario: a `$0.05` cap aborted a run at
 `cost_so_far_usd: 0.055` after 5 tool calls, the same "checked after every tool call" semantics
 `max_tool_calls` already had. `internal/core/llm/pricing_test.go` covers the pure pricing logic.
+
+**Model reasoning is now surfaced live, not just captured internally (2026-08-28)**: a real
+provider's response (confirmed against `fromAnthropicResponse`) commonly carries prose alongside
+`tool_use` blocks on the same turn — `ChatResponse.Content` was already correctly stored into
+`state.Conversation` for this, but never published anywhere a human watching a run could see it.
+New `EventReasoning` (`internal/core/graph/eventbus.go`) is published from `executorNode`
+whenever `resp.Content != ""` — this is *what the model is thinking*, not just its final answer,
+and it fires on every turn, tool-calling or not. `tool_result` events were also enriched with the
+tool's actual (truncated, via the same `truncateForContext`) output text — previously just a bare
+`is_error` boolean, so a human had no way to see *what* a tool call actually returned.
+
+**`internal/core/llm/mockscenarios.go` calls real tools, not placeholders (2026-08-28)**: every
+scenario originally pointed at fake IDs (`"mock-test-page"`, `"pi_mock_123"`) that always
+terminal-error — correct for proving guardrail *logic*, but never demonstrated a tool call
+actually succeeding. Rewritten to target real resources: `mock:tool-call`/`stuck-loop` read the
+founder's real, already-shared Notion page; the 5-call scenarios (`tool-call-cap`/`cost-cap`/
+`cancel`) each read one of 5 *distinct* real Notion pages (created for this — identical args
+across all 5 calls would otherwise falsely trip the stuck-loop detector instead of exercising the
+cap/cost/cancel guardrail each one means to test); `mock:approval` mints a fresh real Stripe
+test-mode PaymentIntent per run inside `approvalScenarioClient.Send` (only on the pre-suspend
+turn, using `appPool`/`encryptionKey`/`orgID` now threaded through from `MockScenarioResolver`),
+since a hardcoded PaymentIntent ID can only ever be fully refunded once. Every scripted response
+also now carries a plausible reasoning sentence, exercising the new `EventReasoning` path above.
+**15 more scenarios added**, one for every remaining tool across all 8 connected services except
+LinkedIn's `draft_post` (a real public/permanent post — deliberately left to unit-test-only
+coverage): `mock:slack`/`mock:slack-send`, `mock:discord`, `mock:drive`/`mock:drive-list`/
+`mock:drive-create`, `mock:calendar`/`mock:calendar-create`, `mock:github`/`mock:github-issue`/
+`mock:github-search`, `mock:notion-write`, `mock:stripe-list`/`mock:stripe-invoice`/
+`mock:stripe-mrr`. All live-verified through the real browser UI, not just `go test`.
+
+**Full live tool-call verification pass (2026-08-28)** found 2 real production bugs, neither
+caught by the existing test suite because neither tool had any test coverage before this pass:
+(1) `stripe.create_invoice` never actually worked for any org — Stripe's `POST /v1/invoices`
+requires a pending invoice item to exist first, which this handler never created; fixed by
+calling `POST /v1/invoiceitems` first (needed a new required `amount_cents` input). (2)
+`slack.list_channels` requests `types=public_channel,private_channel`, but the OAuth scope list
+(`internal/core/integrations/providers/slack.go`) only ever requested `chat:write,channels:read`
+— Slack rejects the whole call with `missing_scope` unless the scope for *every* requested type
+is present; fixed by adding `groups:read` (existing connections need a one-time reconnect).
+Neither is specific to mock mode — both were found by calling the real tool directly via a
+throwaway script (`Gateway.ExecuteTool`, bypassing `graph`/mock-LLM entirely), against the
+founder's real connected accounts.
 
 ### No ORM — `pgx` + `sqlc`, not GORM
 

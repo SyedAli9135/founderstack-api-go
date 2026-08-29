@@ -73,6 +73,86 @@ func TestStripe_ListSubscriptions(t *testing.T) {
 	}
 }
 
+// TestStripe_CreateInvoice covers a real bug caught by live manual
+// verification 2026-08-28, not present in the original code at all (this
+// tool had zero test coverage before): Stripe's POST /v1/invoices errors
+// with "invoice_no_customer_line_items" unless the customer already has a
+// pending invoice item, so the handler must create one via
+// POST /v1/invoiceitems first. This test asserts both calls actually
+// happen, in order, with the right fields.
+func TestStripe_CreateInvoice(t *testing.T) {
+	var gotPaths []string
+	var gotItemForm, gotInvoiceForm string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPaths = append(gotPaths, r.URL.Path)
+		_ = r.ParseForm()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/invoiceitems":
+			gotItemForm = r.Form.Encode()
+			_, _ = w.Write([]byte(`{"id":"ii_1"}`))
+		case "/invoices":
+			gotInvoiceForm = r.Form.Encode()
+			_, _ = w.Write([]byte(`{"id":"in_1","status":"draft","hosted_invoice_url":"https://invoice.stripe.com/in_1"}`))
+		default:
+			t.Errorf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	defer swapStripeAPIBase(srv.URL)()
+
+	session := connectStripeServer(t)
+	result, err := session.CallTool(context.Background(), &gomcp.CallToolParams{
+		Name: "create_invoice",
+		Arguments: map[string]any{
+			"customer_id":  "cus_1",
+			"amount_cents": 500,
+			"description":  "Test invoice",
+		},
+		Meta: mcp.WithToken("sk_test_whatever"),
+	})
+	if err != nil {
+		t.Fatalf("CallTool error = %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("tool reported an error: %+v", result.Content)
+	}
+
+	if len(gotPaths) != 2 || gotPaths[0] != "/invoiceitems" || gotPaths[1] != "/invoices" {
+		t.Fatalf("request paths = %v, want [/invoiceitems /invoices] in that order", gotPaths)
+	}
+	if gotItemForm != "amount=500&currency=usd&customer=cus_1&description=Test+invoice" {
+		t.Fatalf("invoice item form = %q", gotItemForm)
+	}
+	if gotInvoiceForm != "customer=cus_1&description=Test+invoice" {
+		t.Fatalf("invoice form = %q", gotInvoiceForm)
+	}
+
+	var out stripeCreateInvoiceOutput
+	if err := unmarshalStructured(result, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.InvoiceID != "in_1" || out.Status != "draft" {
+		t.Fatalf("output = %+v, want invoice_id=in_1 status=draft", out)
+	}
+}
+
+func TestStripe_CreateInvoice_MissingAmountIsToolError(t *testing.T) {
+	session := connectStripeServer(t)
+
+	result, err := session.CallTool(context.Background(), &gomcp.CallToolParams{
+		Name:      "create_invoice",
+		Arguments: map[string]any{"customer_id": "cus_1"},
+		Meta:      mcp.WithToken("sk_test_whatever"),
+	})
+	if err != nil {
+		t.Fatalf("CallTool protocol error = %v, want a tool-level error instead", err)
+	}
+	if !result.IsError {
+		t.Fatal("result.IsError = false, want true for a missing required amount_cents")
+	}
+}
+
 func TestStripe_RefundPayment_MissingIDIsToolError(t *testing.T) {
 	session := connectStripeServer(t)
 

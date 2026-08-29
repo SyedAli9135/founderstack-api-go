@@ -108,7 +108,9 @@ func stripeListSubscriptions(ctx context.Context, req *gomcp.CallToolRequest, in
 
 type stripeCreateInvoiceInput struct {
 	CustomerID  string `json:"customer_id" jsonschema:"Stripe customer ID to invoice (e.g. cus_...)"`
-	Description string `json:"description,omitempty" jsonschema:"Optional invoice description"`
+	AmountCents int64  `json:"amount_cents" jsonschema:"Line item amount in the smallest currency unit (e.g. cents) — Stripe requires at least one pending invoice item before it will create an invoice at all"`
+	Currency    string `json:"currency,omitempty" jsonschema:"Three-letter ISO currency code for the line item (default usd)"`
+	Description string `json:"description,omitempty" jsonschema:"Optional line-item/invoice description"`
 	Finalize    bool   `json:"finalize,omitempty" jsonschema:"If true, finalize the invoice immediately instead of leaving it as a draft"`
 }
 
@@ -116,6 +118,10 @@ type stripeCreateInvoiceOutput struct {
 	InvoiceID        string `json:"invoice_id"`
 	Status           string `json:"status"`
 	HostedInvoiceURL string `json:"hosted_invoice_url,omitempty"`
+}
+
+type stripeInvoiceItemResponse struct {
+	ID string `json:"id"`
 }
 
 func stripeCreateInvoice(ctx context.Context, req *gomcp.CallToolRequest, in stripeCreateInvoiceInput) (*gomcp.CallToolResult, stripeCreateInvoiceOutput, error) {
@@ -126,11 +132,42 @@ func stripeCreateInvoice(ctx context.Context, req *gomcp.CallToolRequest, in str
 	if in.CustomerID == "" {
 		return nil, stripeCreateInvoiceOutput{}, fmt.Errorf("stripe: customer_id is required")
 	}
+	if in.AmountCents <= 0 {
+		return nil, stripeCreateInvoiceOutput{}, fmt.Errorf("stripe: amount_cents must be greater than 0")
+	}
+	currency := in.Currency
+	if currency == "" {
+		currency = "usd"
+	}
 	// idempotencyKey, if any, protects this whole logical tool call from
 	// double-executing on a retry — see doStripeForm's doc comment. The
-	// finalize sub-step gets its own derived key (a distinct Stripe
-	// write, not covered by the create call's key).
+	// invoice-item and finalize sub-steps each get their own derived key
+	// (distinct Stripe writes, not covered by the create call's key).
 	idempotencyKey, _ := mcp.IdempotencyKeyFromRequest(req)
+
+	// Real Stripe behavior, confirmed live 2026-08-28 (not obvious from a
+	// first read of the API docs): POST /v1/invoices errors with
+	// "invoice_no_customer_line_items" unless the customer already has at
+	// least one pending invoice item — an earlier version of this handler
+	// skipped this step entirely and could never successfully create an
+	// invoice for any customer. Create the line item first, then the
+	// invoice picks up every pending item for the customer automatically.
+	itemForm := url.Values{
+		"customer": {in.CustomerID},
+		"amount":   {strconv.FormatInt(in.AmountCents, 10)},
+		"currency": {currency},
+	}
+	if in.Description != "" {
+		itemForm.Set("description", in.Description)
+	}
+	itemKey := idempotencyKey
+	if itemKey != "" {
+		itemKey += "-item"
+	}
+	var item stripeInvoiceItemResponse
+	if err := doStripeForm(ctx, "POST", stripeAPIBase+"/invoiceitems", token, itemKey, itemForm, &item); err != nil {
+		return nil, stripeCreateInvoiceOutput{}, fmt.Errorf("stripe: create invoice item: %w", err)
+	}
 
 	form := url.Values{"customer": {in.CustomerID}}
 	if in.Description != "" {

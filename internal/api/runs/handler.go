@@ -1,8 +1,3 @@
-// Package runs implements workflow 9's run-observability endpoints —
-// GET /runs, GET /runs/{id}, POST /runs/{id}/cancel, and the SSE stream
-// GET /runs/{id}/stream. Starting a run is workflows.Handler.Run's job
-// (POST /workflows/{id}/run, via graph.Launcher) — this package only
-// observes and controls runs already queued, in flight, or finished.
 package runs
 
 import (
@@ -27,22 +22,15 @@ import (
 	"github.com/founderstack/api/internal/db/tenant"
 )
 
-// Handler implements the 4 endpoints above.
 type Handler struct {
 	appPool *pgxpool.Pool
 	engine  *graph.Engine
 }
 
-// NewHandler builds a Handler. appPool must be the app_user
-// (RLS-enforced) pool. engine is the same process-wide *graph.Engine
-// every run is launched against — Cancel and the SSE subscription both
-// need it directly, not a copy.
 func NewHandler(appPool *pgxpool.Pool, engine *graph.Engine) *Handler {
 	return &Handler{appPool: appPool, engine: engine}
 }
 
-// Register mounts all 4 routes on rg. rg's group must already have
-// middleware.RequireAuth applied.
 func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/runs", h.List)
 	rg.GET("/runs/:id", h.Get)
@@ -71,7 +59,6 @@ type runSummary struct {
 	CreatedAt    string  `json:"created_at"`
 }
 
-// List — GET /api/v1/runs?status=&workflow_id=&limit=&offset=
 func (h *Handler) List(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -133,6 +120,7 @@ func (h *Handler) List(c *gin.Context) {
 
 type runDetail struct {
 	runSummary
+	CurrentNode   *string `json:"current_node,omitempty"`
 	TriggeredBy   *string `json:"triggered_by,omitempty"`
 	InputTokens   int32   `json:"input_tokens"`
 	OutputTokens  int32   `json:"output_tokens"`
@@ -140,7 +128,6 @@ type runDetail struct {
 	ToolCallCount int32   `json:"tool_call_count"`
 }
 
-// Get — GET /api/v1/runs/{id}
 func (h *Handler) Get(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -188,18 +175,12 @@ func (h *Handler) Get(c *gin.Context) {
 			StartedAt: formatTimestamptz(row.StartedAt), CompletedAt: formatTimestamptz(row.CompletedAt),
 			CreatedAt: row.CreatedAt.Time.Format(rfc3339),
 		},
+		CurrentNode: row.CurrentNode,
 		TriggeredBy: triggeredBy, InputTokens: row.InputTokens, OutputTokens: row.OutputTokens,
 		CachedTokens: row.CachedTokens, ToolCallCount: row.ToolCallCount,
 	})
 }
 
-// Cancel — POST /api/v1/runs/{id}/cancel. engine.Cancel is an in-memory,
-// per-process lookup (see Engine.Cancel's own doc comment) — this can
-// only cancel a run whose goroutine is live on this instance. A run
-// that's already finished, or was never running here, gets a 404;
-// distinguishing "already finished" from "never existed" isn't attempted
-// here (both look identical from engine.Cancel's perspective), and isn't
-// needed to satisfy the acceptance criterion this implements.
 func (h *Handler) Cancel(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -243,12 +224,6 @@ func (h *Handler) Cancel(c *gin.Context) {
 	response.OK(c, http.StatusOK, "Cancellation requested", gin.H{"run_id": id.String()})
 }
 
-// Stream — GET /api/v1/runs/{id}/stream, Server-Sent Events. Verifies
-// the run belongs to the caller's org before subscribing (engine.Bus is
-// also process-wide/unscoped, same reasoning as Cancel above), then
-// forwards every graph.Event published for run_id as an SSE `data:` line
-// until either the client disconnects (c.Request.Context().Done()) or a
-// `complete`/`error` event closes the stream naturally.
 func (h *Handler) Stream(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
