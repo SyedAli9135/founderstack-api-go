@@ -137,12 +137,12 @@ func createTestPaymentIntent(ctx context.Context, appPool *pgxpool.Pool, encrypt
 		return "", err
 	}
 	return stripeFixturePost(ctx, tok.AccessToken, "https://api.stripe.com/v1/payment_intents", url.Values{
-		"amount":         {"500"},
-		"currency":       {"usd"},
-		"customer":       {customerID},
-		"payment_method": {"pm_card_visa"},
-		"confirm":        {"true"},
-		"automatic_payment_methods[enabled]":         {"true"},
+		"amount":                             {"500"},
+		"currency":                           {"usd"},
+		"customer":                           {customerID},
+		"payment_method":                     {"pm_card_visa"},
+		"confirm":                            {"true"},
+		"automatic_payment_methods[enabled]": {"true"},
 		"automatic_payment_methods[allow_redirects]": {"never"},
 	})
 }
@@ -318,7 +318,7 @@ var mockScenarios = map[string]mockScenario{
 		responses: []ChatResponse{
 			{
 				StopReason: StopReasonToolUse, Usage: turnUsage,
-				Content: "Let me check which Slack channels I have access to before posting anything.",
+				Content:   "Let me check which Slack channels I have access to before posting anything.",
 				ToolCalls: []ToolCall{{ID: "call_1", Name: "slack.list_channels", Args: toolCallArgs(`{"limit":20}`)}},
 			},
 			{StopReason: StopReasonEndTurn, Content: "I can see the team's channels now. Finished checking Slack.", Usage: turnUsage},
