@@ -14,9 +14,17 @@ RETURNING id;
 -- name: GetOrganizationIDByClerkOrgID :one
 SELECT id FROM organizations WHERE clerk_org_id = $1;
 
+-- can_approve_workflows is set only on first INSERT, never touched by the
+-- ON CONFLICT branch (not listed in its SET clause) — a membership re-sync
+-- (role change, reactivation) must never silently reset a flag that could
+-- since have been granted or revoked by hand. Workflow 13 (team management)
+-- doesn't exist yet, so there's no in-app way for an org's own
+-- admin/owner to grant themselves this — defaulting it true for whoever
+-- created/administers the org is what lets Workflow 10's approval gate be
+-- usable at all before that UI exists.
 -- name: UpsertUserForMembership :exec
-INSERT INTO users (org_id, clerk_user_id, email, full_name, role, is_active)
-VALUES ($1, $2, $3, $4, $5, true)
+INSERT INTO users (org_id, clerk_user_id, email, full_name, role, can_approve_workflows, is_active)
+VALUES ($1, $2, $3, $4, $5, $6, true)
 ON CONFLICT (clerk_user_id) DO UPDATE SET
     org_id = EXCLUDED.org_id,
     role = EXCLUDED.role,

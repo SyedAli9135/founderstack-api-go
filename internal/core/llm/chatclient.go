@@ -45,11 +45,17 @@ type Message struct {
 	IsError bool
 }
 
-// ToolCall is one tool invocation the model requested.
+// ToolCall is one tool invocation the model requested. Explicit lowercase
+// json tags (added for Workflow 10) — this struct now crosses the wire
+// directly (graph.ApprovalRequiredData.ToolCalls, and the approvals table's
+// context_data column, both consumed by founderstack-web's ApprovalCard),
+// not just round-tripped through Go's own json.Marshal/Unmarshal on both
+// ends of workflow_runs.checkpoint_state, where the previous default
+// (capitalized field names) never actually mattered to any outside reader.
 type ToolCall struct {
-	ID   string
-	Name string
-	Args json.RawMessage
+	ID   string          `json:"id"`
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args,omitempty"`
 }
 
 // ToolSchema is one tool's definition offered to the model each turn.

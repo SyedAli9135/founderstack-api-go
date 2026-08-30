@@ -16,6 +16,7 @@ import (
 
 	"github.com/founderstack/api/internal/core/llm"
 	coremcp "github.com/founderstack/api/internal/core/mcp"
+	"github.com/founderstack/api/internal/core/notify"
 )
 
 // RunDeps bundles everything a run's nodes need beyond RunState itself —
@@ -30,6 +31,9 @@ type RunDeps struct {
 	OrgID        pgtype.UUID
 	Model        string
 	AppPool      *pgxpool.Pool
+	// Notifier is nil-safe (writeApprovalGate checks before use) so tests
+	// building RunDeps by hand don't need to construct one.
+	Notifier *notify.Notifier
 }
 
 // BuildNodes wires the 4 nodes this build step implements — planner,
@@ -108,6 +112,9 @@ func executorNode(deps RunDeps) NodeFunc {
 			}
 			if needsApproval {
 				state.PendingToolCalls = resp.ToolCalls
+				if err := writeApprovalGate(ctx, deps, state, resp.ToolCalls); err != nil {
+					return "", fmt.Errorf("graph: write approval gate: %w", err)
+				}
 				return NodeAwaitingApproval, nil
 			}
 

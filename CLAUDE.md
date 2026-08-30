@@ -22,15 +22,14 @@ BYOK is **not** Claude-only: `internal/core/llm` validates and stores keys for 5
 Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 from an
 Anthropic-only original). See "BYOK API Keys" below.
 
-**Workflows 1 (bootstrap) through 9 (run a workflow / execution engine) are implemented.**
-Workflow 10 (human approval gates — Slack/email/push notifications, the `POST
-/approvals/{id}/approve`/`reject` endpoints, the frontend approval card) is not started; the
-run-suspends-at-an-approval-gate *mechanism* it will build on top of already exists and is
-tested (see "Agent Execution Engine" below), but nothing surfaces a pending approval to a human
-yet. Don't assume routes, tables, or packages from workflow 10+ in `WORKFLOW_PLAN_GO.md` exist —
-check `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`,
-`internal/api/identity/`, `internal/api/integrations/`, `internal/api/documents/`,
-`internal/api/agents/`, `internal/api/workflows/`, and `internal/api/runs/` for what's actually
+**Workflows 1 (bootstrap) through 10 (human approval gates) are implemented.** Workflow 10
+(2026-08-30) closed the gap the previous line here described — real `GET/POST /approvals*`
+endpoints, Slack/email/push notifications, and a 24h auto-expiry sweep, all built on top of
+workflow 9's suspend/resume mechanism (see "Human Approval Gate (workflow 10)" below). Don't
+assume routes, tables, or packages from workflow 11+ in `WORKFLOW_PLAN_GO.md` exist — check
+`internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
+`internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
+`internal/api/workflows/`, `internal/api/runs/`, and `internal/api/approvals/` for what's actually
 registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
 third party until real OAuth app credentials
 are registered on each provider's dashboard and put in `.env` — see "Third-Party Integrations
@@ -1017,6 +1016,155 @@ Neither is specific to mock mode — both were found by calling the real tool di
 throwaway script (`Gateway.ExecuteTool`, bypassing `graph`/mock-LLM entirely), against the
 founder's real connected accounts.
 
+### Human Approval Gate (workflow 10) — `internal/core/notify`, `internal/api/approvals`, `internal/core/workflows/approvalexpiry.go`
+
+Closes the gap workflow 9 deliberately left open: the suspend/resume *mechanism* existed and was
+tested, but nothing ever wrote to `approvals`/`approval_decisions` (both tables existed since
+migration `000001`, `approvals.risk_level` since `000008` — anticipated, never used) or told a
+human a run was waiting. Built 2026-08-30, scoped in 4 ways against the plan's literal wording —
+see `WORKFLOW_PLAN_GO.md`'s Workflow 10 scope note (2026-08-29) for the full reasoning behind
+each: Slack notifies one configured per-org channel, not a true per-user DM (no Slack-user-ID
+mapping in this codebase); Slack is notification-only, no in-Slack interactive Approve/Reject
+buttons (would need a new inbound webhook and reopens the DM-mapping question); email uses Brevo,
+not SendGrid (SendGrid's free tier is now a 60-day trial only, $19.95/mo after — Brevo has a
+genuinely free-forever tier and needs no SDK); and a broader "what's my agent up to" activity
+feed beyond approvals themselves is explicitly deferred, not built.
+
+**The INSERT + notification dispatch live in `nodes.go`'s `executorNode`, not `engine.go`** —
+`executorNode` already has full `RunDeps` (`Gateway`, `AppPool`, `OrgID`, `Tools`) at the exact
+point it decides `needsApproval`; `Engine` (`pool`, `Bus`, `mu`, `cancels`, all unexported) has
+none of that, and giving it a `Gateway`/notifier dependency would permanently couple the pure
+state-machine to MCP/notification infra, which nothing else in `engine.go` does. New
+`writeApprovalGate` (`internal/core/graph/approvalgate.go`) computes the batch's highest risk
+tier, INSERTs the `approvals` row in its own `tenant.WithTx` (**not best-effort** — a failed
+INSERT fails the run loudly rather than suspending with no row a human could ever act on), sets
+two new `RunState` fields (`ApprovalID`, `PendingApprovalRiskLevel`) so `engine.go`'s
+`NodeAwaitingApproval` case can enrich the now-populated `EventApprovalRequired` SSE payload
+without itself needing a `Gateway`, then fires `go deps.Notifier.NotifyApprovalRequired(...)` —
+**detached, not awaited**, so a slow Slack/Brevo/webpush call never delays the checkpoint+publish
+that follows. `RunDeps.Notifier *notify.Notifier` is nil-safe; tests building `RunDeps` by hand
+don't need one.
+
+**`internal/core/notify`** deliberately imports nothing from `internal/core/graph` — `Notifier`'s
+methods take explicit primitive arguments (`appPool`, `gateway`, `orgID`, ...), not a `RunDeps`
+value, specifically so the dependency stays one-directional (`graph` → `notify`, never the
+reverse). `NotifyApprovalRequired` fires Slack/email/push concurrently via 3 goroutines +
+`sync.WaitGroup`, each independently logged-not-propagated — one channel failing (org never
+connected Slack, no Brevo key configured) never blocks or fails the other two. Slack reuses the
+existing `slack.send_message` MCP tool via `Gateway.ExecuteTool`, the same call path any
+agent-driven tool call goes through — no second Slack client. `EmailSender`'s `brevoSender` is
+plain `net/http` (`POST https://api.brevo.com/v3/smtp/email`), no SDK — same "don't add a
+dependency a single REST call doesn't justify" policy as Stripe/Slack; `NewEmailSender` returns a
+`noopSender` (logs a warning) when `BREVO_API_KEY`/`BREVO_FROM_EMAIL` are unset, matching every
+other optional-third-party-secret in this codebase. `WebPushSender` wraps
+`SherClockHolmes/webpush-go`, also a logged no-op when either VAPID key is unset.
+
+**The push notification's Approve/Reject buttons work without opening the app** — the one place
+this workflow does something no prior one needed to. A service worker's `notificationclick`
+handler has no access to page JS state (no live Clerk session, no build-time env vars), so
+`ActionTokenSigner` (`internal/core/notify/actiontoken.go`) mints a signed, single-purpose
+HMAC-SHA256 token (`approval_id|user_id|exp`, base64url) per recipient at send time — the same
+"magic approve link" pattern GitHub/PagerDuty use for email. `PushPayload` carries full,
+ready-to-POST `approve_url`/`reject_url` (already including `?action_token=`), not just a bare
+token — `public/sw.js` (founderstack-web) has no build-time access to the API's base URL the way
+the rest of the frontend does, so the server builds the complete URL
+(`notify.Notifier.apiBaseURL`, set from `cfg.AppBaseURL`) instead. `ApprovalTTL` (24h, the
+acceptance criterion's expiry window) lives in `internal/core/notify` — not `graph` — specifically
+so both `approvalgate.go`'s `approvals.expires_at` and this package's action-token expiry
+reference the *same* constant and can never drift apart. `PUSH_ACTION_TOKEN_SECRET` unset (the
+app boots fine either way) makes `Verify` reject every token — push notifications silently degrade
+to "tap opens the app, no working action buttons," a deliberate trade-off, not a bug. The token
+proves identity only, never authorization: `internal/api/approvals/handler.go`'s
+`RegisterActions` re-checks `can_approve_workflows`/expiry/`agents_paused` after verifying it,
+exactly like the authenticated path does — a user demoted after a token was minted is still
+correctly blocked.
+
+**`internal/api/approvals`** splits `Register` (mounted on the normal `RequireAuth`-gated group:
+`GET /approvals`, `GET /approvals/:id`) from `RegisterActions` (its own, deliberately **ungated**
+group: `POST /approvals/:id/approve`, `POST /approvals/:id/reject`) — the same
+`Register`/`RegisterCallback` split `internal/api/integrations/handler.go` already established
+for a resource with two different auth stories. `resolveActor` tries `Authorization: Bearer
+<Clerk JWT>` first (the in-app `ApprovalCard`'s path — verified via two functions
+**extracted from, not duplicated from**, `middleware.RequireAuth`: `middleware.VerifyToken`
+and `middleware.ResolveUser`, now shared by both), then `?action_token=` (the push path). Either
+way, `Approve`/`Reject` re-check permission/expiry/`agents_paused` inside a fresh `tenant.WithTx`
+before writing anything — **`agents_paused` is checked here too, not just at `POST .../run`**
+(the 2026-08-26 guard note this file's own workflow-9 section already flagged): approving is
+exactly what lets a `write_destructive_or_financial` tool call execute, so letting it bypass the
+kill switch would defeat the switch's purpose. `UpdateApprovalStatus`'s `WHERE status='pending'`
+guard (`:execrows`, checked for `0` rows affected) is what makes a double-click or a race against
+the expiry job land as `409 APPROVAL_ALREADY_DECIDED` instead of a double-`Resume`. `ContextData`
+in the wire response is `json.RawMessage`, not a bare `[]byte` — a bare `[]byte` field marshals as
+base64 (`encoding/json`'s default for byte slices), which would have silently handed
+founderstack-web a base64 blob instead of the tool-call array it expects; caught before it shipped
+by re-deriving the actual wire contract, not assumed. Relatedly, `llm.ToolCall` gained explicit
+lowercase `json` tags (`id`/`name`/`args`) — it now crosses the wire directly
+(`ApprovalRequiredData.ToolCalls`, `approvals.context_data`), not just round-tripped through Go's
+own (un)marshal on both ends of `checkpoint_state`, where the previous default (capitalized field
+names) never mattered to any outside reader.
+
+**`internal/core/workflows/approvalexpiry.go`** is the 3rd background job in this codebase
+following the exact same shape as `integrations.RunRefreshJob`/`workflows.RunScheduler`: a
+`time.Ticker` (5 min, matching the plan's literal spec — not `RunScheduler`'s unrelated 60s),
+run once immediately at startup, on `systemPool` (BYPASSRLS) since sweeping expirations across
+every org is inherently cross-tenant. For each `ListExpiredPendingApprovals` row: UPDATE
+`status='expired'`, INSERT an `approval_decisions` row (`user_id` NULL — a system expiry, not a
+person's decision), then **`launcher.Resume(orgID, runID, false, "...")`** — the explicit "real
+gap" the plan calls out: without this call, the underlying `workflow_runs` row stays stuck at
+`awaiting_approval` forever, since flipping the `approvals` row alone never tells the run's own
+state machine the wait is over.
+
+**A real gap found live, not by any test — `can_approve_workflows` had no self-service path to
+ever become `true`.** The column existed since migration `000001` (`boolean DEFAULT false`) but
+was read nowhere until this workflow enforces it — meaning a fresh org's own founder, having
+never manually flipped this flag in Postgres, could never approve anything through the app, with
+no in-app way to grant it (workflow 13, team management, isn't built). Caught during live
+verification of the real approve/reject flow: the founder's own dev account got `403
+NOT_AUTHORIZED_TO_APPROVE` on their own workflow's approval. Fixed at the source, not by hand-
+patching the one account: `internal/db/queries/clerk_sync.sql`'s `UpsertUserForMembership` now
+takes `can_approve_workflows` as an INSERT column (via `clerk.go`'s new `canApproveByDefault(role)`
+— `true` for `admin`/`owner`) — deliberately **not** added to the `ON CONFLICT DO UPDATE SET`
+clause, so a membership re-sync (role change, reactivation) never silently resets a flag that
+could since have been granted or revoked by hand. Whoever creates/administers an org (Clerk's own
+default role for an org's creator is `admin`) can now approve their own agents' actions the
+moment workflow 10 first runs for them, without needing workflow 13 to exist first.
+
+**Verified live end-to-end, not just via the test suite** — the same discipline workflow 9's own
+verification pass established: booted both servers (`MOCK_LLM_MODE=true`), ran the existing
+`[TEST] approval` mock-scenario workflow twice through the real browser UI, and for each leg
+confirmed the real Postgres row, not just the HTTP response — once approving (`stripe.
+refund_payment` actually executed, run reached `completed` with a real refund-confirmation output)
+and once rejecting (with a real typed-in reason, run reached `completed` with "Run stopped: ...
+Reason: \<the typed reason\>" — `tool_call_count: 0`, confirming the pending call was correctly
+never executed). A real frontend bug surfaced during this pass and was fixed the same session —
+see `founderstack-web/AGENTS.md`'s Workflow 10 section for the details (the bug and fix are
+frontend-only; nothing here needed to change for it).
+
+**Testing**: `internal/core/notify/actiontoken_test.go` is a plain unit test (no build tag) —
+sign/verify roundtrip, expired/tampered/wrong-approval-id all rejected, and an unset secret
+rejects everything including a token signed by a *different*, configured signer (never "accept
+anything" just because nothing's configured). `internal/core/graph/approvalgate_integration_test.go`
+extends the existing `nodesTestDeps` fixture to assert the real `approvals` row's shape
+(`risk_level`, `context_data`, `expires_at`) and that `RunState.ApprovalID` survives a
+checkpoint/reload round trip. `internal/api/approvals/handler_integration_test.go` (9 subtests)
+covers the full decision lifecycle against a real suspended run driven through a real
+`graph.Launcher` (approve happy path actually resumes the run to completion; rejected when
+`can_approve_workflows=false`; **`403 AGENTS_PAUSED`**; reject requires a non-empty reason; a
+second approve attempt after the first is `409`; cross-org is `404` via RLS; the action-token path
+approves with no `Authorization` header at all; an expired/tampered token is `401`) — one real
+test-authoring gotcha worth knowing: a naive `*MockChatClient` resolver that builds a fresh client
+per `ResolveChatClient` call breaks across the `Launch`→`Resume` boundary exactly like
+`MOCK_LLM_TESTING.md`'s `approvalScenarioClient` already had to solve for the same reason (a
+`*MockChatClient` tracks call index internally; two *different* client instances each restart at
+canned-response index 0, so the resumed leg re-sends the *first* response — a tool-call batch
+identical to the one that just suspended — which trips the stuck-loop detector). Fixed by keying
+the test's mock-client cache by `org_id`, not building fresh per resolve call.
+`internal/core/workflows/approvalexpiry_integration_test.go` back-dates a real suspended
+approval's `expires_at` rather than waiting 24h (this codebase's established "manufacture the edge
+condition live" pattern), calls `expireApprovals` directly, and asserts the underlying
+`workflow_runs.status` actually left `awaiting_approval` — not just that the `approvals` row
+flipped.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -1254,9 +1402,13 @@ machine — CI runs the authoritative version of the same check regardless.
 | `GET/POST /api/v1/agents`, `GET /agents/tools`, `GET/PATCH/DELETE /agents/{id}` | `internal/api/agents/handler.go` | `middleware.RequireAuth` | Agent configuration CRUD — no execution (workflow 7) |
 | `GET/POST /api/v1/workflows`, `GET/PATCH/DELETE /workflows/{id}`, `POST /workflows/{id}/run` | `internal/api/workflows/handler.go` | `middleware.RequireAuth` | Workflow config CRUD + **launches a real run** (workflow 8 CRUD, workflow 9 execution) |
 | `GET /api/v1/runs`, `GET /runs/{id}`, `POST /runs/{id}/cancel`, `GET /runs/{id}/stream` (SSE) | `internal/api/runs/handler.go` | `middleware.RequireAuth` | List/inspect/cancel/live-stream a run (workflow 9) |
+| `GET /api/v1/approvals`, `GET /approvals/{id}` | `internal/api/approvals/handler.go` (`Register`) | `middleware.RequireAuth` | List/inspect pending or past approvals (workflow 10) |
+| `POST /api/v1/approvals/{id}/approve`, `POST /approvals/{id}/reject` | `internal/api/approvals/handler.go` (`RegisterActions`) | none — dual auth inside the handler (Bearer JWT or `?action_token=`) | Decide a pending approval; the action-token path is what lets a push notification's buttons work with the app closed (workflow 10) |
+| `GET/PUT /api/v1/settings/approvals` | `internal/api/settings/approvals.go` | `middleware.RequireAuth` | Org's configured Slack approvals channel (workflow 10) |
+| `POST/DELETE /api/v1/settings/push-subscription` | `internal/api/settings/pushsubscription.go` | `middleware.RequireAuth` | Register/remove a browser's Web Push subscription (workflow 10) |
 
-(Everything else in `WORKFLOW_PLAN_GO.md` — approvals (workflow 10), run traces/cost breakdown
-(workflow 11) — is unbuilt. Add rows here as routers land.)
+(Everything else in `WORKFLOW_PLAN_GO.md` — run traces/cost breakdown (workflow 11) — is unbuilt.
+Add rows here as routers land.)
 
 ### Dependency policy
 
@@ -1288,8 +1440,11 @@ Slack's hand-rolled OAuth and Stripe's plain `net/http`. `robfig/cron/v3` was ad
 exactly when first used (`ParseStandard`/`Schedule.Next()` for cron validation and `next_run_at`
 computation) — only its parser is used, not its own `Cron{}` job-runner, since workflow 8's
 scheduler is a plain `time.Ticker` per the plan's spec (see "Workflow Configuration & Scheduling"
-above). `sentry-go` and `otel` are still planned but not yet in `go.mod` — add each when its
-workflow lands.
+above). `SherClockHolmes/webpush-go` was added in workflow 10, exactly when first used
+(`internal/core/notify/webpush.go`) — Brevo's transactional email API deliberately got no new
+dependency (plain `net/http`, same reasoning as Slack/Stripe), so this is the workflow's only
+addition to `go.mod`. `sentry-go` and `otel` are still planned but not yet in `go.mod` — add each
+when its workflow lands.
 
 ## Environment Variables
 
@@ -1308,6 +1463,12 @@ and serves all of workflow 4's routes fine with every one of them blank — a re
 OAuth server (wrong/empty `client_id`), not at boot. Requiring them all up front would force a
 solo founder to register every provider's app before the server even starts, for integrations
 they may not use yet.
+
+Workflow 10's 6 vars (`BREVO_API_KEY`, `BREVO_FROM_EMAIL`, `WEBPUSH_VAPID_PUBLIC_KEY`,
+`WEBPUSH_VAPID_PRIVATE_KEY`, `WEBPUSH_VAPID_SUBJECT`, `PUSH_ACTION_TOKEN_SECRET`) are **not** in
+that required list either, same reasoning — the app boots and every approval still works with
+any/all of them blank, just with that one notification channel degrading to a logged no-op (see
+"Human Approval Gate (workflow 10)" above).
 
 `DEV_TOKEN_SECRET` is deliberately **not** in that required list — it's local-testing-only
 (see "Authentication" above) and should stay unset everywhere real, including production.

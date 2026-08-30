@@ -51,6 +51,25 @@ func TestNormalizeRole(t *testing.T) {
 	}
 }
 
+func TestCanApproveByDefault(t *testing.T) {
+	tests := []struct {
+		role string
+		want bool
+	}{
+		{"admin", true},
+		{"owner", true},
+		{"member", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.role, func(t *testing.T) {
+			if got := canApproveByDefault(tc.role); got != tc.want {
+				t.Errorf("canApproveByDefault(%q) = %v, want %v", tc.role, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNilIfEmpty(t *testing.T) {
 	if got := nilIfEmpty(""); got != nil {
 		t.Errorf("nilIfEmpty(\"\") = %q, want nil", *got)

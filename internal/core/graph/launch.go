@@ -14,6 +14,7 @@ import (
 
 	"github.com/founderstack/api/internal/core/llm"
 	coremcp "github.com/founderstack/api/internal/core/mcp"
+	"github.com/founderstack/api/internal/core/notify"
 	"github.com/founderstack/api/internal/db/dbgen"
 	"github.com/founderstack/api/internal/db/tenant"
 )
@@ -45,20 +46,23 @@ type Launcher struct {
 	registry          *coremcp.Registry
 	gateway           *coremcp.Gateway
 	resolveChatClient ChatClientResolver
+	notifier          *notify.Notifier
 }
 
 // NewLauncher builds a Launcher against the real llm.ResolveChatClient.
 // appPool must be the app_user (RLS-enforced) pool — every DB operation
-// here goes through tenant.WithTx.
-func NewLauncher(engine *Engine, appPool *pgxpool.Pool, encryptionKey []byte, registry *coremcp.Registry, gateway *coremcp.Gateway) *Launcher {
-	return NewLauncherWithResolver(engine, appPool, encryptionKey, registry, gateway, llm.ResolveChatClient)
+// here goes through tenant.WithTx. notifier may be nil (RunDeps.Notifier
+// is nil-checked before use) — most tests don't exercise the approval-gate
+// notification path and don't need a real one.
+func NewLauncher(engine *Engine, appPool *pgxpool.Pool, encryptionKey []byte, registry *coremcp.Registry, gateway *coremcp.Gateway, notifier *notify.Notifier) *Launcher {
+	return NewLauncherWithResolver(engine, appPool, encryptionKey, registry, gateway, notifier, llm.ResolveChatClient)
 }
 
 // NewLauncherWithResolver is NewLauncher with an injectable
 // ChatClientResolver — the constructor tests use to substitute a fake
 // resolver returning an llm.MockChatClient.
-func NewLauncherWithResolver(engine *Engine, appPool *pgxpool.Pool, encryptionKey []byte, registry *coremcp.Registry, gateway *coremcp.Gateway, resolveChatClient ChatClientResolver) *Launcher {
-	return &Launcher{engine: engine, appPool: appPool, encryptionKey: encryptionKey, registry: registry, gateway: gateway, resolveChatClient: resolveChatClient}
+func NewLauncherWithResolver(engine *Engine, appPool *pgxpool.Pool, encryptionKey []byte, registry *coremcp.Registry, gateway *coremcp.Gateway, notifier *notify.Notifier, resolveChatClient ChatClientResolver) *Launcher {
+	return &Launcher{engine: engine, appPool: appPool, encryptionKey: encryptionKey, registry: registry, gateway: gateway, notifier: notifier, resolveChatClient: resolveChatClient}
 }
 
 // Preflight checks the two fast-failing conditions before a run is even
@@ -239,7 +243,7 @@ func (l *Launcher) buildNodesForRun(ctx context.Context, orgPg, agentPg pgtype.U
 	deps := RunDeps{
 		Engine: l.engine, ChatClient: chatClient, Gateway: l.gateway,
 		Tools: tools, Policy: policy, SystemPrompt: agentRow.SystemPrompt, OrgID: orgPg,
-		AppPool: l.appPool, Model: *agentRow.Model,
+		AppPool: l.appPool, Model: *agentRow.Model, Notifier: l.notifier,
 	}
 	return agentRow, BuildNodes(deps), nil
 }

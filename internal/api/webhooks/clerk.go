@@ -190,16 +190,30 @@ func (h *ClerkHandler) upsertMembership(ctx context.Context, raw json.RawMessage
 	}
 
 	fullName := nilIfEmpty(strings.TrimSpace(data.PublicUserData.FirstName + " " + data.PublicUserData.LastName))
+	role := normalizeRole(data.Role)
+	canApprove := canApproveByDefault(role)
 	if err := h.db.UpsertUserForMembership(ctx, dbgen.UpsertUserForMembershipParams{
-		OrgID:       orgID,
-		ClerkUserID: data.PublicUserData.UserID,
-		Email:       data.PublicUserData.Identifier,
-		FullName:    fullName,
-		Role:        normalizeRole(data.Role),
+		OrgID:               orgID,
+		ClerkUserID:         data.PublicUserData.UserID,
+		Email:               data.PublicUserData.Identifier,
+		FullName:            fullName,
+		Role:                role,
+		CanApproveWorkflows: &canApprove,
 	}); err != nil {
 		return fmt.Errorf("upsert user: %w", err)
 	}
 	return nil
+}
+
+// canApproveByDefault decides a brand-new user's initial
+// can_approve_workflows value (see UpsertUserForMembership's doc comment
+// for why this only matters on first insert). Clerk's own default role
+// for whoever creates an organization is "admin" — treating admin/owner
+// as pre-authorized to approve their own agents' actions is what makes
+// Workflow 10 usable at all before workflow 13 (team management) exists
+// to grant this explicitly.
+func canApproveByDefault(role string) bool {
+	return role == "admin" || role == "owner"
 }
 
 type userPayload struct {

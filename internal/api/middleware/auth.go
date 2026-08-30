@@ -20,25 +20,29 @@ import (
 	"github.com/founderstack/api/internal/pkg/devtoken"
 )
 
-// jwkCache caches Clerk's JSON Web Keys by kid. Clerk's own docs recommend
+// JWKCache caches Clerk's JSON Web Keys by kid. Clerk's own docs recommend
 // caching and only invalidating when a replacement key is generated (i.e.
 // on an unrecognized kid) rather than fetching on every request — this is
 // exactly that, kept explicit rather than relying on undocumented internal
-// caching behavior in the SDK's higher-level helpers.
-type jwkCache struct {
+// caching behavior in the SDK's higher-level helpers. Exported (was
+// package-private jwkCache) so internal/api/approvals' handler — the one
+// other call site that needs to verify a Clerk Bearer token outside
+// RequireAuth's own gin.HandlerFunc, for its dual auth-header-or-action-
+// token approve/reject endpoints — can hold its own cache instance.
+type JWKCache struct {
 	mu   sync.RWMutex
 	keys map[string]*clerk.JSONWebKey
 }
 
-func newJWKCache() *jwkCache {
-	return &jwkCache{keys: make(map[string]*clerk.JSONWebKey)}
+func NewJWKCache() *JWKCache {
+	return &JWKCache{keys: make(map[string]*clerk.JSONWebKey)}
 }
 
 // get returns the cached key for keyID, calling fetch only on a cache
 // miss. fetch is a parameter (rather than a hardcoded call to
 // jwt.GetJSONWebKey) so the cache's hit/miss behavior is unit-testable
 // without a real Clerk API call — see auth_test.go.
-func (c *jwkCache) get(ctx context.Context, keyID string, fetch func(context.Context, string) (*clerk.JSONWebKey, error)) (*clerk.JSONWebKey, error) {
+func (c *JWKCache) get(ctx context.Context, keyID string, fetch func(context.Context, string) (*clerk.JSONWebKey, error)) (*clerk.JSONWebKey, error) {
 	c.mu.RLock()
 	jwk, ok := c.keys[keyID]
 	c.mu.RUnlock()
@@ -80,7 +84,7 @@ func (c *jwkCache) get(ctx context.Context, keyID string, fetch func(context.Con
 // giving up — see that package's doc comment for why this exists as a
 // separate path rather than a weakened primary one.
 func RequireAuth(systemPool *pgxpool.Pool, cfg *config.Config) gin.HandlerFunc {
-	cache := newJWKCache()
+	cache := NewJWKCache()
 	q := dbgen.New(systemPool)
 
 	return func(c *gin.Context) {
@@ -93,30 +97,18 @@ func RequireAuth(systemPool *pgxpool.Pool, cfg *config.Config) gin.HandlerFunc {
 
 		ctx := c.Request.Context()
 
-		clerkUserID, err := verifyClerkToken(ctx, cache, token)
+		clerkUserID, err := VerifyToken(ctx, cache, cfg, token)
 		if err != nil {
-			clerkUserID, err = devTokenFallback(cfg, token)
-			if err != nil {
-				response.Fail(c, http.StatusUnauthorized, "INVALID_TOKEN", "Invalid session token")
-				c.Abort()
-				return
-			}
-		}
-
-		user, err := q.GetActiveUserByClerkUserID(ctx, clerkUserID)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				response.Fail(c, http.StatusUnauthorized, "USER_NOT_SYNCHRONIZED", "User profile not synchronized")
-			} else {
-				response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not verify session")
-			}
+			response.Fail(c, http.StatusUnauthorized, "INVALID_TOKEN", "Invalid session token")
 			c.Abort()
 			return
 		}
 
-		org, err := q.GetActiveOrganizationByID(ctx, user.OrgID)
+		user, err := ResolveUser(ctx, q, clerkUserID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
+				response.Fail(c, http.StatusUnauthorized, "USER_NOT_SYNCHRONIZED", "User profile not synchronized")
+			} else if errors.Is(err, errOrgNotFound) {
 				response.Fail(c, http.StatusNotFound, "ORGANIZATION_NOT_FOUND", "Organization not found or inactive")
 			} else {
 				response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not verify session")
@@ -125,13 +117,7 @@ func RequireAuth(systemPool *pgxpool.Pool, cfg *config.Config) gin.HandlerFunc {
 			return
 		}
 
-		authctx.Set(c, authctx.User{
-			ID:      user.ID,
-			OrgID:   user.OrgID,
-			Role:    user.Role,
-			OrgName: org.Name,
-			OrgSlug: org.Slug,
-		})
+		authctx.Set(c, user)
 		c.Next()
 	}
 }
@@ -140,9 +126,24 @@ func fetchJWK(ctx context.Context, keyID string) (*clerk.JSONWebKey, error) {
 	return jwt.GetJSONWebKey(ctx, &jwt.GetJSONWebKeyParams{KeyID: keyID})
 }
 
+// VerifyToken runs the real Clerk verification path, falling back to
+// devtoken.Verify exactly like RequireAuth always did, and returns the
+// token's subject (a clerk_user_id) on success. Exported so
+// internal/api/approvals' handler can verify the same Authorization
+// header its authenticated GET routes see, for its approve/reject
+// endpoints' Bearer-token path (the other path being a signed action
+// token, which isn't a Clerk JWT at all — see notify.ActionTokenSigner).
+func VerifyToken(ctx context.Context, cache *JWKCache, cfg *config.Config, token string) (string, error) {
+	clerkUserID, err := verifyClerkToken(ctx, cache, token)
+	if err != nil {
+		return devTokenFallback(cfg, token)
+	}
+	return clerkUserID, nil
+}
+
 // verifyClerkToken runs the real verification path and returns the
 // token's subject (a clerk_user_id) on success.
-func verifyClerkToken(ctx context.Context, cache *jwkCache, token string) (string, error) {
+func verifyClerkToken(ctx context.Context, cache *JWKCache, token string) (string, error) {
 	unverified, err := jwt.Decode(ctx, &jwt.DecodeParams{Token: token})
 	if err != nil {
 		return "", err
@@ -156,6 +157,39 @@ func verifyClerkToken(ctx context.Context, cache *jwkCache, token string) (strin
 		return "", err
 	}
 	return claims.Subject, nil
+}
+
+// errOrgNotFound distinguishes "no such user" from "user exists but their
+// org doesn't" for ResolveUser's caller — both are pgx.ErrNoRows from two
+// different queries, so this wraps the second one to keep them
+// distinguishable after ResolveUser returns a single error.
+var errOrgNotFound = errors.New("middleware: organization not found or inactive")
+
+// ResolveUser looks up clerkUserID's local user + org row and returns the
+// authctx.User RequireAuth stores on the request context — extracted so
+// internal/api/approvals' handler can resolve the same identity for its
+// Authorization-header auth path without duplicating these two dbgen
+// calls. Returns pgx.ErrNoRows when the user itself isn't
+// found/inactive, errOrgNotFound when the user's org isn't.
+func ResolveUser(ctx context.Context, q *dbgen.Queries, clerkUserID string) (authctx.User, error) {
+	user, err := q.GetActiveUserByClerkUserID(ctx, clerkUserID)
+	if err != nil {
+		return authctx.User{}, err
+	}
+	org, err := q.GetActiveOrganizationByID(ctx, user.OrgID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return authctx.User{}, errOrgNotFound
+		}
+		return authctx.User{}, err
+	}
+	return authctx.User{
+		ID:      user.ID,
+		OrgID:   user.OrgID,
+		Role:    user.Role,
+		OrgName: org.Name,
+		OrgSlug: org.Slug,
+	}, nil
 }
 
 // devTokenFallback attempts devtoken.Verify — only ever reached after real

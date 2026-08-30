@@ -83,6 +83,7 @@ type Approval struct {
 	Status      *string            `json:"status"`
 	ContextData []byte             `json:"context_data"`
 	RiskLevel   *string            `json:"risk_level"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
 
 type ApprovalDecision struct {
@@ -171,27 +172,39 @@ type McpConnection struct {
 }
 
 type Organization struct {
-	ID                   pgtype.UUID        `json:"id"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
-	Name                 string             `json:"name"`
-	Slug                 string             `json:"slug"`
-	ClerkOrgID           string             `json:"clerk_org_id"`
-	ActiveApiKeyID       pgtype.UUID        `json:"active_api_key_id"`
-	LlmProvider          *string            `json:"llm_provider"`
-	PlanTier             *string            `json:"plan_tier"`
-	MaxAgents            *int32             `json:"max_agents"`
-	MaxWorkflows         *int32             `json:"max_workflows"`
-	MaxRagStorageGb      *int32             `json:"max_rag_storage_gb"`
-	MaxMcpIntegrations   *int32             `json:"max_mcp_integrations"`
-	StripeCustomerID     *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID *string            `json:"stripe_subscription_id"`
-	SubscriptionStatus   *string            `json:"subscription_status"`
-	TrialEndsAt          pgtype.Timestamptz `json:"trial_ends_at"`
-	Settings             []byte             `json:"settings"`
-	OnboardingCompleted  *bool              `json:"onboarding_completed"`
-	IsActive             *bool              `json:"is_active"`
-	AgentsPaused         bool               `json:"agents_paused"`
+	ID                      pgtype.UUID        `json:"id"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
+	Name                    string             `json:"name"`
+	Slug                    string             `json:"slug"`
+	ClerkOrgID              string             `json:"clerk_org_id"`
+	ActiveApiKeyID          pgtype.UUID        `json:"active_api_key_id"`
+	LlmProvider             *string            `json:"llm_provider"`
+	PlanTier                *string            `json:"plan_tier"`
+	MaxAgents               *int32             `json:"max_agents"`
+	MaxWorkflows            *int32             `json:"max_workflows"`
+	MaxRagStorageGb         *int32             `json:"max_rag_storage_gb"`
+	MaxMcpIntegrations      *int32             `json:"max_mcp_integrations"`
+	StripeCustomerID        *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID    *string            `json:"stripe_subscription_id"`
+	SubscriptionStatus      *string            `json:"subscription_status"`
+	TrialEndsAt             pgtype.Timestamptz `json:"trial_ends_at"`
+	Settings                []byte             `json:"settings"`
+	OnboardingCompleted     *bool              `json:"onboarding_completed"`
+	IsActive                *bool              `json:"is_active"`
+	AgentsPaused            bool               `json:"agents_paused"`
+	ApprovalsSlackChannelID *string            `json:"approvals_slack_channel_id"`
+}
+
+type PushSubscription struct {
+	ID        pgtype.UUID        `json:"id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	OrgID     pgtype.UUID        `json:"org_id"`
+	UserID    pgtype.UUID        `json:"user_id"`
+	Endpoint  string             `json:"endpoint"`
+	P256dhKey string             `json:"p256dh_key"`
+	AuthKey   string             `json:"auth_key"`
 }
 
 type Session struct {

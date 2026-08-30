@@ -49,6 +49,13 @@ func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/api-key/status", h.APIKeyStatus)
 	rg.DELETE("/api-key", h.DeleteAPIKey)
 	rg.GET("/api-key/providers", h.ListProviders)
+
+	//(approval-gate notification config) — see approvals.go
+	// and pushsubscription.go in this same package.
+	rg.GET("/approvals", h.GetApprovalsSettings)
+	rg.PUT("/approvals", h.UpdateApprovalsSettings)
+	rg.POST("/push-subscription", h.SubmitPushSubscription)
+	rg.DELETE("/push-subscription", h.DeletePushSubscription)
 }
 
 type submitAPIKeyRequest struct {

@@ -29,6 +29,7 @@ type Querier interface {
 	// separate "really gone" state the way documents/agents effectively do.
 	DeactivateWorkflow(ctx context.Context, arg DeactivateWorkflowParams) (int64, error)
 	DeleteDocumentChunks(ctx context.Context, docID pgtype.UUID) error
+	DeletePushSubscription(ctx context.Context, arg DeletePushSubscriptionParams) error
 	// Fills in the completion-summary fields checkpoint() itself doesn't own
 	// (status stays checkpoint()'s alone) — only called once a run reaches a
 	// genuinely terminal status, never for awaiting_approval.
@@ -48,9 +49,21 @@ type Querier interface {
 	// chicken-and-egg reasoning as the Clerk webhook's org creation.
 	GetActiveUserByClerkUserID(ctx context.Context, clerkUserID string) (GetActiveUserByClerkUserIDRow, error)
 	GetAgent(ctx context.Context, arg GetAgentParams) (GetAgentRow, error)
+	GetApproval(ctx context.Context, arg GetApprovalParams) (GetApprovalRow, error)
+	// GetApprovalSystemScoped runs on app_system (BYPASSRLS) — the
+	// action-token approve/reject path (internal/api/approvals/handler.go)
+	// has no tenant context yet at this point (an unauthenticated caller
+	// can't SET LOCAL app.current_org_id for an org it hasn't proven it
+	// belongs to), the same chicken-and-egg reasoning as
+	// internal/api/middleware/auth.go's RequireAuth resolving identity before
+	// any org context exists. Scoped by primary key only; every write that
+	// follows still goes through the normal org-scoped path once org_id is
+	// known from this row.
+	GetApprovalSystemScoped(ctx context.Context, id pgtype.UUID) (GetApprovalSystemScopedRow, error)
 	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
 	GetDocument(ctx context.Context, arg GetDocumentParams) (GetDocumentRow, error)
 	GetKeyStatusByProvider(ctx context.Context, arg GetKeyStatusByProviderParams) (GetKeyStatusByProviderRow, error)
+	GetOrgApprovalsSlackChannel(ctx context.Context, id pgtype.UUID) (*string, error)
 	// graph.Launcher's run lifecycle (POST /workflows/{id}/run's async goroutine
 	// — see internal/core/graph/launch.go) and the read-only HTTP endpoints
 	// (GET /runs, GET /runs/{id}).
@@ -69,6 +82,12 @@ type Querier interface {
 	// infer this from Engine.Run's returned error alone, since a suspended
 	// run also returns a nil error.
 	GetRunStatus(ctx context.Context, arg GetRunStatusParams) (string, error)
+	// GetUserApprovalPermissions backs both the authenticated and the
+	// action-token approve/reject paths (internal/api/approvals/handler.go) —
+	// neither authctx.User nor a Clerk JWT carries can_approve_workflows, so
+	// this is looked up fresh at decision time rather than cached on the
+	// request context.
+	GetUserApprovalPermissions(ctx context.Context, id pgtype.UUID) (GetUserApprovalPermissionsRow, error)
 	GetWorkflow(ctx context.Context, arg GetWorkflowParams) (GetWorkflowRow, error)
 	GetWorkflowRun(ctx context.Context, arg GetWorkflowRunParams) (GetWorkflowRunRow, error)
 	// Only called after purgeDocumentJob has successfully removed the
@@ -79,6 +98,16 @@ type Querier interface {
 	// rows (pgx.ErrNoRows on the :one Scan), which the handler translates to a
 	// 400 DUPLICATE_AGENT_NAME rather than a generic 500.
 	InsertAgent(ctx context.Context, arg InsertAgentParams) (InsertAgentRow, error)
+	// Workflow 10: approvals/approval_decisions writes (internal/core/graph's
+	// writeApprovalGate, internal/api/approvals' handler), notification lookups
+	// (internal/core/notify), and the 24h expiry sweep
+	// (internal/core/workflows/approvalexpiry.go). InsertApproval/GetApproval/
+	// ListApprovalsForOrg/UpdateApprovalStatus/InsertApprovalDecision run
+	// through tenant.WithTx (app_user) except ListExpiredPendingApprovals,
+	// which is inherently cross-org and runs on app_system, same reasoning as
+	// every other background sweep in this codebase.
+	InsertApproval(ctx context.Context, arg InsertApprovalParams) (pgtype.UUID, error)
+	InsertApprovalDecision(ctx context.Context, arg InsertApprovalDecisionParams) error
 	// Written from internal/core/graph/observability.go — every tool call
 	// and every LLM call the executor makes writes one row to each of these,
 	// closing the "nothing existing to reuse" gap flagged in the Workflow 9
@@ -121,6 +150,8 @@ type Querier interface {
 	// appear exactly once, and a JOIN would either drop it (INNER) or need the
 	// GROUP BY/aggregate dance anyway for no real benefit at this scale.
 	ListAgents(ctx context.Context, orgID pgtype.UUID) ([]ListAgentsRow, error)
+	ListApprovalsForOrg(ctx context.Context, arg ListApprovalsForOrgParams) ([]ListApprovalsForOrgRow, error)
+	ListApproverEmailsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListApproverEmailsForOrgRow, error)
 	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
 	ListDocumentChunkPineconeIDs(ctx context.Context, docID pgtype.UUID) ([]string, error)
 	// Excludes 'deleting': once DELETE .../{id} has been called, the
@@ -131,6 +162,10 @@ type Querier interface {
 	// Background scheduler (internal/core/workflows/scheduler.go) — app_system,
 	// never tenant.WithTx; see the file-level comment above.
 	ListDueScheduledWorkflows(ctx context.Context) ([]ListDueScheduledWorkflowsRow, error)
+	// ListExpiredPendingApprovals runs on app_system (BYPASSRLS) — sweeping
+	// expirations across every org is inherently cross-tenant, same reasoning
+	// as internal/core/integrations/refresh.go's RunRefreshJob.
+	ListExpiredPendingApprovals(ctx context.Context) ([]ListExpiredPendingApprovalsRow, error)
 	// Used only by the background refresh job (app_system pool). Scoped to
 	// oauth_status = 'connected' so a already-expired or revoked connection
 	// isn't retried every 30 minutes forever.
@@ -143,6 +178,7 @@ type Querier interface {
 	// false (not SQL NULL) when llm_provider is unset, so the generated Go
 	// field is a plain bool, not a nullable pointer.
 	ListKeyStatuses(ctx context.Context, orgID pgtype.UUID) ([]ListKeyStatusesRow, error)
+	ListPushSubscriptionsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListPushSubscriptionsForOrgRow, error)
 	ListRunsForOrg(ctx context.Context, arg ListRunsForOrgParams) ([]ListRunsForOrgRow, error)
 	// Documents whose background job (processDocument or purgeDocumentJob)
 	// may have been running in a process that restarted mid-job — the
@@ -185,12 +221,14 @@ type Querier interface {
 	// route around a real constraint), surfacing as a Postgres 23505 the
 	// handler translates the same way InsertAgent's ON CONFLICT branch does.
 	UpdateAgent(ctx context.Context, arg UpdateAgentParams) (UpdateAgentRow, error)
+	UpdateApprovalStatus(ctx context.Context, arg UpdateApprovalStatusParams) (int64, error)
 	UpdateConnectionTokens(ctx context.Context, arg UpdateConnectionTokensParams) (int64, error)
 	// Used only by the background refresh job (app_system pool) — targets a
 	// specific connection by id, already scoped to the right org by virtue of
 	// having come from ListExpiringConnectionsSystem's own row.
 	UpdateConnectionTokensByIDSystem(ctx context.Context, arg UpdateConnectionTokensByIDSystemParams) (int64, error)
 	UpdateDocumentProcessing(ctx context.Context, arg UpdateDocumentProcessingParams) error
+	UpdateOrgApprovalsSlackChannel(ctx context.Context, arg UpdateOrgApprovalsSlackChannelParams) error
 	// internal/core/graph's checkpoint read/write — the engine.Run/Resume/checkpoint
 	// calls added workflow9_engine_guardrails.up.sql for. Always run through
 	// tenant.WithTx (a fresh transaction per call, org-scoped) — never held open across
@@ -225,6 +263,15 @@ type Querier interface {
 	// through the app_system (BYPASSRLS) pool, never app_user — see
 	// internal/api/webhooks/clerk.go.
 	UpsertOrganization(ctx context.Context, arg UpsertOrganizationParams) (pgtype.UUID, error)
+	UpsertPushSubscription(ctx context.Context, arg UpsertPushSubscriptionParams) error
+	// can_approve_workflows is set only on first INSERT, never touched by the
+	// ON CONFLICT branch (not listed in its SET clause) — a membership re-sync
+	// (role change, reactivation) must never silently reset a flag that could
+	// since have been granted or revoked by hand. Workflow 13 (team management)
+	// doesn't exist yet, so there's no in-app way for an org's own
+	// admin/owner to grant themselves this — defaulting it true for whoever
+	// created/administers the org is what lets Workflow 10's approval gate be
+	// usable at all before that UI exists.
 	UpsertUserForMembership(ctx context.Context, arg UpsertUserForMembershipParams) error
 	// Queries backing workflow 8 (workflow config CRUD + scheduling). Most are
 	// tenant-scoped through app_user via tenant.WithTx, like every other

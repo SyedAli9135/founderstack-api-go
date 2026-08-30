@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/founderstack/api/internal/core/llm"
 )
 
 // EventType is the SSE event name forwarded by GET /runs/{run_id}/stream.
@@ -41,6 +43,16 @@ type CompleteData struct {
 	Output       string     `json:"output"`
 	TokenUsage   TokenUsage `json:"token_usage"`
 	CostSoFarUSD float64    `json:"cost_so_far_usd"`
+}
+
+// ApprovalRequiredData is EventApprovalRequired's Data — added so
+// founderstack-web's ApprovalCard can render straight from this SSE event
+// (approval id, risk badge, the pending tool-call batch) without a second
+// GET /approvals/{id} round trip for the inline live-run case.
+type ApprovalRequiredData struct {
+	ApprovalID string         `json:"approval_id"`
+	RiskLevel  string         `json:"risk_level"`
+	ToolCalls  []llm.ToolCall `json:"tool_calls"`
 }
 
 // EventBus is a small pub/sub keyed by run_id: node functions (and the

@@ -138,7 +138,11 @@ func (e *Engine) runFrom(ctx context.Context, nodes Nodes, state *RunState, node
 			if err := checkpoint(ctx, e.pool, state, next, "awaiting_approval"); err != nil {
 				return err
 			}
-			e.Bus.Publish(Event{Type: EventApprovalRequired, RunID: state.WorkflowRunID})
+			e.Bus.Publish(Event{Type: EventApprovalRequired, RunID: state.WorkflowRunID, Data: ApprovalRequiredData{
+				ApprovalID: state.ApprovalID.String(),
+				RiskLevel:  state.PendingApprovalRiskLevel,
+				ToolCalls:  state.PendingToolCalls,
+			}})
 			return nil
 		default:
 			if err := checkpoint(ctx, e.pool, state, next, "running"); err != nil {

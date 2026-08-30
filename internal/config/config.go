@@ -86,7 +86,7 @@ type Config struct {
 	// token fallback path entirely rather than requiring it be configured.
 	DevTokenSecret secret.Value `mapstructure:"DEV_TOKEN_SECRET"`
 
-	// MockLLMMode swaps every workflow-9 run's real BYOK ChatClient for a
+	// MockLLMMode swaps every workflow run's real BYOK ChatClient for a
 	// scripted llm.MockScenarioResolver (see that file's doc comment for
 	// the full scenario catalog) and enables a dev-only approval-resume
 	// debug route — lets a founder exercise the whole agent execution
@@ -98,6 +98,26 @@ type Config struct {
 	// this, so a misconfigured production environment can't silently run
 	// every agent against canned responses instead of a real model.
 	MockLLMMode bool `mapstructure:"MOCK_LLM_MODE"`
+
+	// (approval-gate notifications) — all 6 deliberately
+	// optional (not in requiredFields), same "app boots fine, the feature
+	// degrades to a logged no-op" convention as every other third-party
+	// secret above. BrevoAPIKey, not SendGrid: SendGrid's free tier is now
+	// a 60-day trial only; Brevo has a genuinely free-forever tier and
+	// needs no SDK (internal/core/notify/email.go is a plain net/http
+	// call). WebPushVAPIDPublicKey is intentionally not a secret.Value —
+	// it's shipped to the frontend as-is.
+	BrevoAPIKey            secret.Value `mapstructure:"BREVO_API_KEY"`
+	BrevoFromEmail         string       `mapstructure:"BREVO_FROM_EMAIL"`
+	WebPushVAPIDPublicKey  string       `mapstructure:"WEBPUSH_VAPID_PUBLIC_KEY"`
+	WebPushVAPIDPrivateKey secret.Value `mapstructure:"WEBPUSH_VAPID_PRIVATE_KEY"`
+	WebPushVAPIDSubject    string       `mapstructure:"WEBPUSH_VAPID_SUBJECT"`
+	// PushActionTokenSecret signs the single-purpose action tokens embedded
+	// in a push notification's payload (internal/core/notify/actiontoken.go)
+	// so its Approve/Reject buttons work without opening the app — a
+	// dedicated secret, not reused from OAuthStateSecret, to contain blast
+	// radius between the two unrelated signing use cases.
+	PushActionTokenSecret secret.Value `mapstructure:"PUSH_ACTION_TOKEN_SECRET"`
 }
 
 // requiredFields lists the mapstructure keys that must resolve to a
@@ -177,6 +197,13 @@ func Load() (*Config, error) {
 		"API_KEY_MOCK_PREFIX":    "mock-test-key-",
 		"DEV_TOKEN_SECRET":       "",
 		"MOCK_LLM_MODE":          false,
+
+		"BREVO_API_KEY":             "",
+		"BREVO_FROM_EMAIL":          "",
+		"WEBPUSH_VAPID_PUBLIC_KEY":  "",
+		"WEBPUSH_VAPID_PRIVATE_KEY": "",
+		"WEBPUSH_VAPID_SUBJECT":     "",
+		"PUSH_ACTION_TOKEN_SECRET":  "",
 	}
 	for key, def := range defaults {
 		v.SetDefault(key, def)

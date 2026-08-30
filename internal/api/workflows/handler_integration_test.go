@@ -163,7 +163,7 @@ func testRouter(t *testing.T, systemPool, appPool *pgxpool.Pool, cfg *config.Con
 	}
 	gateway := coremcp.NewGateway(appPool, make([]byte, 32), registry, nil)
 	engine := graph.NewEngine(appPool)
-	launcher := graph.NewLauncherWithResolver(engine, appPool, make([]byte, 32), registry, gateway,
+	launcher := graph.NewLauncherWithResolver(engine, appPool, make([]byte, 32), registry, gateway, nil,
 		func(ctx context.Context, appPool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, provider llm.ProviderID, model string) (llm.ChatClient, error) {
 			return llm.NewMockChatClient(), nil
 		})

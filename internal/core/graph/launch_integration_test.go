@@ -117,7 +117,7 @@ func TestLauncher_PreflightBlocksWhenAgentsPaused(t *testing.T) {
 	}
 
 	engine := NewEngine(appPool)
-	launcher := NewLauncherWithResolver(engine, appPool, fx.encKey, nil, nil, mockChatClientResolver(nil))
+	launcher := NewLauncherWithResolver(engine, appPool, fx.encKey, nil, nil, nil, mockChatClientResolver(nil))
 
 	err := launcher.Preflight(context.Background(), pgtype.UUID{Bytes: fx.orgID, Valid: true})
 	if !errors.Is(err, ErrAgentsPaused) {
@@ -131,7 +131,7 @@ func TestLauncher_PreflightBlocksWhenNoBYOKKey(t *testing.T) {
 	fx := newLaunchFixture(t, systemPool, map[string]any{"allowed_tools": []string{"fake.get_data"}}, "anthropic", false) // hasKey=false
 
 	engine := NewEngine(appPool)
-	launcher := NewLauncherWithResolver(engine, appPool, fx.encKey, nil, nil, mockChatClientResolver(nil))
+	launcher := NewLauncherWithResolver(engine, appPool, fx.encKey, nil, nil, nil, mockChatClientResolver(nil))
 
 	err := launcher.Preflight(context.Background(), pgtype.UUID{Bytes: fx.orgID, Valid: true})
 	if !errors.Is(err, ErrNoBYOKKey) {
@@ -145,7 +145,7 @@ func TestLauncher_PreflightPassesWithValidKeyAndNotPaused(t *testing.T) {
 	fx := newLaunchFixture(t, systemPool, map[string]any{"allowed_tools": []string{"fake.get_data"}}, "anthropic", true)
 
 	engine := NewEngine(appPool)
-	launcher := NewLauncherWithResolver(engine, appPool, fx.encKey, nil, nil, mockChatClientResolver(nil))
+	launcher := NewLauncherWithResolver(engine, appPool, fx.encKey, nil, nil, nil, mockChatClientResolver(nil))
 
 	if err := launcher.Preflight(context.Background(), pgtype.UUID{Bytes: fx.orgID, Valid: true}); err != nil {
 		t.Fatalf("Preflight() error = %v, want nil", err)
@@ -177,7 +177,7 @@ func TestLauncher_LaunchRunsToCompletionAndFinalizes(t *testing.T) {
 	)
 
 	engine := NewEngine(appPool)
-	launcher := NewLauncherWithResolver(engine, appPool, fx.encKey, registry, gateway, mockChatClientResolver(mock))
+	launcher := NewLauncherWithResolver(engine, appPool, fx.encKey, registry, gateway, nil, mockChatClientResolver(mock))
 
 	if err := launcher.Preflight(context.Background(), pgtype.UUID{Bytes: fx.orgID, Valid: true}); err != nil {
 		t.Fatalf("Preflight() error = %v, want nil", err)
@@ -246,7 +246,7 @@ func TestLauncher_LaunchMarksFailedWhenAgentHasNoModel(t *testing.T) {
 	}
 
 	engine := NewEngine(appPool)
-	launcher := NewLauncherWithResolver(engine, appPool, fx.encKey, nil, nil, mockChatClientResolver(llm.NewMockChatClient()))
+	launcher := NewLauncherWithResolver(engine, appPool, fx.encKey, nil, nil, nil, mockChatClientResolver(llm.NewMockChatClient()))
 	launcher.Launch(fx.orgID, fx.agentID, fx.workflowID, fx.runID, "do something")
 
 	var status string

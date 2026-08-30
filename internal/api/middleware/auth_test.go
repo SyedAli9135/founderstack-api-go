@@ -34,7 +34,7 @@ func TestBearerToken(t *testing.T) {
 }
 
 func TestJWKCache_CachesAfterFirstFetch(t *testing.T) {
-	cache := newJWKCache()
+	cache := NewJWKCache()
 	calls := 0
 	fetch := func(_ context.Context, keyID string) (*clerk.JSONWebKey, error) {
 		calls++
@@ -56,7 +56,7 @@ func TestJWKCache_CachesAfterFirstFetch(t *testing.T) {
 }
 
 func TestJWKCache_FetchesSeparatelyPerKeyID(t *testing.T) {
-	cache := newJWKCache()
+	cache := NewJWKCache()
 	calls := 0
 	fetch := func(_ context.Context, keyID string) (*clerk.JSONWebKey, error) {
 		calls++
@@ -75,7 +75,7 @@ func TestJWKCache_FetchesSeparatelyPerKeyID(t *testing.T) {
 }
 
 func TestJWKCache_DoesNotCacheOnFetchError(t *testing.T) {
-	cache := newJWKCache()
+	cache := NewJWKCache()
 	wantErr := errors.New("clerk API unreachable")
 	calls := 0
 	fetch := func(_ context.Context, keyID string) (*clerk.JSONWebKey, error) {

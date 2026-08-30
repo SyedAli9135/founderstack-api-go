@@ -22,6 +22,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/founderstack/api/internal/api/agents"
+	approvalsapi "github.com/founderstack/api/internal/api/approvals"
 	"github.com/founderstack/api/internal/api/documents"
 	"github.com/founderstack/api/internal/api/identity"
 	integrationsapi "github.com/founderstack/api/internal/api/integrations"
@@ -39,6 +40,7 @@ import (
 	corellm "github.com/founderstack/api/internal/core/llm"
 	coremcp "github.com/founderstack/api/internal/core/mcp"
 	mcpservers "github.com/founderstack/api/internal/core/mcp/servers"
+	"github.com/founderstack/api/internal/core/notify"
 	coreworkflows "github.com/founderstack/api/internal/core/workflows"
 	"github.com/founderstack/api/internal/pkg/vault"
 )
@@ -119,7 +121,7 @@ func run() error {
 		logger.Info("mcp tool registry ready", "services", len(tools), "tools", count)
 	}
 
-	// Workflow 9: the execution engine. mcpGateway is registry's paired
+	// the execution engine. mcpGateway is registry's paired
 	// executor — the one call site that fetches+decrypts an org's
 	// integration token and attaches it to a tool call (see
 	// coremcp.Gateway's own doc comment). engine is a singleton shared by
@@ -129,6 +131,19 @@ func run() error {
 	// an executing one.
 	mcpGateway := coremcp.NewGateway(dbPool, encryptionKey, mcpRegistry, redisClient)
 	graphEngine := graph.NewEngine(dbPool)
+
+	// all 3 channels degrade to a logged no-op when their
+	// config is unset (see each sender's own constructor doc comment) —
+	// notifier is never nil, so RunDeps.Notifier is always safe to use
+	// without a further nil check inside writeApprovalGate beyond the one
+	// already there for tests that build RunDeps by hand.
+	actionTokens := notify.NewActionTokenSigner(cfg.PushActionTokenSecret)
+	notifier := notify.New(
+		notify.NewEmailSender(cfg.BrevoAPIKey, cfg.BrevoFromEmail),
+		notify.NewWebPushSender(cfg.WebPushVAPIDPublicKey, cfg.WebPushVAPIDPrivateKey, cfg.WebPushVAPIDSubject),
+		actionTokens,
+		cfg.AppBaseURL,
+	)
 
 	var launcher *graph.Launcher
 	if cfg.MockLLMMode {
@@ -141,12 +156,12 @@ func run() error {
 			return fmt.Errorf("MOCK_LLM_MODE=true is not allowed when APP_ENV=production")
 		}
 		logger.Warn("MOCK_LLM_MODE enabled — every workflow run will use a scripted MockChatClient, no real LLM provider will be called")
-		launcher = graph.NewLauncherWithResolver(graphEngine, dbPool, encryptionKey, mcpRegistry, mcpGateway, corellm.MockScenarioResolver)
+		launcher = graph.NewLauncherWithResolver(graphEngine, dbPool, encryptionKey, mcpRegistry, mcpGateway, notifier, corellm.MockScenarioResolver)
 	} else {
-		launcher = graph.NewLauncher(graphEngine, dbPool, encryptionKey, mcpRegistry, mcpGateway)
+		launcher = graph.NewLauncher(graphEngine, dbPool, encryptionKey, mcpRegistry, mcpGateway, notifier)
 	}
 
-	// Workflow 6 (document upload / RAG). Pinecone is required here (unlike
+	// (document upload / RAG). Pinecone is required here (unlike
 	// newPineconeClient's nil-if-unconfigured fallback for the health
 	// check) — a document upload with no vector store to index into isn't
 	// a degraded mode, it's a broken one, so a missing PINECONE_API_KEY
@@ -167,18 +182,24 @@ func run() error {
 	// job queue.
 	docsProcessor.RecoverStuckJobs(ctx, systemPool)
 
-	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, mcpRegistry, graphEngine, launcher)
+	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, mcpRegistry, graphEngine, launcher, actionTokens)
 
 	// Runs until ctx is cancelled (same SIGINT/SIGTERM signal the HTTP
 	// server shuts down on) — see integrations.RunRefreshJob's doc comment
 	// for why this needs systemPool rather than the RLS-scoped dbPool.
 	go integrations.RunRefreshJob(ctx, systemPool, encryptionKey, integrationsRegistry)
 
-	// Workflow 8's background scheduler — same reasoning as the refresh job
+	// background scheduler — same reasoning as the refresh job
 	// above for why this runs on systemPool. Only inserts pending
 	// workflow_runs rows; see coreworkflows.RunScheduler's doc comment for
 	// why it doesn't do anything past that yet.
 	go coreworkflows.RunScheduler(ctx, systemPool)
+
+	// 24h approval auto-expiry sweep — same systemPool
+	// reasoning, and the same "run once immediately, then every tick"
+	// shape as the two jobs above. See RunApprovalExpiryJob's doc comment
+	// for why this must call launcher.Resume, not just flip approvals.status.
+	go coreworkflows.RunApprovalExpiryJob(ctx, systemPool, launcher)
 
 	srv := &http.Server{
 		Addr:              addr(),
@@ -250,7 +271,7 @@ func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	return client, nil
 }
 
-func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, mcpRegistry *coremcp.Registry, graphEngine *graph.Engine, launcher *graph.Launcher) *gin.Engine {
+func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, mcpRegistry *coremcp.Registry, graphEngine *graph.Engine, launcher *graph.Launcher, actionTokens *notify.ActionTokenSigner) *gin.Engine {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -314,12 +335,27 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 		runsapi.NewDevResumeHandler(db, launcher).Register(apiRuns)
 	}
 
+	approvalsHandler := approvalsapi.NewHandler(db, systemDB, launcher, actionTokens, cfg)
+
+	apiApprovals := router.Group("/api/v1")
+	apiApprovals.Use(middleware.RequireAuth(systemDB, cfg))
+	approvalsHandler.Register(apiApprovals)
+
+	// Deliberately ungated — a push notification's Approve/Reject action
+	// buttons have no live Clerk session to attach (see
+	// notify.ActionTokenSigner's doc comment); Handler.resolveActor does
+	// its own dual auth (Bearer or ?action_token=) per request instead of
+	// gin middleware. Same "second, differently-authenticated route group
+	// for the same resource" shape as apiIntegrationsCallback above.
+	apiApprovalsActions := router.Group("/api/v1")
+	approvalsHandler.RegisterActions(apiApprovalsActions)
+
 	return router
 }
 
 // newIntegrationsRegistry constructs one provider per catalog.go entry —
-// the single place, per the "open/closed" design note in
-// WORKFLOW_PLAN_GO.md's workflow 4 section, that needs a new line when a
+// the single place, per the "open/closed" design note,
+// that needs a new line when a
 // provider is added. Every provider's redirect URL follows the same
 // {API_URL}/api/v1/integrations/{service}/callback shape.
 func newIntegrationsRegistry(cfg *config.Config) *integrations.Registry {
@@ -338,7 +374,7 @@ func newIntegrationsRegistry(cfg *config.Config) *integrations.Registry {
 	)
 }
 
-// newMCPRegistry connects every MCP tool server (workflow 5) —
+// newMCPRegistry connects every MCP tool server —
 // mcpservers.AllServers() is the single place a new tool server needs a
 // new line (shared with cmd/seedtools, which needs the identical map).
 // Every server is wired via mcp.NewInMemoryTransports() inside
