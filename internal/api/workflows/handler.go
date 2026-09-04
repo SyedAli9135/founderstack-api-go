@@ -1,8 +1,5 @@
-// Package workflows implements workflow 8 — workflow configuration CRUD,
-// cron scheduling, and pause/resume. "Run Now" and the background
-// scheduler both stop at inserting a 'pending' workflow_runs row; nothing
-// here calls an LLM, executes a tool, or advances a run past 'pending' —
-// that's workflow 9's job (internal/core/graph, not built yet).
+// Package workflows implements workflow configuration CRUD, cron scheduling, and
+// pause/resume, plus launching a real run via internal/core/graph.
 package workflows
 
 import (
@@ -28,29 +25,20 @@ import (
 
 var validTriggerTypes = map[string]bool{"manual": true, "scheduled": true, "webhook": true}
 
-// standardGraphDefinition is fixed for every workflow — see
-// InsertWorkflow's doc comment in internal/db/queries/workflows.sql for
-// why this isn't user-configurable.
+// Fixed for every workflow — not user-configurable; see InsertWorkflow's doc comment in
+// internal/db/queries/workflows.sql.
 var standardGraphDefinition = []byte(`{"nodes":["planner","rag_retriever","executor","validator","reporter"]}`)
 
-// Handler implements workflow 8's 6 endpoints, plus workflow 9's Run
-// endpoint (Run itself dates from workflow 8 — "queue a pending row" —
-// but now actually starts execution via launcher).
 type Handler struct {
 	appPool  *pgxpool.Pool
 	launcher *graph.Launcher
 }
 
-// NewHandler builds a Handler. appPool must be the app_user (RLS-enforced)
-// pool — every DB operation here goes through tenant.WithTx. launcher is
-// what turns a queued run into a real, executing one — see
-// internal/core/graph/launch.go.
 func NewHandler(appPool *pgxpool.Pool, launcher *graph.Launcher) *Handler {
 	return &Handler{appPool: appPool, launcher: launcher}
 }
 
-// Register mounts all 6 routes on rg. rg's group must already have
-// middleware.RequireAuth applied.
+// rg must already have middleware.RequireAuth applied.
 func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/workflows", h.List)
 	rg.POST("/workflows", h.Create)
@@ -79,11 +67,8 @@ type workflowView struct {
 	UpdatedAt              time.Time  `json:"updated_at"`
 }
 
-// row is the shape shared by ListWorkflowsRow/GetWorkflowRow/
-// InsertWorkflowRow/UpdateWorkflowRow, minus agent_name — Insert/Update
-// don't JOIN agents (agent_id is either just-validated or immutable on
-// PATCH), so their view conversions take agentName as a separate argument
-// instead of a struct field.
+// Shared by List/Get/Insert/UpdateWorkflowRow, minus agent_name — Insert/Update don't JOIN
+// agents, so their view conversions take agentName as a separate argument instead.
 type row struct {
 	ID                     pgtype.UUID
 	AgentID                pgtype.UUID
@@ -143,8 +128,7 @@ func viewFromUpdate(r dbgen.UpdateWorkflowRow, agentName string) workflowView {
 		r.IsActive, r.Version, r.CreatedAt, r.UpdatedAt}, agentName)
 }
 
-// List returns every workflow for the org, active and paused alike —
-// GET /api/v1/workflows.
+// Doesn't filter by is_active — a paused workflow must stay visible so it can be resumed.
 func (h *Handler) List(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -171,7 +155,6 @@ func (h *Handler) List(c *gin.Context) {
 	response.OK(c, http.StatusOK, "", views)
 }
 
-// Get returns one workflow's detail — GET /api/v1/workflows/{id}.
 func (h *Handler) Get(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -215,7 +198,6 @@ type createWorkflowRequest struct {
 	EstimatedManualMinutes *int32  `json:"estimated_manual_minutes"`
 }
 
-// Create validates and inserts a new workflow — POST /api/v1/workflows.
 func (h *Handler) Create(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -299,8 +281,6 @@ type updateWorkflowRequest struct {
 	IsActive               *bool   `json:"is_active"`
 }
 
-// Update applies a partial update, including pause/resume via is_active —
-// PATCH /api/v1/workflows/{id}.
 func (h *Handler) Update(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -330,10 +310,8 @@ func (h *Handler) Update(c *gin.Context) {
 			return err
 		}
 
-		// trigger_type, cron_expression, and next_run_at are one coupled
-		// unit (see workflows.sql's UpdateWorkflow doc comment) — computed
-		// together here from the *effective* state (request value if
-		// present, existing value otherwise), never independently.
+		// trigger_type/cron_expression/next_run_at are one coupled unit — computed together
+		// from the effective state (request value if present, existing value otherwise).
 		effectiveTriggerType := existing.TriggerType
 		if req.TriggerType != nil {
 			if !validTriggerTypes[*req.TriggerType] {
@@ -379,10 +357,8 @@ func (h *Handler) Update(c *gin.Context) {
 	response.OK(c, http.StatusOK, "Workflow updated", view)
 }
 
-// Delete pauses a workflow (is_active=false) — DELETE /api/v1/workflows/{id}.
-// Semantically identical to PATCH {is_active: false}; see
-// internal/db/queries/workflows.sql's DeactivateWorkflow doc comment for
-// why workflows don't have a separate "really gone" state.
+// Semantically identical to PATCH {is_active: false} — workflows have no separate
+// "really gone" state (see internal/db/queries/workflows.sql's DeactivateWorkflow).
 func (h *Handler) Delete(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -412,14 +388,8 @@ func (h *Handler) Delete(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// Run starts a workflow run — POST /api/v1/workflows/{id}/run. Checks
-// launcher.Preflight (org kill switch, BYOK key presence) synchronously
-// before queuing anything, so a founder gets a real 4xx instead of a 202
-// that silently fails moments later — see graph.Launcher's own doc
-// comment. Once queued, launches execution via launcher.Launch on a
-// detached context (context.Background(), not c.Request.Context() —
-// this request has already returned its 202 by the time that goroutine
-// does real work).
+// Checks launcher.Preflight synchronously before queuing, so a founder gets a real 4xx
+// instead of a 202 that silently fails moments later.
 func (h *Handler) Run(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -483,11 +453,8 @@ func (h *Handler) Run(c *gin.Context) {
 	})
 }
 
-// computeSchedule validates triggerType and, for "scheduled", parses
-// cronExpr and computes the next fire time. Returns ("", "") for the
-// error fields when valid. cronExpr/nextRunAt come back nil for
-// non-scheduled trigger types — a manual or webhook workflow has no
-// schedule to track.
+// Returns ("", "") for the error fields when valid. cronExpr/nextRunAt come back nil for
+// non-scheduled trigger types — a manual or webhook workflow has no schedule to track.
 func computeSchedule(triggerType string, cronExpr *string) (*string, pgtype.Timestamptz, string, string) {
 	if triggerType != "scheduled" {
 		return nil, pgtype.Timestamptz{}, "", ""

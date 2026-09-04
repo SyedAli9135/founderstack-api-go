@@ -13,10 +13,6 @@ import (
 // githubAPIBase is a var so github_test.go can point it at a fake server.
 var githubAPIBase = "https://api.github.com"
 
-// NewGitHubServer builds the GitHub MCP tool server (WORKFLOW_PLAN_GO.md
-// workflow 5) — review_pr, search_code, create_issue. Auth is a
-// Bearer-prefixed PAT, matching the token stored by workflow 4's GitHub
-// PAT connect flow.
 func NewGitHubServer() *gomcp.Server {
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "github", Version: "1.0.0"}, nil)
 
@@ -41,11 +37,8 @@ func NewGitHubServer() *gomcp.Server {
 	return server
 }
 
-// doGitHub is doJSON with GitHub's recommended Accept/API-Version headers
-// layered on — GitHub's REST API tolerates plain "application/json" but
-// the documented, versioned contract is "application/vnd.github+json"
-// plus X-GitHub-Api-Version, so tool responses don't silently start
-// differing shape on a future API default-version bump.
+// Sets GitHub's documented Accept/API-Version headers rather than relying
+// on bare "application/json" happening to keep working.
 func doGitHub(ctx context.Context, method, endpoint, token string, body, out any) error {
 	req, err := newRequestWithBody(ctx, method, endpoint, body)
 	if err != nil {

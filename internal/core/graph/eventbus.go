@@ -45,10 +45,8 @@ type CompleteData struct {
 	CostSoFarUSD float64    `json:"cost_so_far_usd"`
 }
 
-// ApprovalRequiredData is EventApprovalRequired's Data — added so
-// founderstack-web's ApprovalCard can render straight from this SSE event
-// (approval id, risk badge, the pending tool-call batch) without a second
-// GET /approvals/{id} round trip for the inline live-run case.
+// ApprovalRequiredData is EventApprovalRequired's Data — lets the frontend
+// render an approval card straight from the stream, no extra GET needed.
 type ApprovalRequiredData struct {
 	ApprovalID string         `json:"approval_id"`
 	RiskLevel  string         `json:"risk_level"`

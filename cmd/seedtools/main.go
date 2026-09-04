@@ -1,9 +1,7 @@
 // Command seedtools embeds every registered MCP tool's name+description+
 // input schema via Cohere and upserts the vectors into Pinecone's
-// founderstack-tools index (namespace "tools") — workflow 5's tool
-// discovery step. The planner (workflow 9, not yet built) will query this
-// index to semantically find relevant tools for a task instead of
-// listing all of them in every prompt.
+// founderstack-tools index (namespace "tools"), for future semantic tool
+// discovery instead of listing every tool in each prompt.
 //
 // Run: go run ./cmd/seedtools
 package main

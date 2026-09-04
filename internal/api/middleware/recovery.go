@@ -13,8 +13,7 @@ import (
 )
 
 // Recovery catches panics so a single bad request can't take the process
-// down, and reports them through the same envelope every other error uses.
-// This is a last-resort safety net, not the primary error path.
+// down, reporting them through the same envelope every other error uses.
 func Recovery(cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {

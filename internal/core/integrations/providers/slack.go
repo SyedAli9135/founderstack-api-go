@@ -11,23 +11,16 @@ import (
 	"github.com/founderstack/api/internal/core/integrations"
 )
 
-// slackScopes is comma-separated (Slack's own convention for its "scope"
-// query/form parameter — unlike standard OAuth2's space-separated list),
-// which is one of the reasons Slack is implemented by hand below rather
-// than through golang.org/x/oauth2.Config: the other is that every Slack
-// API response, including a *failed* token exchange, comes back as HTTP
-// 200 with an "ok": false body — x/oauth2's Exchange treats any 200 as
-// success and would silently return a token-shaped struct with an empty
-// access_token instead of an error.
+// slackScopes is comma-separated (Slack's convention, unlike standard
+// OAuth2's space-separated list) — implemented by hand rather than via
+// x/oauth2.Config since every Slack response, including a failed exchange,
+// is HTTP 200 with "ok": false, which x/oauth2's Exchange would silently
+// treat as success.
 //
-// groups:read is required alongside channels:read — real bug caught by
-// live manual verification 2026-08-28: internal/core/mcp/servers/slack.go's
-// list_channels calls conversations.list with
-// types=public_channel,private_channel, and Slack requires the scope for
-// *every* requested type to be present or it rejects the whole call with
-// missing_scope, even though channels:read alone is enough for the
-// public_channel half. Without groups:read this tool could never
-// succeed for any org.
+// groups:read is required alongside channels:read: mcp/servers/slack.go's
+// list_channels requests types=public_channel,private_channel, and Slack
+// requires the scope for every requested type or it rejects the whole call
+// with missing_scope.
 const slackScopes = "chat:write,channels:read,groups:read"
 
 type Slack struct {

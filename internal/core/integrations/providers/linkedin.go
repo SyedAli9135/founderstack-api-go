@@ -18,11 +18,9 @@ var linkedinEndpoint = oauth2.Endpoint{
 	TokenURL: "https://www.linkedin.com/oauth/v2/accessToken",
 }
 
-// linkedinScopes is deliberately just w_member_social — the free "Share
-// on LinkedIn" product's posting scope. Not "openid"/"profile": those
-// would let this read the founder's identity too, which nothing here
-// needs, and requesting scopes beyond what's used only adds to what a
-// founder has to trust when authorizing.
+// linkedinScopes is deliberately just w_member_social (the free "Share on
+// LinkedIn" posting scope) — not openid/profile, which nothing here needs
+// and would only add to what a founder has to trust when authorizing.
 var linkedinScopes = []string{"w_member_social"}
 
 type LinkedIn struct {
@@ -57,11 +55,9 @@ func (l *LinkedIn) RevokeToken(ctx context.Context, token string) error {
 	return revokeViaRFC7009(ctx, "https://www.linkedin.com/oauth/v2/revoke", l.cfg.ClientID, l.cfg.ClientSecret, token)
 }
 
-// ValidateToken uses LinkedIn's token introspection endpoint rather than
-// a resource API — with only w_member_social granted, there's no
-// "who am I" profile endpoint this token is authorized to call, but
-// introspection (client-authenticated, not scope-gated) works regardless
-// of which scopes were requested.
+// ValidateToken uses token introspection, not a resource API — with only
+// w_member_social granted there's no profile endpoint to call, but
+// introspection is client-authenticated rather than scope-gated.
 func (l *LinkedIn) ValidateToken(ctx context.Context, token string) error {
 	form := url.Values{
 		"token":         {token},

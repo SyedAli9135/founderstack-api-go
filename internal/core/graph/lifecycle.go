@@ -31,9 +31,8 @@ func getRunStatus(ctx context.Context, pool *pgxpool.Pool, orgID, runID pgtype.U
 }
 
 // finalizeIfTerminal fills in the completion-summary fields (output,
-// token counts, duration) once — and only once — a run reaches a
-// genuinely terminal status. Called by Launcher after Engine.Run
-// returns, and by Engine.Resume after a run resumes and reaches a terminal status.
+// token counts, duration) once a run reaches a terminal status — called
+// after both Engine.Run and Engine.Resume return.
 func finalizeIfTerminal(ctx context.Context, pool *pgxpool.Pool, orgID, runID pgtype.UUID, state *RunState) error {
 	status, err := getRunStatus(ctx, pool, orgID, runID)
 	if err != nil {

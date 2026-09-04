@@ -9,13 +9,14 @@ import (
 )
 
 const (
-	rateLimitWindow = time.Minute
-	// rateLimitMaxCalls is a per-(org_id, service) ceiling, not a per-org-wide one
-	rateLimitMaxCalls = 30
+	rateLimitWindow   = time.Minute
+	rateLimitMaxCalls = 30 // per (org_id, service), not org-wide
 )
 
-// checkRateLimit enforces the per-(org_id, service) ceiling via a simple
-// fixed-window INCR+EXPIRE — same Redis client and pattern already established "
+// checkRateLimit enforces the per-(org_id, service) ceiling via a
+// fixed-window INCR+EXPIRE. Fails open (nil rdb or a Redis error both
+// return nil, not an error) — this protects resources, it isn't a
+// security guardrail, so a Redis outage shouldn't block every tool call.
 func checkRateLimit(ctx context.Context, rdb *redis.Client, orgID, service string) error {
 	if rdb == nil {
 		return nil

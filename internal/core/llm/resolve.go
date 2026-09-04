@@ -20,13 +20,10 @@ import (
 // configured" response rather than a generic error.
 var ErrNoActiveKey = errors.New("llm: no active key for this provider")
 
-// ResolveChatClient builds a real, usable ChatClient for orgID's active
-// provider and model — this is workflow 9's graph.Launcher's one call to
-// get from "an org and an agent" to "a client its executor node can call
-// Send on." Unlike GetClient (kept Anthropic-only, for its existing
-// callers/tests), this dispatches across all 5 BYOK providers via the
-// ChatClient adapters in this package — see chat_anthropic.go/
-// chat_openai_compatible.go/chat_gemini.go.
+// ResolveChatClient builds a usable ChatClient for orgID's active provider
+// and model, dispatching across all 5 BYOK providers. Unlike GetClient
+// (kept Anthropic-only for its existing callers/tests), this is what
+// graph.Launcher calls.
 func ResolveChatClient(ctx context.Context, appPool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, provider ProviderID, model string) (ChatClient, error) {
 	if _, ok := Catalog[provider]; !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownProvider, provider)

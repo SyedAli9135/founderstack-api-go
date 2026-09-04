@@ -16,33 +16,19 @@ import (
 	"github.com/founderstack/api/internal/core/integrations"
 )
 
-// MockScenarioResolver is a dev-only ChatClientResolver (see
-// graph.ChatClientResolver) that ignores the org's real BYOK key entirely
-// and returns one of a fixed catalog of scripted MockChatClient scenarios,
-// selected by the agent's plain `model` field — e.g. an agent configured
-// with model "mock:tool-call" gets the tool-call-and-respond scenario.
-// Wired in by cmd/api/main.go only when config.MockLLMMode is set (and
-// only outside production — see Config.MockLLMMode's doc comment) so a
-// founder without a real provider key yet can still exercise the whole
-// workflow-9 harness (guardrails, approval suspend/resume, SSE events,
-// checkpointing) against real Postgres through the real HTTP API, not
-// just via the Go test suite. See WORKFLOW_PLAN_GO.md's Workflow 9
-// manual-verification guide for the exact test-org setup and expected
-// result per scenario.
+// MockScenarioResolver is a dev-only ChatClientResolver that ignores the
+// org's real BYOK key and returns one of a fixed catalog of scripted
+// MockChatClient scenarios, selected by the agent's plain `model` field.
+// Wired in only when config.MockLLMMode is set (never in production) so
+// the whole workflow-9 harness is exercisable through the real HTTP API
+// without a live provider key. Unrecognized model strings are a hard
+// error, not a silent fallback — a typo should fail loudly.
 //
-// Unrecognized model strings are a hard error, not a silent fallback —
-// this is a test tool; a typo should surface clearly (the run fails,
-// findable in server logs) rather than quietly running the wrong
-// scenario.
-//
-// "mock:approval" is handled separately from every other scenario below
-// — see approvalScenarioClient's doc comment for a real bug this found:
-// a plain sequential MockChatClient breaks across an approval-gate
-// suspend/resume, because Resume triggers a brand new
-// ChatClientResolver call (a fresh MockChatClient, canned-response index
-// reset to 0), unlike a real provider client where "what comes next" is
-// driven by the conversation history, not by how many times the client
-// itself has been constructed.
+// "mock:approval" is handled separately — see approvalScenarioClient: a
+// plain sequential MockChatClient breaks across an approval-gate
+// suspend/resume, since Resume triggers a fresh ChatClientResolver call
+// (canned-response index reset to 0) unlike a real provider, where "what
+// comes next" is driven by conversation history, not construction count.
 func MockScenarioResolver(ctx context.Context, appPool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, provider ProviderID, model string) (ChatClient, error) {
 	if model == "mock:approval" {
 		client := approvalScenarioClient{appPool: appPool, encryptionKey: encryptionKey, orgID: orgID}
@@ -60,25 +46,13 @@ func MockScenarioResolver(ctx context.Context, appPool *pgxpool.Pool, encryption
 	return &delayedChatClient{inner: client, delay: delay}, nil
 }
 
-// approvalScenarioClient implements "mock:approval" without a sequential
-// per-instance response counter (see MockScenarioResolver's doc comment
-// for why one breaks here) — found by actually running this scenario
-// end to end against a real Postgres-backed suspend/resume, not assumed
-// correct from the code alone: the naive canned-sequence version aborted
-// with a false "stuck loop detected" the instant a human approved,
-// because the freshly-resolved MockChatClient's first response was once
-// again the exact same stripe.refund_payment request the stuck-loop
-// detector had already recorded as this run's last batch. Instead this
-// decides its response from the actual conversation history Send is
-// called with, the same way a real ChatClient effectively would: no
-// stripe.refund_payment tool result present yet -> request it (first
-// turn, pre-suspend); a tool result for it is already present -> the run
-// is resuming post-approval, report done.
-// appPool/encryptionKey/orgID let Send mint a real, fresh Stripe
-// test-mode PaymentIntent on the pre-suspend turn (see below) — added so
-// this scenario's refund_payment call genuinely succeeds against a real
-// account instead of a hardcoded placeholder ID, which could only ever
-// succeed once (a real PaymentIntent can only be fully refunded once).
+// approvalScenarioClient implements "mock:approval" by deciding its
+// response from conversation history instead of a sequential counter (see
+// MockScenarioResolver): no stripe.refund_payment result yet -> request it
+// (pre-suspend); a result is already present -> resuming post-approval,
+// report done. appPool/encryptionKey/orgID let Send mint a real, fresh
+// Stripe test-mode PaymentIntent on the pre-suspend turn, since a
+// hardcoded ID can only ever be refunded once.
 type approvalScenarioClient struct {
 	appPool       *pgxpool.Pool
 	encryptionKey []byte
@@ -95,16 +69,10 @@ func (c approvalScenarioClient) Send(ctx context.Context, systemPrompt string, m
 		}
 	}
 
-	// This is the pre-suspend turn — mint a fresh, real Stripe test-mode
-	// customer + confirmed PaymentIntent (test card, zero real money) so
-	// the refund_payment call below hits a genuinely refundable target
-	// every time this scenario runs, not a hardcoded ID that goes stale
-	// after its first successful refund. Only called here, once, not on
-	// every Resume — Resume re-resolves a fresh approvalScenarioClient too
-	// (see MockScenarioResolver's doc comment), but by then a tool result
-	// is already present above, so this branch never runs twice per run.
-	// Falls back to a placeholder ID (a real, useful tool-error demo, not
-	// a broken run) if this org has no working Stripe connection at all.
+	// Pre-suspend turn: mint a fresh, real Stripe test-mode PaymentIntent
+	// so refund_payment hits a genuinely refundable target every run.
+	// Falls back to a placeholder ID (a useful tool-error demo, not a
+	// broken run) if this org has no working Stripe connection.
 	paymentIntentID, err := createTestPaymentIntent(ctx, c.appPool, c.encryptionKey, c.orgID)
 	if err != nil {
 		paymentIntentID = "pi_mock_no_real_stripe_connection"
@@ -121,10 +89,9 @@ func (c approvalScenarioClient) Send(ctx context.Context, systemPrompt string, m
 }
 
 // createTestPaymentIntent creates a real Stripe test-mode customer plus a
-// confirmed PaymentIntent (pm_card_visa, Stripe's standard always-succeeds
-// test card — no real money moves in test mode) using the org's own
-// stored Stripe token. Test-fixture setup only, not a tool call itself —
-// mirrors the exact recipe manually verified live 2026-08-28.
+// confirmed PaymentIntent (pm_card_visa, Stripe's always-succeeds test
+// card) using the org's own stored Stripe token. Fixture setup only, not
+// a tool call itself.
 func createTestPaymentIntent(ctx context.Context, appPool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID) (string, error) {
 	tok, err := integrations.GetIntegrationToken(ctx, appPool, encryptionKey, orgID, "stripe")
 	if err != nil {
@@ -178,53 +145,34 @@ func stripeFixturePost(ctx context.Context, secretKey, endpoint string, form url
 	return decoded.ID, nil
 }
 
-// defaultMockDelay is applied to every scenario that doesn't set its own
-// (longer) delay. A MockChatClient otherwise returns in well under a
-// millisecond — real enough to prove correctness against Postgres
-// afterward, but too fast for a human watching GET /runs/{id}/stream live
-// to see anything: by the time a manual `curl -N .../stream` request
-// reaches the handler, an un-delayed mock run has usually already
-// finished and the EventBus has nothing left to deliver (events aren't
-// buffered/replayed for a subscriber that arrives late). A short, fixed
-// delay per turn makes a manual SSE-watching session behave the way a
-// real (much slower) LLM call naturally would.
+// defaultMockDelay applies to any scenario without its own (longer) delay.
+// A MockChatClient otherwise returns in under a millisecond — too fast for
+// a human watching GET /runs/{id}/stream to see anything, since events
+// aren't buffered/replayed for a subscriber that arrives late.
 const defaultMockDelay = 800 * time.Millisecond
 
 type mockScenario struct {
 	description string
 	responses   []ChatResponse
-	// delay overrides defaultMockDelay — only "mock:cancel" sets this
-	// (much longer), giving a human enough wall-clock time to issue POST
-	// /runs/{id}/cancel against a real, in-flight run before it finishes
-	// on its own.
+	// delay overrides defaultMockDelay — only "mock:cancel" sets this, to
+	// give a human time to POST /runs/{id}/cancel before the run finishes.
 	delay time.Duration
 }
 
 func toolCallArgs(jsonArgs string) json.RawMessage { return json.RawMessage(jsonArgs) }
 
 // turnUsage is a representative per-turn token count applied to every
-// scenario response below — realistic enough that CostSoFarUSD actually
-// accumulates something (see llm.EstimateCostUSD), which is what makes
-// "mock:cost-cap" below able to exercise
-// policy_scope.max_cost_per_run_usd at all. A MockChatClient response
-// otherwise defaults its Usage to the zero value, which is why this
-// guardrail looked untestable at first — cost never moved because these
-// scenarios never reported any token usage, not just because
-// RunState.CostSoFarUSD itself wasn't wired up (that was the other half
-// of the same bug — see accumulateUsage's doc comment).
+// scenario response below, so CostSoFarUSD actually accumulates something
+// (a bare MockChatClient response otherwise defaults Usage to zero) —
+// needed for "mock:cost-cap" to exercise max_cost_per_run_usd at all.
 var turnUsage = TokenUsage{InputTokens: 500, OutputTokens: 150}
 
-// mockNotionPages are 5 real, permanent Notion pages (created 2026-08-28
-// specifically for this purpose — "[FounderStack Mock] Reference Page N",
-// children of the founder's own real, already-shared "SQL Training Plan"
-// page) that every multi-call scenario below reads from. Using real page
-// IDs — instead of the placeholder "mock-page-N" strings the original
-// build used — means these scenarios' tool calls genuinely succeed
-// against the real Notion API, not just correctly fail. 5 *distinct*
-// pages are needed (not 1 reused 5 times): toolCallBatchSignature keys
-// off a call's exact args, so 5 identical page_ids would falsely trip the
-// stuck-loop detector instead of exercising the cap/cost/cancel guardrail
-// each of these scenarios actually means to test.
+// mockNotionPages are 5 real, permanent Notion pages that every
+// multi-call scenario below reads from — real IDs so these tool calls
+// genuinely succeed, not just correctly fail. 5 *distinct* pages are
+// needed: toolCallBatchSignature keys off a call's exact args, so 5
+// identical page_ids would falsely trip the stuck-loop detector instead
+// of exercising the cap/cost/cancel guardrail each scenario means to test.
 var mockNotionPages = [5]string{
 	"2cfa27a8-4499-80a3-94e4-e9cc897c1297", // SQL Training Plan
 	"3caa27a8-4499-811e-b48a-d987792b5f65", // Reference Page 1
@@ -233,13 +181,10 @@ var mockNotionPages = [5]string{
 	"3caa27a8-4499-8101-a279-e44860b26d08", // Reference Page 4
 }
 
-// mockReadPageCall builds one notion.read_page turn against
-// mockNotionPages[i], with reasoning text a real model would plausibly
-// produce right before making that call — see executorNode's new
-// EventReasoning publish, which surfaces ChatResponse.Content live even
-// on a turn that also requests a tool call (confirmed this is exactly
-// what real providers like Anthropic do, not just a final-answer-only
-// field).
+// mockReadPageCall builds one notion.read_page turn with reasoning text a
+// real model would plausibly produce before the call — exercises
+// executorNode's EventReasoning publish, which surfaces ChatResponse.Content
+// even on a turn that also requests a tool call.
 func mockReadPageCall(i int, callID, reasoning string) ChatResponse {
 	return ChatResponse{
 		StopReason: StopReasonToolUse, Usage: turnUsage, Content: reasoning,
@@ -262,9 +207,7 @@ var mockScenarios = map[string]mockScenario{
 			{StopReason: StopReasonEndTurn, Content: "I've reviewed the page — it's the SQL training plan. Finished reviewing the page.", Usage: turnUsage},
 		},
 	},
-	// "mock:approval" is NOT in this map — see MockScenarioResolver's and
-	// approvalScenarioClient's doc comments for why it needs
-	// conversation-aware logic instead of a plain canned sequence.
+	// "mock:approval" is NOT in this map — see approvalScenarioClient.
 	"mock:policy-violation": {
 		description: "requests notion.write_page — configure the test agent's allowed_tools to exclude it, so CheckToolAllowed rejects the call and the run aborts",
 		responses: []ChatResponse{
@@ -304,15 +247,10 @@ var mockScenarios = map[string]mockScenario{
 			{StopReason: StopReasonToolUse, Usage: TokenUsage{InputTokens: 5000, OutputTokens: 2000}, Content: "And the fourth reference page, to be thorough.", ToolCalls: mockReadPageCall(4, "call_5", "").ToolCalls},
 		},
 	},
-	// The 5 scenarios below (mock:slack/discord/drive/calendar/github) each
-	// exercise one more of the 8 connected tool servers with the same
-	// real-resource-plus-reasoning treatment as mock:tool-call above —
-	// added 2026-08-28 alongside it, once the founder asked to see the
-	// same real-execution proof for every integration, not just Notion
-	// and Stripe. Each points at a small, stable, real resource created
-	// specifically for this (a Drive file, a Calendar event, a GitHub PR)
-	// so these scenarios keep working indefinitely without depending on
-	// data that might get cleaned up elsewhere.
+	// The 5 scenarios below each exercise one more of the 8 connected tool
+	// servers, same real-resource-plus-reasoning treatment as mock:tool-call.
+	// Each points at a small, stable, real resource (a Drive file, a
+	// Calendar event, a GitHub PR) so they keep working indefinitely.
 	"mock:slack": {
 		description: "requests slack.list_channels once against the real connected workspace — read-only, so safe to re-run indefinitely",
 		responses: []ChatResponse{
@@ -373,12 +311,9 @@ var mockScenarios = map[string]mockScenario{
 		},
 	},
 	// The 10 scenarios below round out every remaining tool across all 8
-	// connected servers (LinkedIn's draft_post is the one deliberate
-	// exception — a real public/permanent post, left to unit-test-only
-	// coverage per the founder's own call) — added 2026-08-28 once the
-	// founder pointed out most services only had one of their several
-	// tools actually exercised by a mock scenario. Same real-resource,
-	// real-reasoning treatment as everything above.
+	// connected servers (LinkedIn's draft_post is the one exception — a
+	// real public/permanent post, left to unit-test-only coverage). Same
+	// real-resource, real-reasoning treatment as everything above.
 	"mock:notion-write": {
 		description: "requests notion.write_page against the real, already-shared parent page — creates a genuinely new real page every run (repeatable write, like mock:discord)",
 		responses: []ChatResponse{
@@ -492,11 +427,9 @@ func mockScenarioNames() string {
 	return fmt.Sprintf("%v", names)
 }
 
-// delayedChatClient wraps a ChatClient with a fixed delay before each
-// Send call, honoring ctx cancellation while waiting rather than blocking
-// past it — needed so "mock:cancel" gives a human real wall-clock time to
-// cancel an in-flight run without also breaking Engine.Cancel's own
-// ctx-propagation guarantee.
+// delayedChatClient wraps a ChatClient with a fixed delay before each Send
+// call, honoring ctx cancellation while waiting rather than blocking past
+// it — preserves Engine.Cancel's ctx-propagation guarantee.
 type delayedChatClient struct {
 	inner ChatClient
 	delay time.Duration

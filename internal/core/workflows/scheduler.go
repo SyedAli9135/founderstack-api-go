@@ -1,9 +1,6 @@
-// Package workflows holds workflow 8's background scheduler — the piece
-// that decides *when* a scheduled workflow should fire. It stops at
-// inserting a 'pending' workflow_runs row and recomputing next_run_at;
-// nothing here calls an LLM, executes a tool, or advances a run past
-// 'pending' — that's workflow 9's job (internal/core/graph, not built
-// yet). See internal/api/workflows for the CRUD half of workflow 8.
+// Package workflows decides *when* a scheduled workflow fires. It stops
+// at inserting a 'pending' workflow_runs row and recomputing next_run_at
+// — nothing here calls an LLM or executes a tool; that's internal/core/graph.
 package workflows
 
 import (
@@ -18,20 +15,14 @@ import (
 	"github.com/founderstack/api/internal/db/dbgen"
 )
 
-// pollInterval matches workflow 8's spec exactly: a goroutine with
-// time.Ticker(60s), not a full cron daemon library running its own
-// scheduling loop — robfig/cron/v3 is used here only for ParseStandard's
-// validation and Next() computation, not its own Cron{} runner.
+// A plain time.Ticker(60s), not a cron daemon — robfig/cron/v3 is used
+// only for ParseStandard/Next(), not its own Cron{} runner.
 const pollInterval = 60 * time.Second
 
-// RunScheduler polls for due scheduled workflows every pollInterval until
-// ctx is cancelled. systemPool must be the app_system (BYPASSRLS) pool —
-// scanning next_run_at across every org is inherently cross-tenant, same
-// reasoning as internal/core/integrations/refresh.go's RunRefreshJob and
-// internal/core/documents/recover.go's RecoverStuckJobs. Runs once
-// immediately at startup (a workflow whose fire time passed while the
-// process was down shouldn't wait a full minute to be caught), then every
-// tick thereafter.
+// systemPool must be app_system (BYPASSRLS): scanning next_run_at across
+// every org is inherently cross-tenant. Runs once immediately at startup
+// so a workflow whose fire time passed while the process was down isn't
+// stuck waiting a full tick.
 func RunScheduler(ctx context.Context, systemPool *pgxpool.Pool) {
 	tick(ctx, systemPool)
 

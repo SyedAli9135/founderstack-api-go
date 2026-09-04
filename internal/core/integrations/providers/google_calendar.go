@@ -12,10 +12,9 @@ import (
 
 const calendarEventsScope = "https://www.googleapis.com/auth/calendar.events"
 
-// GoogleCalendar shares its OAuth *app* (client ID/secret) with
-// GoogleDrive — one Google Cloud project, two scopes — but is a distinct
-// catalog entry / mcp_connections row, since a founder may connect one
-// without the other. See catalog.go's comment.
+// GoogleCalendar shares its OAuth app (client ID/secret) with GoogleDrive —
+// one Google Cloud project, two scopes — but is a distinct catalog entry /
+// mcp_connections row, since a founder may connect one without the other.
 type GoogleCalendar struct {
 	cfg *oauth2.Config
 }

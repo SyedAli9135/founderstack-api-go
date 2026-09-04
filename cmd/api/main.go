@@ -61,32 +61,28 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// Configures the Clerk SDK's default backend (used by
-	// middleware.RequireAuth to fetch JWKS for JWT verification).
+	// Used by middleware.RequireAuth to fetch JWKS for JWT verification.
 	clerk.SetKey(cfg.ClerkSecretKey.Expose())
 
 	// Decoded once at startup so a misconfigured ENCRYPTION_KEY fails the
-	// process at boot — not silently, on a founder's first BYOK submission.
+	// process at boot, not silently on a founder's first BYOK submission.
 	encryptionKey, err := vault.DecodeKey(cfg.EncryptionKey.Expose())
 	if err != nil {
 		return fmt.Errorf("decode ENCRYPTION_KEY: %w", err)
 	}
 
-	// Cancelled on SIGINT/SIGTERM; everything below shuts down off this.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Connects as app_user (RLS-enforced), not the postgres superuser that
-	// runs migrations — see config.go's AppDatabaseURL doc comment.
+	// app_user, RLS-enforced — not the postgres superuser that runs migrations.
 	dbPool, err := pgxpool.New(ctx, cfg.AppDatabaseURL)
 	if err != nil {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}
 	defer dbPool.Close()
 
-	// Connects as app_system (BYPASSRLS) — for the Clerk webhook and any
-	// future system context that legitimately spans tenants. See
-	// config.go's SystemDatabaseURL doc comment.
+	// app_system, BYPASSRLS — the Clerk webhook and any system context
+	// that legitimately spans tenants.
 	systemPool, err := pgxpool.New(ctx, cfg.SystemDatabaseURL)
 	if err != nil {
 		return fmt.Errorf("connect to postgres (system pool): %w", err)
@@ -106,9 +102,8 @@ func run() error {
 
 	integrationsRegistry := newIntegrationsRegistry(cfg)
 
-	// Building the registry here means a wiring bug (a malformed tool
-	// schema, a missing registration) fails the process at boot, not
-	// silently the first time something tries to call a tool.
+	// Built at boot so a wiring bug (a malformed tool schema, a missing
+	// registration) fails the process here, not the first tool call.
 	mcpRegistry, err := newMCPRegistry(ctx)
 	if err != nil {
 		return fmt.Errorf("build mcp tool registry: %w", err)
@@ -121,22 +116,16 @@ func run() error {
 		logger.Info("mcp tool registry ready", "services", len(tools), "tools", count)
 	}
 
-	// the execution engine. mcpGateway is registry's paired
-	// executor — the one call site that fetches+decrypts an org's
-	// integration token and attaches it to a tool call (see
-	// coremcp.Gateway's own doc comment). engine is a singleton shared by
-	// every run this process ever starts, since its EventBus/cancel map
-	// are process-wide by design. launcher is what
-	// workflowsapi.Handler.Run calls to actually turn a queued run into
-	// an executing one.
+	// mcpGateway fetches+decrypts an org's integration token and attaches
+	// it to a tool call. graphEngine is a singleton shared by every run
+	// this process starts — its EventBus/cancel map are process-wide by
+	// design.
 	mcpGateway := coremcp.NewGateway(dbPool, encryptionKey, mcpRegistry, redisClient)
 	graphEngine := graph.NewEngine(dbPool)
 
-	// all 3 channels degrade to a logged no-op when their
-	// config is unset (see each sender's own constructor doc comment) —
-	// notifier is never nil, so RunDeps.Notifier is always safe to use
-	// without a further nil check inside writeApprovalGate beyond the one
-	// already there for tests that build RunDeps by hand.
+	// Each notify channel degrades to a logged no-op when its config is
+	// unset, so notifier is never nil and safe to use without a further
+	// nil check.
 	actionTokens := notify.NewActionTokenSigner(cfg.PushActionTokenSecret)
 	notifier := notify.New(
 		notify.NewEmailSender(cfg.BrevoAPIKey, cfg.BrevoFromEmail),
@@ -147,11 +136,8 @@ func run() error {
 
 	var launcher *graph.Launcher
 	if cfg.MockLLMMode {
-		// Never honor this in production, regardless of what's in the
-		// environment — see Config.MockLLMMode's doc comment. A
-		// misconfigured MOCK_LLM_MODE=true in a real deployment must fail
-		// loud at boot, not silently run every agent against canned
-		// responses instead of a real model.
+		// A misconfigured MOCK_LLM_MODE=true in production must fail loud
+		// at boot, not silently run every agent against canned responses.
 		if cfg.IsProduction() {
 			return fmt.Errorf("MOCK_LLM_MODE=true is not allowed when APP_ENV=production")
 		}
@@ -161,12 +147,10 @@ func run() error {
 		launcher = graph.NewLauncher(graphEngine, dbPool, encryptionKey, mcpRegistry, mcpGateway, notifier)
 	}
 
-	// (document upload / RAG). Pinecone is required here (unlike
-	// newPineconeClient's nil-if-unconfigured fallback for the health
-	// check) — a document upload with no vector store to index into isn't
-	// a degraded mode, it's a broken one, so a missing PINECONE_API_KEY
-	// fails boot via the required-fields check in config.Load, and this
-	// constructor assumes pineconeClient is non-nil.
+	// Unlike newPineconeClient's nil-if-unconfigured fallback for the
+	// health check, Pinecone is required here — a document upload with no
+	// vector store to index into is broken, not degraded, so a missing
+	// PINECONE_API_KEY fails boot via config.Load's required-fields check.
 	docsStore, err := coredocs.NewStore(ctx, cfg.AWSRegion, cfg.AWSAccessKeyID, cfg.AWSSecretAccessKey.Expose(), cfg.AWSS3EndpointURL, cfg.S3BucketDocuments)
 	if err != nil {
 		return fmt.Errorf("build documents s3 store: %w", err)
@@ -176,29 +160,18 @@ func run() error {
 		return fmt.Errorf("build documents processor: %w", err)
 	}
 
-	// One-time sweep for any document whose processing/purge goroutine was
-	// lost to a prior process restart — see RecoverStuckJobs's doc comment
-	// for why this is the accepted tradeoff of goroutines over a durable
-	// job queue.
+	// Re-dispatches any document whose processing/purge goroutine was lost
+	// to a prior process restart.
 	docsProcessor.RecoverStuckJobs(ctx, systemPool)
 
 	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, mcpRegistry, graphEngine, launcher, actionTokens)
 
-	// Runs until ctx is cancelled (same SIGINT/SIGTERM signal the HTTP
-	// server shuts down on) — see integrations.RunRefreshJob's doc comment
-	// for why this needs systemPool rather than the RLS-scoped dbPool.
+	// All 3 background jobs run on systemPool (BYPASSRLS) — each scans
+	// across every org, which is inherently cross-tenant — and stop when
+	// ctx is cancelled by the same SIGINT/SIGTERM the HTTP server shuts
+	// down on.
 	go integrations.RunRefreshJob(ctx, systemPool, encryptionKey, integrationsRegistry)
-
-	// background scheduler — same reasoning as the refresh job
-	// above for why this runs on systemPool. Only inserts pending
-	// workflow_runs rows; see coreworkflows.RunScheduler's doc comment for
-	// why it doesn't do anything past that yet.
 	go coreworkflows.RunScheduler(ctx, systemPool)
-
-	// 24h approval auto-expiry sweep — same systemPool
-	// reasoning, and the same "run once immediately, then every tick"
-	// shape as the two jobs above. See RunApprovalExpiryJob's doc comment
-	// for why this must call launcher.Resume, not just flip approvals.status.
 	go coreworkflows.RunApprovalExpiryJob(ctx, systemPool, launcher)
 
 	srv := &http.Server{
@@ -255,8 +228,7 @@ func newRedisClient(cfg *config.Config) (*redis.Client, error) {
 }
 
 // newPineconeClient returns nil (not an error) when no Pinecone key is
-// configured — Pinecone is optional for the API to boot locally, and the
-// health check reports that state explicitly rather than failing startup.
+// configured — the health check reports that state rather than failing boot.
 func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	if cfg.PineconeAPIKey.IsEmpty() {
 		return nil, nil
@@ -287,8 +259,8 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiAuth := router.Group("/api/v1/auth")
 	identity.NewDevTokenHandler(cfg).Register(apiAuth)
 
-	// Every route under here requires a verified session — db is app_user
-	// (RLS-enforced); each handler scopes its own queries via tenant.WithTx.
+	// Every route under here requires a verified session; each handler
+	// scopes its own queries via tenant.WithTx against the app_user pool.
 	apiSettings := router.Group("/api/v1/settings")
 	apiSettings.Use(middleware.RequireAuth(systemDB, cfg))
 	settings.NewHandler(db, encryptionKey, cfg.APIKeyMockPrefix).Register(apiSettings)
@@ -304,10 +276,8 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	intHandler.Register(apiIntegrations)
 
 	// Unauthenticated: the OAuth provider redirects the founder's browser
-	// here directly, with no JWT — see Handler.RegisterCallback's doc
-	// comment. Same URL prefix as apiIntegrations above; the route
-	// patterns (":service/callback" vs. ":service/connect" etc.) don't
-	// collide, so Gin's router handles both groups fine.
+	// here directly, with no JWT. Same URL prefix as apiIntegrations above;
+	// the route patterns don't collide.
 	apiIntegrationsCallback := router.Group("/api/v1/integrations")
 	intHandler.RegisterCallback(apiIntegrationsCallback)
 
@@ -327,10 +297,8 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiRuns.Use(middleware.RequireAuth(systemDB, cfg))
 	runsapi.NewHandler(db, graphEngine).Register(apiRuns)
 
-	// Dev-only stand-in for workflow 10's real approve/reject endpoints —
-	// see runsapi.DevResumeHandler's doc comment. Only ever registered
-	// when MOCK_LLM_MODE is on, matching the same gate that swapped
-	// launcher's ChatClientResolver for the scripted one above.
+	// Dev-only stand-in for the real approve/reject endpoints, registered
+	// only when MOCK_LLM_MODE is on.
 	if cfg.MockLLMMode {
 		runsapi.NewDevResumeHandler(db, launcher).Register(apiRuns)
 	}
@@ -341,12 +309,9 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiApprovals.Use(middleware.RequireAuth(systemDB, cfg))
 	approvalsHandler.Register(apiApprovals)
 
-	// Deliberately ungated — a push notification's Approve/Reject action
-	// buttons have no live Clerk session to attach (see
-	// notify.ActionTokenSigner's doc comment); Handler.resolveActor does
-	// its own dual auth (Bearer or ?action_token=) per request instead of
-	// gin middleware. Same "second, differently-authenticated route group
-	// for the same resource" shape as apiIntegrationsCallback above.
+	// Deliberately ungated — a push notification's Approve/Reject buttons
+	// have no live Clerk session; Handler.resolveActor does its own dual
+	// auth (Bearer or ?action_token=) per request instead.
 	apiApprovalsActions := router.Group("/api/v1")
 	approvalsHandler.RegisterActions(apiApprovalsActions)
 
@@ -354,10 +319,8 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 }
 
 // newIntegrationsRegistry constructs one provider per catalog.go entry —
-// the single place, per the "open/closed" design note,
-// that needs a new line when a
-// provider is added. Every provider's redirect URL follows the same
-// {API_URL}/api/v1/integrations/{service}/callback shape.
+// the single place a new provider needs a new line. Every provider's
+// redirect URL follows the same {API_URL}/.../{service}/callback shape.
 func newIntegrationsRegistry(cfg *config.Config) *integrations.Registry {
 	callbackURL := func(service string) string {
 		return cfg.AppBaseURL + "/api/v1/integrations/" + service + "/callback"
@@ -374,31 +337,21 @@ func newIntegrationsRegistry(cfg *config.Config) *integrations.Registry {
 	)
 }
 
-// newMCPRegistry connects every MCP tool server —
-// mcpservers.AllServers() is the single place a new tool server needs a
-// new line (shared with cmd/seedtools, which needs the identical map).
-// Every server is wired via mcp.NewInMemoryTransports() inside
-// coremcp.NewRegistry, not called directly — see internal/core/mcp's
-// package doc for why.
+// newMCPRegistry connects every MCP tool server — mcpservers.AllServers()
+// is the single place a new tool server needs a new line (shared with
+// cmd/seedtools). Wired via mcp.NewInMemoryTransports() inside
+// coremcp.NewRegistry, not called directly.
 func newMCPRegistry(ctx context.Context) (*coremcp.Registry, error) {
 	return coremcp.NewRegistry(ctx, mcpservers.AllServers())
 }
 
-// newDocumentsProcessor builds workflow 6's Cohere + Pinecone-backed
-// Processor. pineconeClient is assumed non-nil — see its call site's
-// comment for why documents treats Pinecone as required rather than
-// optional the way the health check does.
+// newDocumentsProcessor builds the Cohere + Pinecone-backed Processor.
+// pineconeClient is assumed non-nil.
 func newDocumentsProcessor(ctx context.Context, cfg *config.Config, appPool *pgxpool.Pool, store *coredocs.Store, pineconeClient *pinecone.Client) (*coredocs.Processor, error) {
-	// WithMaxAttempts(7): found live, not from Cohere's docs — a small test
-	// upload (28 chunks, one partial batch) embedded fine, but a real 27MB
-	// PDF (480+ chunks, several full batches) started failing partway
-	// through with Cohere's trial-tier "100000 tokens per minute" 429. The
-	// SDK's own retrier (internal/retrier.go) already backs off
-	// exponentially (1s/2s/4s/8s/16s/32s, capped at 60s, ±10% jitter,
-	// Retry-After-aware) but only retries twice by default — nowhere near
-	// enough to survive a per-minute rate-limit window. 7 attempts gives
-	// ~63s of cumulative backoff, comfortably covering one full window
-	// reset without failing the whole document over a transient cap.
+	// WithMaxAttempts(7): a large (480+ chunk) document can outlast
+	// Cohere's own retrier's default 2 attempts against its per-minute
+	// rate limit — 7 gives ~63s of cumulative backoff, enough to cover one
+	// full window reset.
 	cohereClient := coherecli.NewClient(coreoption.WithToken(cfg.CohereAPIKey.Expose()), coreoption.WithMaxAttempts(7))
 
 	idx, err := pineconeClient.DescribeIndex(ctx, cfg.PineconeIndexRAG)
@@ -413,11 +366,10 @@ func newDocumentsProcessor(ctx context.Context, cfg *config.Config, appPool *pgx
 	return coredocs.NewProcessor(appPool, store, coredocs.NewCohereEmbedder(cohereClient), coredocs.NewPineconeIndex(idxConn)), nil
 }
 
-// corsConfig mirrors app/main.py's CORS policy: wide open in development,
-// locked to the app's own origins in production. AllowOriginFunc (rather
-// than the literal AllowOrigins: []string{"*"}) is used for the dev case
-// because the CORS spec forbids combining a wildcard origin with
-// AllowCredentials — the browser will reject "*" + credentials outright.
+// corsConfig is wide open in development, locked to the app's own origins
+// in production. AllowOriginFunc, not AllowOrigins: []string{"*"}, for the
+// dev case — the CORS spec forbids combining a wildcard origin with
+// AllowCredentials.
 func corsConfig(cfg *config.Config) cors.Config {
 	c := cors.Config{
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},

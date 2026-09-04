@@ -11,19 +11,10 @@ import (
 	mcp "github.com/founderstack/api/internal/core/mcp"
 )
 
-// stripeAPIBase is a var, not a const, purely so stripe_test.go can point
-// it at a fake httptest server instead of the real Stripe API — same
-// "test the request-shape logic, not a live third-party dependency"
-// reasoning as internal/core/llm/verify.go's geminiModelsURL.
+// var, not const, so stripe_test.go can point it at a fake httptest
+// server instead of the real Stripe API.
 var stripeAPIBase = "https://api.stripe.com/v1"
 
-// NewStripeServer builds the Stripe MCP tool server — the "Founder's
-// Core 5" finance tool (WORKFLOW_PLAN_GO.md workflow 5). Auth is Basic
-// (secret key as username, empty password), matching Stripe's own
-// convention and internal/core/integrations/providers/stripe.go's
-// ValidateKey. Plain REST calls, not stripe-go — same "one dependency
-// per real need" reasoning as everywhere else BYOK/integrations touches
-// a third-party API in this codebase.
 func NewStripeServer() *gomcp.Server {
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "stripe", Version: "1.0.0"}, nil)
 
@@ -36,10 +27,8 @@ func NewStripeServer() *gomcp.Server {
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "create_invoice",
 		Description: "Create a draft Stripe invoice for a customer. Set finalize=true to also finalize it immediately.",
-		// Reversible, not financial-destructive: this creates/finalizes a
-		// bill but doesn't itself move money (no auto-charge unless the
-		// org's own Stripe collection settings do that), and a draft/open
-		// invoice can still be voided.
+		// Reversible, not financial-destructive: no auto-charge, and a
+		// draft/open invoice can still be voided.
 		Annotations: mcp.ReversibleWrite(),
 	}, stripeCreateInvoice)
 
@@ -59,8 +48,7 @@ func NewStripeServer() *gomcp.Server {
 }
 
 type stripeListSubscriptionsInput struct {
-	// Limit caps how many subscriptions to return (Stripe's own page
-	// size cap is 100); default 20 keeps a typical tool-call response
+	// Default 20, not Stripe's own 100 cap, keeps a typical response
 	// small enough for a model to read without truncation.
 	Limit int `json:"limit,omitempty" jsonschema:"Maximum subscriptions to return (default 20, max 100)"`
 }
@@ -139,19 +127,14 @@ func stripeCreateInvoice(ctx context.Context, req *gomcp.CallToolRequest, in str
 	if currency == "" {
 		currency = "usd"
 	}
-	// idempotencyKey, if any, protects this whole logical tool call from
-	// double-executing on a retry — see doStripeForm's doc comment. The
-	// invoice-item and finalize sub-steps each get their own derived key
-	// (distinct Stripe writes, not covered by the create call's key).
+	// The invoice-item and finalize sub-steps each get their own derived
+	// key — distinct Stripe writes, not covered by the create call's key.
 	idempotencyKey, _ := mcp.IdempotencyKeyFromRequest(req)
 
-	// Real Stripe behavior, confirmed live 2026-08-28 (not obvious from a
-	// first read of the API docs): POST /v1/invoices errors with
-	// "invoice_no_customer_line_items" unless the customer already has at
-	// least one pending invoice item — an earlier version of this handler
-	// skipped this step entirely and could never successfully create an
-	// invoice for any customer. Create the line item first, then the
-	// invoice picks up every pending item for the customer automatically.
+	// POST /v1/invoices errors with invoice_no_customer_line_items unless
+	// the customer already has a pending invoice item — not obvious from
+	// a first read of the docs. Create the item first; the invoice then
+	// picks up every pending item for the customer automatically.
 	itemForm := url.Values{
 		"customer": {in.CustomerID},
 		"amount":   {strconv.FormatInt(in.AmountCents, 10)},
@@ -201,9 +184,7 @@ func stripeCreateInvoice(ctx context.Context, req *gomcp.CallToolRequest, in str
 
 type stripeRefundPaymentInput struct {
 	PaymentIntentID string `json:"payment_intent_id" jsonschema:"Stripe PaymentIntent ID to refund (e.g. pi_...)"`
-	// AmountCents refunds a partial amount when set; a full refund when
-	// omitted/zero, matching Stripe's own "omit amount for a full refund"
-	// convention.
+	// Zero means full refund, matching Stripe's own convention.
 	AmountCents int64 `json:"amount_cents,omitempty" jsonschema:"Amount to refund in the smallest currency unit (e.g. cents). Omit for a full refund."`
 }
 
@@ -238,18 +219,14 @@ func stripeRefundPayment(ctx context.Context, req *gomcp.CallToolRequest, in str
 type stripeGetMRRInput struct{}
 
 type stripeGetMRROutput struct {
-	// MRRCents is an estimate, not a billing-grade figure — see the
-	// interval-normalization comment on monthlyNormalizedCents below.
+	// Estimate, not billing-grade — see monthlyNormalizedCents below.
 	MRRCents            int64  `json:"mrr_cents"`
 	Currency            string `json:"currency"`
 	ActiveSubscriptions int    `json:"active_subscriptions"`
 }
 
-// maxMRRPages caps how many 100-subscription pages get(mrr) will fetch —
-// 20 pages (2000 subscriptions) is far beyond what any solo-founder-scale
-// account has today; the cap exists so a runaway account (or a bug in
-// Stripe's has_more pagination) can't turn one tool call into an
-// unbounded loop.
+// Bounds a runaway account (or a has_more pagination bug) from turning
+// one tool call into an unbounded loop.
 const maxMRRPages = 20
 
 func stripeGetMRR(ctx context.Context, req *gomcp.CallToolRequest, _ stripeGetMRRInput) (*gomcp.CallToolResult, stripeGetMRROutput, error) {
@@ -294,13 +271,9 @@ func stripeGetMRR(ctx context.Context, req *gomcp.CallToolRequest, _ stripeGetMR
 	return nil, stripeGetMRROutput{MRRCents: totalCents, Currency: currency, ActiveSubscriptions: count}, nil
 }
 
-// monthlyNormalizedCents converts one subscription item's price into a
-// monthly-equivalent amount. Months and years divide/multiply exactly;
-// weeks and days use the standard average-per-month approximation
-// (365.25/12 days, 52.18/12 weeks) every calendar-normalized billing
-// estimate makes, since calendar months aren't a fixed length — this is
-// an estimate for planning purposes, not a billing-grade reconciliation
-// figure.
+// Converts one price into a monthly-equivalent amount; weeks/days use the
+// standard average-per-month approximation since calendar months aren't a
+// fixed length. A planning estimate, not billing-grade reconciliation.
 func monthlyNormalizedCents(unitAmount, quantity int64, interval string, intervalCount int64) int64 {
 	if intervalCount <= 0 {
 		intervalCount = 1

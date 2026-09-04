@@ -12,8 +12,8 @@ import (
 	"github.com/founderstack/api/internal/core/integrations"
 )
 
-// Gateway is what the rest of the backend calls to actually run a tool. Nothing outside this
-// package touches a *gomcp.ClientSession directly.
+// Gateway is what the rest of the backend calls to run a tool. Nothing
+// outside this package touches a *gomcp.ClientSession directly.
 type Gateway struct {
 	appPool       *pgxpool.Pool
 	encryptionKey []byte
@@ -21,18 +21,15 @@ type Gateway struct {
 	rdb           *redis.Client
 }
 
-// NewGateway builds a Gateway. appPool must be the app_user (RLS-enforced)
+// NewGateway builds a Gateway. appPool must be the app_user (RLS-enforced) pool.
 func NewGateway(appPool *pgxpool.Pool, encryptionKey []byte, registry *Registry, rdb *redis.Client) *Gateway {
 	return &Gateway{appPool: appPool, encryptionKey: encryptionKey, registry: registry, rdb: rdb}
 }
 
 // ExecuteTool runs one tool call for orgID against service's MCP server.
-// This is the single call site (per call) that fetches and decrypts the
-// org's stored integration token (internal/core/integrations.GetIntegrationToken)
-// and makes it available to the tool handler — via CallToolParams.Meta
-// (see WithToken/TokenFromRequest), not a context.Value. Never pass a
-// credential as a tool argument: it would then be part of the JSON
-// schema the LLM sees and could plan around, echo back, or log.
+// The org's decrypted token is passed via CallToolParams.Meta (WithToken),
+// never as a context.Value (doesn't cross the real MCP session boundary)
+// or a tool argument (would be visible to the LLM).
 func (g *Gateway) ExecuteTool(ctx context.Context, orgID pgtype.UUID, service, toolName string, args map[string]any, idempotencyKey string) (*gomcp.CallToolResult, error) {
 	if err := checkRateLimit(ctx, g.rdb, orgID.String(), service); err != nil {
 		return nil, err

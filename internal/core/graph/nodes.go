@@ -36,9 +36,8 @@ type RunDeps struct {
 	Notifier *notify.Notifier
 }
 
-// BuildNodes wires the 4 nodes this build step implements — planner,
-// executor (the full ReAct inner loop), the approval_gate resume handler,
-// and validator/reporter. RAG retrieval and the human-facing side of approval
+// BuildNodes wires the graph's 5 nodes: planner, executor (the ReAct
+// inner loop), the approval_gate resume handler, validator, reporter.
 func BuildNodes(deps RunDeps) Nodes {
 	return Nodes{
 		"planner":            plannerNode(deps),
@@ -58,12 +57,9 @@ func plannerNode(deps RunDeps) NodeFunc {
 	}
 }
 
-// executorNode is the ReAct-style inner loop, execute any requested
-// tool calls through the risk/policy gates, feed results back, repeat —
-// bounded by policy_scope.max_tool_calls, with the model's own "no tool
-// calls returned" response as the stop signal. Every tool call is
-// checkpointed individually (Engine.Checkpoint), not just at this node's
-// eventual return.
+// executorNode is the ReAct-style inner loop: call the model, execute
+// requested tool calls through the risk/policy gates, feed results back,
+// repeat — bounded by max_tool_calls, checkpointed after every tool call.
 func executorNode(deps RunDeps) NodeFunc {
 	return func(ctx context.Context, state *RunState) (NodeName, error) {
 		for {
@@ -98,9 +94,9 @@ func executorNode(deps RunDeps) NodeFunc {
 			}
 			state.LastToolCallBatch = sig
 
-			// A batch is gated as a whole: if any call in it needs
-			// approval, nothing in the batch executes until a human
-			// decides — including the reversible calls alongside it.
+			// A batch is gated as a whole — if any call needs approval,
+			// nothing executes until a human decides, including the
+			// reversible calls alongside it.
 			needsApproval := false
 			for _, tc := range resp.ToolCalls {
 				if err := deps.Policy.CheckToolAllowed(tc.Name); err != nil {
@@ -126,16 +122,13 @@ func executorNode(deps RunDeps) NodeFunc {
 					return "", err
 				}
 			}
-			// Loop back: call the model again with the tool results just
-			// appended to state.Conversation.
 		}
 	}
 }
 
-// approvalGateNode is what Engine.Resume actually invokes (current_node
-// is checkpointed as NodeAwaitingApproval == "approval_gate" when
-// executor_node suspends) — not the code that decides to suspend, which
-// is executor_node's own job above. Resume() has already set
+// approvalGateNode is what Engine.Resume invokes when current_node is
+// checkpointed as NodeAwaitingApproval — not the code that decides to
+// suspend (executorNode's own job). Resume() has already set
 // state.Approval from the human's decision by the time this runs.
 func approvalGateNode(deps RunDeps) NodeFunc {
 	return func(ctx context.Context, state *RunState) (NodeName, error) {
@@ -166,12 +159,10 @@ func approvalGateNode(deps RunDeps) NodeFunc {
 	}
 }
 
-// suspiciousInstructionPatterns is a first-pass heuristic for prompt-injection guardrail:
-// tool results are untrusted input flowing back into the model's context the same way any external
-// content is in an agentic system. Deliberately a flag, not a hard
-// block — a substring heuristic has real false positives, and the
-// founder should see the warning and judge it, not have the run silently
-// fail on a false alarm.
+// suspiciousInstructionPatterns is a first-pass prompt-injection
+// heuristic — tool results are untrusted input. Deliberately a flag, not
+// a block: a substring heuristic has real false positives, so the
+// founder judges it rather than the run silently failing on a false alarm.
 var suspiciousInstructionPatterns = []string{
 	"ignore previous instructions",
 	"ignore all previous instructions",
@@ -203,8 +194,8 @@ func validatorNode(deps RunDeps) NodeFunc {
 	}
 }
 
-// reporterNode composes the final output.This just makes sure validator's
-// warnings, if any, are surfaced rather than silently dropped.
+// reporterNode composes the final output, surfacing any validator
+// warnings rather than dropping them.
 func reporterNode(deps RunDeps) NodeFunc {
 	return func(ctx context.Context, state *RunState) (NodeName, error) {
 		if len(state.Warnings) > 0 {
@@ -216,10 +207,8 @@ func reporterNode(deps RunDeps) NodeFunc {
 }
 
 // executeOneToolCall runs tc via the MCP gateway, appends both the
-// model-facing tool-result message and the audit-facing ToolResult
-// record, increments ToolCallCount, and checkpoints — used by both
-// executorNode's normal loop and approvalGateNode's post-approval path,
-// so both go through identical bookkeeping.
+// model-facing and audit-facing result records, and checkpoints — shared
+// by executorNode and approvalGateNode so both get identical bookkeeping.
 func executeOneToolCall(ctx context.Context, deps RunDeps, state *RunState, tc llm.ToolCall) error {
 	service, toolName, ok := strings.Cut(tc.Name, ".")
 	if !ok {
@@ -236,12 +225,9 @@ func executeOneToolCall(ctx context.Context, deps RunDeps, state *RunState, tc l
 	deps.Engine.Bus.Publish(Event{Type: EventToolCall, RunID: state.WorkflowRunID, Data: map[string]any{"tool": tc.Name, "args": args}})
 
 	// Idempotency key for financial-tier calls only (Stripe's
-	// create_invoice/refund_payment are the only handlers that actually
-	// use it — see mcp.WithIdempotencyKey's doc comment): protects
-	// against double-execution if this exact logical tool call is ever
-	// retried (an approval batch re-Resume()'d, a crash-recovery
-	// replay). {run_id}-{tool_call_index} is deterministic and stable —
-	// ToolCallCount is the index, read before it's incremented below.
+	// create_invoice/refund_payment are the only handlers that use it) —
+	// protects against double-execution on a re-Resume()'d approval batch
+	// or a crash-recovery replay. ToolCallCount is read before it increments below.
 	var idempotencyKey string
 	if RequiresApproval(deps.Tools.RiskLevel(tc.Name)) {
 		idempotencyKey = fmt.Sprintf("%s-%d", state.WorkflowRunID, state.ToolCallCount)
@@ -266,16 +252,12 @@ func executeOneToolCall(ctx context.Context, deps RunDeps, state *RunState, tc l
 		slog.Error("graph: write audit_logs for tool call failed", "run_id", state.WorkflowRunID, "tool", tc.Name, "err", err)
 	}
 
-	// The result text (truncated for display, same limit as the
-	// model-context copy below) was already computed above and stored in
-	// state.ToolResults, but never actually shown to a human watching the
-	// run — the SSE event used to carry only a bare success/fail flag.
 	deps.Engine.Bus.Publish(Event{Type: EventToolResult, RunID: state.WorkflowRunID, Data: map[string]any{
 		"tool": tc.Name, "is_error": isError, "result": truncateForContext(resultText),
 	}})
 
-	// Truncated copy for the model's own context — the full,
-	// untruncated resultText still goes into ToolResults below
+	// Truncated for the model's own context — the full, untruncated
+	// resultText still goes into ToolResults below.
 	state.Conversation = append(state.Conversation, llm.Message{
 		Role: llm.RoleTool, Name: tc.Name, ToolCallID: tc.ID, Content: truncateForContext(resultText), IsError: isError,
 	})
@@ -294,13 +276,10 @@ func executeOneToolCall(ctx context.Context, deps RunDeps, state *RunState, tc l
 // retryable failure — currently just a tripped rate limit.
 const gatewayMaxAttempts = 3
 
-// gatewayCallWithRetry retries Gateway.ExecuteTool only when it returns
-// an error classified coremcp.ErrToolRetryable — currently only a
-// tripped rate limit reaches this (a tool-handler error is already
-// flattened into result.IsError by the time ExecuteTool returns, per
-// mcp.ToolHandlerFor's own documented behavior, so it's never a Go
-// error here). Any other error (unknown service, token fetch failure,
-// ...) returns immediately, unretried.
+// gatewayCallWithRetry retries only on coremcp.ErrToolRetryable —
+// currently just a tripped rate limit (a tool-handler error is already
+// flattened into result.IsError by mcp.ToolHandlerFor before ExecuteTool
+// returns, so it's never a Go error here). Anything else is unretried.
 func gatewayCallWithRetry(ctx context.Context, gateway *coremcp.Gateway, orgID pgtype.UUID, service, toolName string, args map[string]any, idempotencyKey string) (*gomcp.CallToolResult, error) {
 	var lastErr error
 	for attempt := 1; attempt <= gatewayMaxAttempts; attempt++ {
@@ -323,13 +302,10 @@ func gatewayCallWithRetry(ctx context.Context, gateway *coremcp.Gateway, orgID p
 	return nil, lastErr
 }
 
-// toolResultContextLimit caps how much of a tool result's text gets fed
-// back into the model's own context — a large Stripe/Notion/GitHub
-// payload shouldn't dominate every subsequent turn's token budget. The
-// full, untruncated result is never affected — only the copy appended to
-// state.Conversation goes through this; state.ToolResults (the
-// audit-facing record) and the cost_ledger/audit_logs writes both still
-// see the complete text.
+// toolResultContextLimit caps how much of a tool result feeds back into
+// the model's own context — a large payload shouldn't dominate every
+// subsequent turn's budget. Only the state.Conversation copy is
+// truncated; ToolResults/cost_ledger/audit_logs keep the full text.
 const toolResultContextLimit = 4000
 
 func truncateForContext(text string) string {
@@ -339,10 +315,8 @@ func truncateForContext(text string) string {
 	return text[:toolResultContextLimit] + fmt.Sprintf("\n...(truncated, %d bytes total — refine your request with more specific filters to see more)", len(text))
 }
 
-// toolResultText extracts a plain-text representation of a tool call's
-// result: StructuredContent (the typed Out value every tool handler in
-// this codebase returns) when present, else concatenated text content
-// blocks.
+// toolResultText extracts plain text from a tool result: StructuredContent
+// when present, else concatenated text content blocks.
 func toolResultText(result *gomcp.CallToolResult) (text string, isError bool) {
 	if result == nil {
 		return "", false
@@ -372,11 +346,9 @@ func marshalOrQuote(s string) []byte {
 	return b
 }
 
-// accumulateUsage folds one Send call's token usage into the run's
-// running total, plus a rough dollar estimate (llm.EstimateCostUSD, keyed
-// by model — see its doc comment for why this is an estimate, not
-// billing-grade) into CostSoFarUSD, which policy_scope.max_cost_per_run_usd
-// is actually enforced against.
+// accumulateUsage folds one Send call's usage into the run's running
+// total, plus a rough dollar estimate (llm.EstimateCostUSD) into
+// CostSoFarUSD, which max_cost_per_run_usd is enforced against.
 func accumulateUsage(state *RunState, model string, u llm.TokenUsage) {
 	state.TokenUsage.InputTokens += u.InputTokens
 	state.TokenUsage.OutputTokens += u.OutputTokens

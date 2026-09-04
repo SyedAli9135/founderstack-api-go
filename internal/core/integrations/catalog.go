@@ -1,10 +1,8 @@
 package integrations
 
-// AuthType classifies how a catalog entry is connected — which of the
-// two API shapes (OAuth redirect vs. pasted key) the frontend and
-// handlers use for it. It's UI/routing metadata, not a Go dispatch
-// mechanism: actual behavior is resolved via the Registry and interface
-// type assertions in types.go, never by switching on this string.
+// AuthType is UI/routing metadata only — dispatch actual provider
+// behavior via Registry + interface assertions (types.go), not by
+// switching on this string.
 type AuthType string
 
 const (

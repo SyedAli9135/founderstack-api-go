@@ -2,32 +2,16 @@ package llm
 
 import "strings"
 
-// EstimateCostUSD gives a rough per-call dollar estimate for one LLM
-// Send call's token usage, keyed by loose substring matches against the
-// agent's configured model string. This is deliberately NOT billing-grade
-// — provider prices change over time and this table isn't kept in sync
-// with them automatically — same "estimate for planning purposes, not a
-// billing-grade reconciliation figure" framing this codebase already uses
-// for Stripe's get_mrr tool. It exists so
-// agents.policy_scope.max_cost_per_run_usd has something real to check
-// against (previously RunState.CostSoFarUSD was never incremented at
-// all, so that guardrail could never actually trip — see
-// WORKFLOW_PLAN_GO.md's Workflow 9 harness notes and
-// MOCK_LLM_TESTING.md's "Known, deliberate gaps" section for how this was
-// found). Real per-token billing-grade cost accounting is workflow 11's
-// job — this is the harness's own interim guardrail-enforcement number,
-// not what a founder's "you paid $X" summary should ultimately be
-// computed from.
-//
-// Rates are per 1,000 tokens, roughly reflecting representative pricing
-// as of when this table was written (2026-08-26) — periodically worth a
-// manual refresh, not meant to track live pricing pages.
+// EstimateCostUSD gives a rough per-call dollar estimate, keyed by loose
+// substring match against the agent's model string. Deliberately NOT
+// billing-grade (real per-token accounting is workflow 11's job) — this
+// only exists so policy_scope.max_cost_per_run_usd has a real number to
+// check against. Rates are per 1,000 tokens, a periodic-refresh snapshot
+// rather than live pricing.
 func EstimateCostUSD(model string, usage TokenUsage) float64 {
 	rate := ratesFor(model)
-	// Cached input tokens are billed at a steep discount by every
-	// provider here (roughly a 90% discount on Anthropic's prompt
-	// caching, the closest real reference point) — applied uniformly
-	// rather than per-provider, since this is already an estimate.
+	// ~90% discount, matching Anthropic's prompt-caching rate — applied
+	// uniformly since this is already an estimate.
 	const cachedDiscount = 0.1
 	cost := float64(usage.InputTokens)/1000*rate.inputPer1K +
 		float64(usage.CachedTokens)/1000*rate.inputPer1K*cachedDiscount +
@@ -40,11 +24,8 @@ type tokenRate struct {
 	outputPer1K float64
 }
 
-// fallbackRate covers anything not matched below — including every
-// MOCK_LLM_MODE scenario's "mock:..." model string, which is deliberate:
-// cost still accumulates in mock mode, so mock:tool-call-cap-style
-// scenarios can exercise the cost cap the same way they exercise the
-// tool-call cap, without needing a real provider's pricing to be modeled.
+// fallbackRate also covers every "mock:..." model string — cost still
+// accumulates in mock mode so cost-cap scenarios stay exercisable.
 var fallbackRate = tokenRate{inputPer1K: 0.001, outputPer1K: 0.003}
 
 var modelRates = []struct {

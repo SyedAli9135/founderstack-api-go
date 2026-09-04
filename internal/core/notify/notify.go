@@ -1,9 +1,6 @@
-// Package notify sends approval-gate notifications (Slack, email, web
-// push) and mints the signed action tokens a push notification's own
-// Approve/Reject buttons need. Deliberately depends on nothing in
-// internal/core/graph — graph.RunDeps holds a *Notifier, not the other
-// way around, so this package takes explicit primitive arguments instead
-// of a RunDeps value.
+// Package notify deliberately depends on nothing in internal/core/graph
+// — graph.RunDeps holds a *Notifier, not the other way around, so this
+// package takes explicit primitive arguments instead of a RunDeps value.
 package notify
 
 import (
@@ -23,24 +20,19 @@ import (
 	"github.com/founderstack/api/internal/db/tenant"
 )
 
-// ApprovalTTL is the 24h auto-expiry acceptance criterion
-// (WORKFLOW_PLAN_GO.md, Workflow 10) — the one place this lives; both
-// internal/core/graph/approvalgate.go (the approvals.expires_at column)
-// and this package's action-token signing (an action token must die no
-// later than the approval it decides) reference it, so the two can never
-// drift apart.
+// The one place the 24h auto-expiry window lives — both
+// approvalgate.go's expires_at column and this package's action-token
+// expiry reference it, so the two can never drift apart.
 const ApprovalTTL = 24 * time.Hour
 
-// Notifier aggregates the 3 notification channels plus the action-token
-// signer push notifications need. A nil *Notifier is valid — RunDeps.Notifier
-// is nil-checked before use so tests building RunDeps by hand don't need one.
+// A nil *Notifier is valid — RunDeps.Notifier is nil-checked before use
+// so tests building RunDeps by hand don't need one.
 type Notifier struct {
 	Email  EmailSender
 	Push   *WebPushSender
 	Tokens *ActionTokenSigner
-	// apiBaseURL builds a push notification's ApproveURL/RejectURL — see
-	// PushPayload's doc comment for why the server builds the full URL
-	// instead of the service worker reconstructing one.
+	// Builds ApproveURL/RejectURL — see PushPayload's doc comment for why
+	// the server builds the full URL, not the service worker.
 	apiBaseURL string
 }
 
@@ -48,12 +40,10 @@ func New(email EmailSender, push *WebPushSender, tokens *ActionTokenSigner, apiB
 	return &Notifier{Email: email, Push: push, Tokens: tokens, apiBaseURL: apiBaseURL}
 }
 
-// NotifyApprovalRequired fires all 3 channels concurrently, each
-// independently logged-not-propagated — one channel failing (e.g. the
-// org never connected Slack) never affects the other two. Called via `go`
-// from writeApprovalGate, so ctx is a fresh context.Background(), not the
-// run's own (which may already be cancelled by the time a slow HTTP call
-// would check it).
+// Fires all 3 channels concurrently, each independently
+// logged-not-propagated. Called via `go` from writeApprovalGate, so ctx
+// is a fresh context.Background(), not the run's own (which may already
+// be cancelled by the time a slow HTTP call would check it).
 func (n *Notifier) NotifyApprovalRequired(ctx context.Context, appPool *pgxpool.Pool, gateway *coremcp.Gateway, orgID pgtype.UUID, approvalID uuid.UUID, riskLevel string, calls []llm.ToolCall) {
 	if n == nil {
 		return

@@ -23,18 +23,11 @@ var (
 	driveUploadBase = "https://www.googleapis.com/upload/drive/v3"
 )
 
-// NewGoogleDriveServer builds the Google Drive MCP tool server —
-// list_files, read_file, create_file. workflow 4 scoped Drive's OAuth to
-// the `drive.file` scope specifically (see
-// internal/core/integrations/providers/google_drive.go), not `drive` or
-// `drive.readonly` — deliberately, to avoid Google's paid CASA security
-// assessment required for broader Drive access. That scope's real
-// consequence for these tools: list_files and read_file only ever see
-// files this app itself created (via create_file) or that the founder
-// explicitly opened through a Drive picker UI this product doesn't have
-// — not "every file in the founder's Drive." A freshly connected org
-// will see an empty list_files result until create_file has made
-// something, and that's the scope working as intended, not a bug.
+// Scoped to drive.file (avoids Google's paid CASA assessment), so
+// list_files/read_file only ever see files this app created or the
+// founder explicitly shared with it — a fresh org sees an empty list
+// until create_file has made something, which is the scope working as
+// intended.
 func NewGoogleDriveServer() *gomcp.Server {
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "google_drive", Version: "1.0.0"}, nil)
 
@@ -127,11 +120,9 @@ func driveReadFile(ctx context.Context, req *gomcp.CallToolRequest, in driveRead
 		return nil, driveReadFileOutput{}, fmt.Errorf("google_drive: file_id is required")
 	}
 
-	// alt=media returns the file's raw bytes, not a JSON envelope, so
-	// this can't go through doJSON/doAndDecode — it needs the response
-	// body verbatim. Always a GET (a read), so — unlike doAndDecode's
-	// isWrite guard — both a network-level failure and an explicit
-	// 429/5xx response are safe to retry here.
+	// alt=media returns raw bytes, not JSON, so this can't go through
+	// doAndDecode. Always a GET, so unlike doAndDecode's isWrite guard,
+	// a network-level failure is safe to retry here too.
 	endpoint := fmt.Sprintf("%s/files/%s?alt=media", driveAPIBase, in.FileID)
 
 	var lastErr error
@@ -219,10 +210,8 @@ func driveCreateFile(ctx context.Context, req *gomcp.CallToolRequest, in driveCr
 	return nil, driveCreateFileOutput{FileID: created.ID}, nil
 }
 
-// driveMultipartBody builds a multipart/related body per Google's upload
-// API: one application/json part carrying file metadata, one part
-// carrying the actual content — the shape every Drive/Docs/Sheets
-// multipart upload endpoint expects, not a generic multipart/form-data.
+// Builds a multipart/related body (metadata part + content part), the
+// shape Google's upload API expects — not multipart/form-data.
 func driveMultipartBody(name, mimeType, content string) (*bytes.Buffer, string, error) {
 	buf := &bytes.Buffer{}
 	w := multipart.NewWriter(buf)
@@ -246,9 +235,7 @@ func driveMultipartBody(name, mimeType, content string) (*bytes.Buffer, string, 
 	if err := w.Close(); err != nil {
 		return nil, "", err
 	}
-	// Google's upload API expects "multipart/related", not the
-	// "multipart/form-data" mime/multipart's own FormDataContentType()
-	// assumes — same boundary, different top-level type, so build the
-	// header manually rather than use that helper's output as-is.
+	// FormDataContentType() would say multipart/form-data; Google needs
+	// multipart/related with the same boundary, built by hand.
 	return buf, "multipart/related; boundary=" + w.Boundary(), nil
 }

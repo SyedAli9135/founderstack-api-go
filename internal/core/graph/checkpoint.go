@@ -13,10 +13,9 @@ import (
 	"github.com/founderstack/api/internal/db/tenant"
 )
 
-// checkpoint persists state to workflow_runs.checkpoint_state/current_node
-// (plus the running cost/tool-call counters) through a fresh tenant.WithTx
-// call — never held open across a node's tool-call loop or an
-// approval-gate pause, since WithTx's transaction is meant to be short-lived.
+// checkpoint persists state to workflow_runs via a fresh, short-lived
+// tenant.WithTx call — never held open across a tool-call loop or an
+// approval-gate pause.
 func checkpoint(ctx context.Context, pool *pgxpool.Pool, state *RunState, currentNode NodeName, status string) error {
 	data, err := json.Marshal(state)
 	if err != nil {

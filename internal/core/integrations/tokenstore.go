@@ -16,14 +16,12 @@ import (
 	"github.com/founderstack/api/internal/pkg/vault"
 )
 
-// ErrNotConnected means the org has never connected this service —
-// GetIntegrationToken's normal "nothing to fetch" case, distinct from a
-// connection that exists but has expired (ErrTokenUnavailable).
+// ErrNotConnected: org never connected this service (distinct from
+// ErrTokenUnavailable, an existing-but-expired/revoked connection).
 var ErrNotConnected = errors.New("integrations: service not connected for this org")
 
-// ErrTokenUnavailable means a connection row exists but isn't currently
-// usable (revoked, or expired with no refresh available yet) — the MCP
-// gateway should surface this as "reconnect needed," not retry blindly.
+// ErrTokenUnavailable: connection row exists but isn't usable — the MCP
+// gateway should surface "reconnect needed," not retry blindly.
 var ErrTokenUnavailable = errors.New("integrations: connection is not active")
 
 // Connection is a decrypted, org-scoped integration connection as read
@@ -49,8 +47,7 @@ type ConnectionSummary struct {
 
 // tokenEnvelope is the JSON shape encrypted into
 // mcp_connections.encrypted_credentials. Scopes live in their own jsonb
-// column (oauth_scopes), not here, so they stay readable without
-// decrypting anything.
+// column instead, so they stay readable without decrypting anything.
 type tokenEnvelope struct {
 	AccessToken  string            `json:"access_token"`
 	RefreshToken string            `json:"refresh_token,omitempty"`
@@ -59,12 +56,9 @@ type tokenEnvelope struct {
 }
 
 // SaveConnection encrypts tok and upserts it for orgID/service.
-// credentialProvider records how the credential was obtained ("oauth" for
-// the OAuth providers, "manual" for pasted keys/PATs/bot tokens — the
-// column's existing default). displayName is shown on the integration
-// card; oauthStatus is almost always "connected" here except for a
-// refresh failure path that wants to write "expired" atomically with new
-// (or unchanged) token data.
+// credentialProvider is "oauth" or "manual" (pasted key/PAT/bot token).
+// oauthStatus is usually "connected", except a refresh-failure path that
+// writes "expired" atomically with the (unchanged) token data.
 func SaveConnection(ctx context.Context, pool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, service, displayName, credentialProvider, oauthStatus string, tok Token) error {
 	encrypted, scopesJSON, err := encodeToken(tok, encryptionKey)
 	if err != nil {
@@ -87,9 +81,8 @@ func SaveConnection(ctx context.Context, pool *pgxpool.Pool, encryptionKey []byt
 }
 
 // GetConnection fetches and decrypts orgID's connection for service.
-// Returns pgx.ErrNoRows (propagated, not wrapped) if no such connection
-// exists — callers check errors.Is(err, pgx.ErrNoRows), same convention
-// as settings.APIKeyStatus.
+// Propagates pgx.ErrNoRows unwrapped if none exists — same convention as
+// settings.APIKeyStatus.
 func GetConnection(ctx context.Context, pool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, service string) (*Connection, error) {
 	var conn *Connection
 	err := tenant.WithTx(ctx, pool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
@@ -184,14 +177,9 @@ func UpdateTokens(ctx context.Context, pool *pgxpool.Pool, encryptionKey []byte,
 }
 
 // GetIntegrationToken is the shared lookup MCP tool handlers use to get a
-// usable, decrypted Token for orgID's connection to service (workflow 5).
-// Deliberately collapses "never connected" and "row exists but not
-// usable" into two distinct sentinel errors rather than one generic
-// failure, since the MCP gateway needs to tell the founder "connect X"
-// apart from "reconnect X." Returns the full Token, not just AccessToken
-// — the MCP Gateway needs Token.Extra too (Discord's `webhook.incoming`
-// grant, e.g., has no usable AccessToken at all for posting a message;
-// the webhook URL in Extra is the only credential that works).
+// usable, decrypted Token for orgID's connection to service. Returns the
+// full Token, not just AccessToken — some grants (Discord's
+// webhook.incoming) have no usable AccessToken, only a credential in Extra.
 func GetIntegrationToken(ctx context.Context, pool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, service string) (Token, error) {
 	conn, err := GetConnection(ctx, pool, encryptionKey, orgID, service)
 	if err != nil {

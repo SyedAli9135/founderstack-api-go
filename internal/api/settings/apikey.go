@@ -20,38 +20,30 @@ import (
 	"github.com/founderstack/api/internal/pkg/vault"
 )
 
-// kmsKeyID is stored alongside every encrypted key so a future migration
-// to a real KMS can tell which rows still need re-encrypting. Not an
-// actual KMS key reference today — matches the Python original's own
-// hardcoded "local-fernet" placeholder, adapted for this envelope format.
+// Not an actual KMS reference today — lets a future migration to a real KMS tell which
+// rows still need re-encrypting.
 const kmsKeyID = "local-aes-gcm"
 
-// Handler implements the 4 BYOK settings endpoints.
 type Handler struct {
 	appPool          *pgxpool.Pool
 	encryptionKey    []byte
 	apiKeyMockPrefix string
 }
 
-// NewHandler builds a Handler. appPool must be the app_user (RLS-enforced)
-// pool — every operation here goes through tenant.WithTx, never a bare
-// query. encryptionKey is the decoded ENCRYPTION_KEY (vault.DecodeKey),
-// resolved once at startup so a misconfigured key fails the process at
-// boot, not silently on a founder's first key submission.
+// encryptionKey is the decoded ENCRYPTION_KEY, resolved once at startup so a misconfigured
+// key fails the process at boot, not on a founder's first key submission.
 func NewHandler(appPool *pgxpool.Pool, encryptionKey []byte, apiKeyMockPrefix string) *Handler {
 	return &Handler{appPool: appPool, encryptionKey: encryptionKey, apiKeyMockPrefix: apiKeyMockPrefix}
 }
 
-// Register mounts all 4 routes on rg. rg's group must already have
-// middleware.RequireAuth applied — these handlers assume authctx is set.
+// rg must already have middleware.RequireAuth applied.
 func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.POST("/api-key", h.SubmitAPIKey)
 	rg.GET("/api-key/status", h.APIKeyStatus)
 	rg.DELETE("/api-key", h.DeleteAPIKey)
 	rg.GET("/api-key/providers", h.ListProviders)
 
-	//(approval-gate notification config) — see approvals.go
-	// and pushsubscription.go in this same package.
+	// Approval-gate notification config — see approvals.go and pushsubscription.go.
 	rg.GET("/approvals", h.GetApprovalsSettings)
 	rg.PUT("/approvals", h.UpdateApprovalsSettings)
 	rg.POST("/push-subscription", h.SubmitPushSubscription)
@@ -59,16 +51,12 @@ func (h *Handler) Register(rg *gin.RouterGroup) {
 }
 
 type submitAPIKeyRequest struct {
-	// Provider defaults to "anthropic" when omitted — founderstack-web's
-	// current ApiKeyForm predates multi-provider support and never sends
-	// this field, so leaving it unset must reproduce the exact original
-	// single-provider behavior.
+	// Defaults to "anthropic" when omitted — founderstack-web's ApiKeyForm predates
+	// multi-provider support and never sends this field.
 	Provider string `json:"provider"`
 	APIKey   string `json:"api_key" binding:"required"`
 }
 
-// resolveProvider defaults an empty/omitted provider string to Anthropic
-// — see submitAPIKeyRequest.Provider's doc comment for why.
 func resolveProvider(raw string) llm.ProviderID {
 	if raw == "" {
 		return llm.ProviderAnthropic
@@ -76,10 +64,8 @@ func resolveProvider(raw string) llm.ProviderID {
 	return llm.ProviderID(raw)
 }
 
-// keyPreview returns a short, non-secret prefix of apiKey for display —
-// up to 8 raw characters, not tied to any one provider's format-prefix
-// length (Gemini's "AIza" is 4 chars, Anthropic's "sk-ant-" is 7), so one
-// implementation works uniformly across every Catalog entry.
+// Up to 8 raw characters, not tied to any one provider's prefix length (Gemini's "AIza" is
+// 4 chars, Anthropic's "sk-ant-" is 7), so one implementation works for every Catalog entry.
 func keyPreview(apiKey string) string {
 	n := 8
 	if len(apiKey) < n {
@@ -88,11 +74,8 @@ func keyPreview(apiKey string) string {
 	return apiKey[:n] + "..."
 }
 
-// invalidKeyMessage builds the founder-facing error message for a
-// rejected/malformed key, generalized from founderstack-api's original
-// Anthropic-only wording (which this reproduces exactly for
-// provider=anthropic — a wire contract the frontend's error display
-// depends on).
+// Reproduces founderstack-api's exact original wording for provider=anthropic — the
+// frontend's error display depends on this wire contract.
 func invalidKeyMessage(meta llm.Meta) string {
 	msg := fmt.Sprintf("The provided %s API key is invalid or inactive.", meta.Name)
 	if meta.KeyPrefix != "" {
@@ -101,11 +84,8 @@ func invalidKeyMessage(meta llm.Meta) string {
 	return msg + " Please ensure it has active usage permissions."
 }
 
-// SubmitAPIKey validates, encrypts, and stores a key for the caller's org
-// — POST /api/v1/settings/api-key. Also marks the submitted provider as
-// the org's active LLM provider, same "whichever key you submit becomes
-// active" behavior as the original Anthropic-only endpoint, now
-// provider-selectable.
+// Also marks the submitted provider as the org's active LLM provider — whichever key you
+// submit becomes active.
 func (h *Handler) SubmitAPIKey(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -132,10 +112,7 @@ func (h *Handler) SubmitAPIKey(c *gin.Context) {
 		case errors.Is(err, llm.ErrInvalidFormat), errors.Is(err, llm.ErrKeyRejected):
 			response.Fail(c, http.StatusBadRequest, "INVALID_API_KEY", invalidKeyMessage(meta))
 		case errors.Is(err, llm.ErrValidationUnavailable):
-			// Distinct from the two cases above and from the Python
-			// original — see llm.ErrValidationUnavailable's doc comment
-			// for why "the provider is unreachable" shouldn't be reported
-			// to the founder as "your key is invalid."
+			// "Provider unreachable" is distinct from "key is invalid" — don't conflate them.
 			response.Fail(c, http.StatusServiceUnavailable, "VALIDATION_UNAVAILABLE",
 				fmt.Sprintf("Could not reach %s to validate the key. Please try again shortly.", meta.Name))
 		default:
@@ -189,13 +166,8 @@ type apiKeyStatus struct {
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 }
 
-// APIKeyStatus reports whether the org has a key on file for the given
-// provider — GET /api/v1/settings/api-key/status?provider=openai. provider
-// defaults to "anthropic" when omitted, matching the original
-// single-provider endpoint's shape exactly for existing callers. data is
-// null (not a 404) when no key has ever been submitted for that provider,
-// matching the Python original: "no key yet" is a normal state, not an
-// error.
+// data is null (not a 404) when no key has ever been submitted — "no key yet" is a normal
+// state, not an error.
 func (h *Handler) APIKeyStatus(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -242,11 +214,7 @@ func (h *Handler) APIKeyStatus(c *gin.Context) {
 	response.OK(c, http.StatusOK, "", status)
 }
 
-// DeleteAPIKey deactivates the org's key for the given provider —
-// DELETE /api/v1/settings/api-key?provider=openai. provider defaults to
-// "anthropic" when omitted, matching the original endpoint's shape.
-// Unconditional, like the Python original: no error if there was nothing
-// to delete, idempotent either way.
+// Unconditional: no error if there was nothing to delete, idempotent either way.
 func (h *Handler) DeleteAPIKey(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -267,10 +235,8 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 		}); err != nil {
 			return err
 		}
-		// Only clears the org's active pointer if providerID was the
-		// active provider — deleting a non-active provider's key must
-		// not clobber a different, still-active provider. See the
-		// query's own doc comment.
+		// Only clears the active pointer if providerID was the active provider — deleting a
+		// non-active key must not clobber a different, still-active one.
 		return q.ClearOrganizationActiveApiKeyForProvider(ctx, dbgen.ClearOrganizationActiveApiKeyForProviderParams{
 			ID:          user.OrgID,
 			LlmProvider: (*string)(&providerID),
@@ -296,14 +262,8 @@ type providerStatusView struct {
 	LastUsedAt    *time.Time `json:"last_used_at,omitempty"`
 }
 
-// ListProviders merges the static llm.Catalog (every LLM provider BYOK
-// supports) with the org's actual stored keys — GET
-// /api/v1/settings/api-key/providers. Mirrors
-// internal/api/integrations.Handler.ListIntegrations' catalog+status merge
-// pattern: every provider always appears, even ones the org has never
-// configured, so the frontend can render a full picker/status grid (and
-// know which provider is "active") from one request instead of one
-// GET .../status call per provider.
+// Every provider always appears, even unconfigured ones, so the frontend can render a full
+// picker/status grid from one request instead of one GET .../status call per provider.
 func (h *Handler) ListProviders(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {

@@ -17,19 +17,16 @@ import (
 	"github.com/founderstack/api/internal/db/tenant"
 )
 
-// DevResumeHandler exposes graph.Launcher.Resume over HTTP
 type DevResumeHandler struct {
 	appPool  *pgxpool.Pool
 	launcher *graph.Launcher
 }
 
-// NewDevResumeHandler builds a DevResumeHandler.
 func NewDevResumeHandler(appPool *pgxpool.Pool, launcher *graph.Launcher) *DevResumeHandler {
 	return &DevResumeHandler{appPool: appPool, launcher: launcher}
 }
 
-// Register mounts the one dev-only route on rg. rg's group must already
-// have middleware.RequireAuth applied
+// rg must already have middleware.RequireAuth applied.
 func (h *DevResumeHandler) Register(rg *gin.RouterGroup) {
 	rg.POST("/runs/:id/dev-resume", h.Resume)
 }
@@ -39,9 +36,6 @@ type devResumeRequest struct {
 	Reason   string `json:"reason"`
 }
 
-// Resume — POST /api/v1/runs/{id}/dev-resume. Confirms the run belongs to
-// the caller's org and is actually awaiting_approval before firing
-// Launcher.Resume
 func (h *DevResumeHandler) Resume(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {

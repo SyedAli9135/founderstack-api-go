@@ -30,10 +30,7 @@ var (
 	ErrKeyRejected = errors.New("llm: provider rejected the API key")
 	// ErrValidationUnavailable means the key's shape is fine but the
 	// provider's API couldn't be reached to confirm it (network error,
-	// 5xx, timeout) — maps to a 502/503, this is NOT the founder's
-	// problem. The Python original conflates this into the same "invalid
-	// key" response; distinguishing it here is a deliberate improvement,
-	// not a behavior a frontend depends on being wrong.
+	// 5xx, timeout) — maps to a 502/503, not the founder's problem.
 	ErrValidationUnavailable = errors.New("llm: could not reach the provider to validate the key")
 )
 
@@ -60,15 +57,12 @@ func ValidateKey(ctx context.Context, provider ProviderID, apiKey, mockPrefix st
 	return validateKey(ctx, apiKey, meta.KeyPrefix, mockPrefix, verifyFn)
 }
 
-// validateKey checked the mock prefix before the format check — a change
-// from this package's original single-provider ordering — because one
-// shared mock prefix can't be made to satisfy every provider's real key
-// shape at once (Anthropic's "sk-ant-", Gemini's "AIza", ...). The format
-// check itself is trivial per-provider string logic, covered directly by
-// unit tests; skipping it for mock keys doesn't reduce real coverage.
+// validateKey checks the mock prefix before the format check, since one
+// shared mock prefix can't satisfy every provider's real key shape at once
+// (Anthropic's "sk-ant-", Gemini's "AIza", ...).
 //
 // mockPrefix == "" must never match: strings.HasPrefix(s, "") is true for
-// every s, which would silently disable real validation entirely if
+// every s, which would silently disable real validation if
 // API_KEY_MOCK_PREFIX were ever left blank.
 func validateKey(ctx context.Context, apiKey, keyPrefix, mockPrefix string, verifyFn verify) error {
 	if mockPrefix != "" && strings.HasPrefix(apiKey, mockPrefix) {

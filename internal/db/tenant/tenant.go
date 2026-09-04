@@ -1,11 +1,8 @@
-// Package tenant provides the one correct way to run a tenant-scoped
-// database operation: inside a transaction with the RLS session variable
-// set for that transaction only. Every handler doing real per-org work
-// against the app_user (RLS-enforced) pool should go through WithTx rather
-// than querying the pool directly — a direct query has no org context set
-// and will see zero rows under every table's tenant_isolation policy (see
-// internal/db/migrations/000002_enable_rls.up.sql), not accidentally see
-// everything.
+// Package tenant runs tenant-scoped queries inside a transaction with the
+// RLS session variable set for that transaction only. A direct query
+// against app_user with no org context set sees zero rows under every
+// table's tenant_isolation policy (000002_enable_rls.up.sql), never
+// everything — go through WithTx rather than querying the pool directly.
 package tenant
 
 import (
@@ -19,13 +16,9 @@ import (
 )
 
 // WithTx runs fn inside a fresh transaction on pool (the app_user pool),
-// with app.current_org_id set for that transaction's duration via
-// set_config(..., true) — not a string-built "SET LOCAL", which doesn't
-// support real query parameterization and would need manual value escaping
-// to stay injection-safe. fn's queries run against q, scoped to orgID by
-// every table's RLS policy for the duration of the transaction. Commits on
-// success, rolls back on any error (including a panic recovered by an
-// outer Gin Recovery middleware — the deferred Rollback still fires first).
+// with app.current_org_id set via set_config(..., true) — not a
+// string-built "SET LOCAL", which doesn't support real parameterization.
+// Commits on success, rolls back on any error or panic.
 func WithTx(ctx context.Context, pool *pgxpool.Pool, orgID pgtype.UUID, fn func(ctx context.Context, q *dbgen.Queries) error) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {

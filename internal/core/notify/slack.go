@@ -9,14 +9,9 @@ import (
 	coremcp "github.com/founderstack/api/internal/core/mcp"
 )
 
-// sendSlackApproval posts text to the org's configured approvals channel
-// via the existing slack.send_message MCP tool — the same call path any
-// agent-driven tool call goes through, reused here rather than a second
-// Slack client. Logs and swallows every failure (channel unset, org never
-// connected Slack, tool call error): a notification failing must never
-// affect the run it's about, the same "an audit-trail write failing
-// shouldn't take down the run" reasoning internal/core/graph/observability.go
-// already documents.
+// Reuses the slack.send_message MCP tool rather than a second Slack
+// client. Logs and swallows every failure — a notification failing must
+// never affect the run it's about.
 func sendSlackApproval(ctx context.Context, gateway *coremcp.Gateway, orgID pgtype.UUID, channel, text string) {
 	if gateway == nil || channel == "" {
 		return

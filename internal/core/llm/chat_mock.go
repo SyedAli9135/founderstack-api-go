@@ -14,12 +14,9 @@ type MockChatCall struct {
 }
 
 // MockChatClient returns a pre-programmed sequence of responses, one per
-// Send call — no network, no live provider. This is the default test
-// harness for internal/core/graph going forward (see WORKFLOW_PLAN_GO.md's
-// Workflow 9 harness planning notes), not just a stopgap for the founder
-// not having live BYOK keys yet: it's what lets the engine's checkpointing,
-// guardrails, approval gate, and SSE events all be exercised end-to-end
-// deterministically.
+// Send call — no network, no live provider. The default test harness for
+// internal/core/graph: exercises checkpointing, guardrails, approval gate,
+// and SSE events deterministically.
 type MockChatClient struct {
 	Responses []ChatResponse
 	Calls     []MockChatCall

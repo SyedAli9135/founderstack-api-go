@@ -10,26 +10,19 @@ import (
 )
 
 // anthropicMessagesURL is a var so tests can point it at a fake httptest
-// server instead of the real Anthropic API — same pattern as
-// verify.go's geminiModelsURL.
+// server.
 var anthropicMessagesURL = "https://api.anthropic.com/v1/messages"
 
 const (
 	anthropicAPIVersion = "2023-06-01"
-	// anthropicMaxTokens is a fixed ceiling for now — agents.max_output_tokens
-	// (already in the schema) becomes a per-call param once executor_node
-	// wires an agent's config into ChatClient.Send; not needed for this
-	// build step, which only proves the adapter's wire-format correctness.
+	// anthropicMaxTokens is a fixed ceiling for now; will become a
+	// per-call param once agents.max_output_tokens is wired through.
 	anthropicMaxTokens = 4096
 )
 
-// AnthropicChatClient implements ChatClient via a plain net/http call
-// against Anthropic's Messages API — deliberately not anthropic-sdk-go.
-// The hand-rolled graph.Engine owns the call/tool/repeat loop; this is
-// only the single-call transport, same style as the OpenAI-compatible and
-// Gemini adapters alongside it. Wire shapes below are confirmed against
-// anthropic-sdk-go's own struct JSON tags (system/tools/content-block
-// fields), not guessed, without taking a dependency on the SDK itself.
+// AnthropicChatClient implements ChatClient via plain net/http against
+// Anthropic's Messages API, deliberately not anthropic-sdk-go — the
+// single-call transport only; graph.Engine owns the call/tool/repeat loop.
 type AnthropicChatClient struct {
 	apiKey string
 	model  string
@@ -107,9 +100,7 @@ func (c *AnthropicChatClient) Send(ctx context.Context, systemPrompt string, mes
 		Tools:     toAnthropicTools(tools),
 	}
 	if systemPrompt != "" {
-		// Cache the system prompt — it's static for the whole run, the
-		// textbook case for prompt caching. See the Workflow 9 harness
-		// plan's "pure cost win, do it from day one" note.
+		// Cached: static for the whole run, the textbook prompt-caching case.
 		req.System = []anthropicSystemBlock{{
 			Type:         "text",
 			Text:         systemPrompt,

@@ -22,13 +22,10 @@ import (
 // whether the token proves identity.
 var ErrActionTokenInvalid = errors.New("notify: invalid or expired action token")
 
-// ActionTokenSigner mints and verifies the single-purpose "magic link"
-// token embedded in a push notification's payload (the same pattern
-// GitHub/PagerDuty use for email approve links) — the only way a service
-// worker's notificationclick handler can prove who's tapping without a
-// live Clerk session (see WORKFLOW_PLAN_GO.md's Workflow 10 scope note).
-// One token authorizes exactly one user to decide exactly one approval;
-// it proves identity only; the caller still re-checks
+// Mints/verifies the single-purpose "magic link" token embedded in a
+// push notification's payload — the only way a service worker's
+// notificationclick handler can prove who's tapping without a live Clerk
+// session. Proves identity only; the caller still re-checks
 // can_approve_workflows/agents_paused before acting on it.
 type ActionTokenSigner struct {
 	secret secret.Value
@@ -38,11 +35,9 @@ func NewActionTokenSigner(secret secret.Value) *ActionTokenSigner {
 	return &ActionTokenSigner{secret: secret}
 }
 
-// Sign returns a base64url token binding approvalID+userID+expiresAt.
 // Empty when the secret is unset, so a caller can tell at send-time
-// whether to even attempt embedding a working action button — Verify
-// always rejects an empty/unset-secret token, it never treats "no
-// secret configured" as "accept anything".
+// whether to embed a working action button — Verify always rejects an
+// empty/unset-secret token, never "no secret configured" = "accept anything".
 func (s *ActionTokenSigner) Sign(approvalID, userID uuid.UUID, expiresAt time.Time) string {
 	if s.secret.IsEmpty() {
 		return ""

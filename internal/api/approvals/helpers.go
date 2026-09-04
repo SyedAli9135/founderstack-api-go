@@ -30,8 +30,5 @@ func formatTimestamptz(t pgtype.Timestamptz) *string {
 	return &s
 }
 
-// nowUTC is a var (not a bare time.Now() call) purely so a future test
-// could override it — not exercised yet, but costs nothing and matches
-// this codebase's general "make time comparisons overridable" caution
-// around expiry logic.
+// A var, not a bare time.Now() call, so a test can override it for expiry checks.
 var nowUTC = func() time.Time { return time.Now().UTC() }

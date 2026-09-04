@@ -16,9 +16,7 @@ type Success struct {
 	Data    any    `json:"data,omitempty"`
 }
 
-// ErrorDetail mirrors ErrorDetail: a machine-readable code, a human message,
-// the request ID for support/tracing, and optional structured detail (e.g.
-// per-field validation errors).
+// ErrorDetail mirrors ErrorDetail: code, message, request ID, optional detail.
 type ErrorDetail struct {
 	Code      string `json:"code"`
 	Message   string `json:"message"`
@@ -71,9 +69,7 @@ func RequestID(c *gin.Context) string {
 	return s
 }
 
-// NewID returns a random 32-character hex ID, used for both request IDs and
-// anywhere else a short opaque identifier is needed without pulling in a
-// UUID dependency for it.
+// NewID returns a random 32-character hex ID (request IDs and similar).
 func NewID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)

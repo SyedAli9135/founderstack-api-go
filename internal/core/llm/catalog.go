@@ -1,10 +1,8 @@
 package llm
 
-// ProviderID identifies one of the LLM providers BYOK can validate and
-// store a key for. A plain string, not a Postgres enum — api_key_registry
-// (and organizations.llm_provider)'s columns are varchar(50), matching the
-// same "caller-supplied string, not a DB enum" choice already made for
-// internal/core/integrations' service_name.
+// ProviderID identifies a BYOK-supported LLM provider. A plain string, not
+// a Postgres enum, matching api_key_registry/organizations.llm_provider's
+// varchar(50) columns.
 type ProviderID string
 
 const (
@@ -15,10 +13,8 @@ const (
 	ProviderDeepSeek  ProviderID = "deepseek"
 )
 
-// Meta describes one catalog entry: the founder-facing display name and
-// the real key format's prefix (used both for the cheap pre-network-call
-// format check and to word the invalid-key error message). Mirrors
-// internal/core/integrations/catalog.go's Meta/Catalog shape.
+// Meta is one catalog entry: display name plus the real key format's
+// prefix, used for the cheap pre-network format check and error wording.
 type Meta struct {
 	Name      string
 	KeyPrefix string

@@ -45,14 +45,10 @@ func verifyAnthropic(ctx context.Context, apiKey string) error {
 }
 
 // verifyOpenAICompatible builds a verify for any provider exposing an
-// OpenAI-compatible GET {modelsURL} endpoint — OpenAI itself, plus Qwen
-// (Alibaba DashScope's compatible-mode endpoint) and DeepSeek, both of
-// which deliberately mirror OpenAI's API shape. A single Bearer-authed GET
-// against the cheapest possible endpoint, same "list models" spirit as
-// verifyAnthropic — no SDK pulled in for a one-line REST call, matching
-// this codebase's existing Stripe ValidateKey precedent
-// (internal/core/integrations/providers/stripe.go: "don't add a
-// dependency a single GET doesn't justify").
+// OpenAI-compatible GET {modelsURL} endpoint — OpenAI, Qwen (DashScope's
+// compatible-mode endpoint), and DeepSeek all mirror OpenAI's API shape.
+// No SDK for a one-line REST call, matching this codebase's "don't add a
+// dependency a single GET doesn't justify" policy.
 func verifyOpenAICompatible(modelsURL string) verify {
 	return func(ctx context.Context, apiKey string) error {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
@@ -78,11 +74,8 @@ func verifyOpenAICompatible(modelsURL string) verify {
 	}
 }
 
-// geminiModelsURL is a var (not a verifyGemini-local const) purely so
-// verify_test.go can point it at a fake httptest server instead of the
-// real Google API — same "test the request-shape logic, not a live
-// third-party dependency" reasoning as verifyOpenAICompatible taking its
-// URL as a parameter.
+// A var, not a local const, so verify_test.go can point it at a fake
+// httptest server instead of the real Google API.
 var geminiModelsURL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 // verifyGemini checks a Google AI Studio key via the same "list models,

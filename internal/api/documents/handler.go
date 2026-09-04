@@ -1,7 +1,5 @@
-// Package documents implements workflow 6's 5 HTTP endpoints — upload,
-// list, get, delete, reindex — over internal/core/documents' S3/extract/
-// chunk/embed/index pipeline. Every route here must sit behind
-// middleware.RequireAuth.
+// Package documents implements the upload/list/get/delete/reindex HTTP endpoints over
+// internal/core/documents' S3/extract/chunk/embed/index pipeline.
 package documents
 
 import (
@@ -26,15 +24,10 @@ import (
 	"github.com/founderstack/api/internal/db/tenant"
 )
 
-// maxUploadBytes matches workflow 6's spec: files up to 50MB accepted.
 const maxUploadBytes = 50 << 20
 
-// allowedExtensions is workflow 6's supported-formats list (PDF, DOCX,
-// TXT, MD) mapped to the content type stored on the row — checked here,
-// at the API boundary, before any S3 upload or background work happens;
-// internal/core/documents.ExtractText independently rejects anything
-// else too, so a file that somehow skipped this check still can't be
-// silently mis-processed.
+// Checked here at the API boundary; internal/core/documents.ExtractText independently
+// rejects anything else too, so a file that skips this check still can't be mis-processed.
 var allowedExtensions = map[string]string{
 	".pdf":  "application/pdf",
 	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -42,24 +35,19 @@ var allowedExtensions = map[string]string{
 	".md":   "text/markdown",
 }
 
-// Handler implements the 5 document endpoints.
 type Handler struct {
 	appPool   *pgxpool.Pool
 	store     coredocs.BlobStore
 	processor *coredocs.Processor
 }
 
-// NewHandler builds a Handler. appPool must be the app_user
-// (RLS-enforced) pool — every DB operation here goes through
-// tenant.WithTx, never a bare query. store takes the BlobStore interface
-// rather than the concrete *coredocs.Store so handler_integration_test.go
-// can inject a fake instead of needing a real S3/LocalStack dependency.
+// store takes the BlobStore interface, not the concrete *coredocs.Store, so tests can
+// inject a fake instead of needing a real S3/LocalStack dependency.
 func NewHandler(appPool *pgxpool.Pool, store coredocs.BlobStore, processor *coredocs.Processor) *Handler {
 	return &Handler{appPool: appPool, store: store, processor: processor}
 }
 
-// Register mounts all 5 routes on rg. rg's group must already have
-// middleware.RequireAuth applied.
+// Register mounts all 5 routes; rg must already have middleware.RequireAuth applied.
 func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.POST("/documents/upload", h.Upload)
 	rg.GET("/documents", h.List)
@@ -68,10 +56,7 @@ func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.POST("/documents/:id/reindex", h.Reindex)
 }
 
-// Upload validates and stores an uploaded file, then kicks off
-// background processing — POST /api/v1/documents/upload
-// (multipart/form-data: "file" + optional "category"). Returns 202
-// immediately; the founder polls GET .../{id} for processing_status.
+// Upload returns 202 immediately; the founder polls GET .../{id} for processing_status.
 func (h *Handler) Upload(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -108,10 +93,8 @@ func (h *Handler) Upload(c *gin.Context) {
 	}
 	defer file.Close()
 
-	// Generated here (not left to the documents.id column's
-	// gen_random_uuid() default) so the S3 key — documents/{org_id}/{doc_id}/{filename} —
-	// is known before uploading, avoiding an insert-then-update-s3_path
-	// round trip.
+	// Generated here, not left to the DB default, so the S3 key is known before uploading —
+	// avoids an insert-then-update-s3_path round trip.
 	docID := pgtype.UUID{Bytes: uuid.New(), Valid: true}
 	key := coredocs.Key(user.OrgID.String(), docID.String(), fileHeader.Filename)
 
@@ -141,13 +124,9 @@ func (h *Handler) Upload(c *gin.Context) {
 
 	orgID := user.OrgID
 	go func() {
-		// Deliberately not c.Request.Context(): that context is
-		// cancelled the moment this handler returns (the 202 below), but
-		// processing needs to keep running well past that.
+		// Not c.Request.Context(): that's cancelled the moment this handler returns.
 		if err := h.processor.Process(context.Background(), orgID, docID); err != nil {
-			// Process itself already persists 'failed' + error_detail on
-			// the row — this log is for operator visibility, not the
-			// founder-facing error path (that's GET .../{id}).
+			// Process already persists 'failed'+error_detail; this log is for operators only.
 			logProcessingError("upload", docID, err)
 		}
 	}()
@@ -167,8 +146,6 @@ type documentSummary struct {
 	IndexedAt        *time.Time `json:"indexed_at,omitempty"`
 }
 
-// List returns every non-deleting document for the org —
-// GET /api/v1/documents.
 func (h *Handler) List(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -210,9 +187,7 @@ type documentDetail struct {
 	ErrorDetail *string `json:"error_detail,omitempty"`
 }
 
-// Get returns one document's detail — GET /api/v1/documents/{id}.
-// 404s (not a generic 500) when the id doesn't belong to this org — RLS
-// makes that indistinguishable from "doesn't exist at all" by design.
+// RLS makes "wrong org" indistinguishable from "doesn't exist", so both 404 here.
 func (h *Handler) Get(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -258,10 +233,8 @@ func (h *Handler) Get(c *gin.Context) {
 	response.OK(c, http.StatusOK, "", doc)
 }
 
-// Delete soft-deletes a document and kicks off background purging —
-// DELETE /api/v1/documents/{id}. Matches the rest of this codebase's
-// delete-ish convention (integrations, BYOK keys): mark it, don't
-// destroy it synchronously in the request path.
+// Soft-deletes and kicks off background purging, matching this codebase's other
+// delete-ish endpoints: mark it, don't destroy it synchronously in the request path.
 func (h *Handler) Delete(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -292,9 +265,6 @@ func (h *Handler) Delete(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// Reindex re-embeds a document from scratch (a founder retrying a
-// failed document, or picking up a model upgrade) —
-// POST /api/v1/documents/{id}/reindex.
 func (h *Handler) Reindex(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -307,9 +277,7 @@ func (h *Handler) Reindex(c *gin.Context) {
 		return
 	}
 
-	// Confirm the document exists (and belongs to this org) before
-	// returning 202 — an unknown id should 404, not silently accept and
-	// do nothing in the background.
+	// Confirm existence before 202 — an unknown id should 404, not silently no-op.
 	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		_, err := q.GetDocument(ctx, dbgen.GetDocumentParams{OrgID: user.OrgID, ID: docID})
 		return err

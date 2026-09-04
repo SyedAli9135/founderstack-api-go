@@ -9,10 +9,6 @@ import (
 	"net/http"
 )
 
-// openAIChatCompletionsPath is appended to each provider's base URL to
-// build its chat-completions endpoint — mirrors verify.go's per-provider
-// modelsURL construction (OpenAI/Qwen/DeepSeek all expose an
-// OpenAI-compatible REST surface).
 const openAIChatCompletionsPath = "/chat/completions"
 
 const (
@@ -23,10 +19,8 @@ const (
 
 // OpenAICompatibleChatClient implements ChatClient via plain net/http
 // against any provider exposing an OpenAI-compatible
-// POST {baseURL}/chat/completions endpoint — OpenAI itself, plus Qwen
-// (Alibaba DashScope's compatible-mode endpoint) and DeepSeek, both of
-// which deliberately mirror OpenAI's API shape. One implementation for
-// all 3, same reasoning as verify.go's verifyOpenAICompatible.
+// POST {baseURL}/chat/completions endpoint — OpenAI, Qwen, and DeepSeek
+// all mirror OpenAI's API shape, so one implementation covers all 3.
 type OpenAICompatibleChatClient struct {
 	baseURL string
 	apiKey  string

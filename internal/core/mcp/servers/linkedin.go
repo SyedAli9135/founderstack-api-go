@@ -15,36 +15,21 @@ import (
 // server.
 var linkedinAPIBase = "https://api.linkedin.com/rest"
 
-// linkedinAPIVersion is LinkedIn's required versioned-API header
-// (YYYYMM), same "no content-negotiation fallback" story as Notion's
-// Notion-Version.
-const linkedinAPIVersion = "202601"
+const linkedinAPIVersion = "202601" // YYYYMM, no content-negotiation fallback
 
-// NewLinkedInServer builds the LinkedIn MCP tool server (WORKFLOW_PLAN_GO.md
-// workflow 5) — draft_post only. reply_to_mention from the original plan
-// is deliberately not implemented: workflow 4 scoped LinkedIn's OAuth to
-// just the free "Share on LinkedIn" product (w_member_social) rather than
-// the paid, partner-gated Marketing Developer Platform (see
-// founderstack-api-go/CLAUDE.md's Third-Party Integrations section) —
-// reading/replying to mentions and comments lives behind that gated
-// platform, not w_member_social, so there's no real API this tool could
-// call. Re-add it if LinkedIn's OAuth scope is ever widened.
-//
-// "draft_post" is a slight misnomer carried over from the original plan:
-// LinkedIn's API has no saved-draft state reachable with this scope —
-// this tool composes and publishes the post in one call. The tool's
-// description says so explicitly rather than implying a review step that
-// doesn't exist.
+// reply_to_mention from the original plan isn't implemented: LinkedIn's
+// OAuth here is scoped to w_member_social only, and mentions/comments
+// need the paid Marketing Developer Platform. "draft_post" is a misnomer
+// kept from the plan — this scope has no saved-draft state, so the tool
+// composes and publishes in one call (its description says so).
 func NewLinkedInServer() *gomcp.Server {
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "linkedin", Version: "1.0.0"}, nil)
 
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "draft_post",
 		Description: "Compose and publish a post to LinkedIn. LinkedIn has no API-accessible draft state — this publishes immediately.",
-		// Destructive-tier despite not moving money: a public, permanent,
-		// brand-visible post published with no draft/undo step is exactly
-		// the kind of irreversible external action the risk model treats
-		// the same as a financial one — see internal/core/mcp/risk.go.
+		// Destructive-tier despite not moving money: public, permanent, no
+		// undo step.
 		Annotations: mcp.DestructiveOrFinancial(),
 	}, linkedinDraftPost)
 
@@ -52,13 +37,8 @@ func NewLinkedInServer() *gomcp.Server {
 }
 
 type linkedinDraftPostInput struct {
-	// AuthorURN identifies who the post is published as, e.g.
-	// "urn:li:person:abc123". Accepted as an explicit input rather than
-	// resolved automatically: w_member_social alone doesn't reliably
-	// grant profile-read access (that's typically bundled with a
-	// separate openid/profile scope this integration doesn't request),
-	// so guessing at it here would assume a permission workflow 4 never
-	// actually granted.
+	// Explicit input, not auto-resolved: w_member_social alone doesn't
+	// reliably grant the profile-read scope a resolve call would need.
 	AuthorURN string `json:"author_urn" jsonschema:"LinkedIn person URN to post as, e.g. urn:li:person:abc123"`
 	Text      string `json:"text" jsonschema:"Post text"`
 }
@@ -97,17 +77,11 @@ func linkedinDraftPost(ctx context.Context, req *gomcp.CallToolRequest, in linke
 	return nil, linkedinDraftPostOutput{PostID: postID}, nil
 }
 
-// doLinkedInCreate posts payload to endpoint and returns the created
-// resource's ID from the LinkedIn-convention x-restli-id response
-// header — the Posts API returns 201 with an empty body and the new
-// post's URN in that header, not in a JSON body like every other
-// provider here.
-// doLinkedInCreate is always a POST (publishing a post has no read
-// variant), so — same reasoning as doAndDecode's isWrite guard — a
-// network-level failure never auto-retries here: the post may have
-// already gone live before the response was lost, and retrying could
-// double-publish. Only an explicit 429/5xx response (the server
-// rejected the request outright, without applying it) retries.
+// The Posts API returns 201 with an empty body and the new post's URN in
+// the x-restli-id header, not a JSON body like every other provider here.
+// Always a POST, so — same reasoning as doAndDecode's isWrite guard — a
+// network-level failure never auto-retries (the post may have already
+// gone live); only an explicit 429/5xx response retries.
 func doLinkedInCreate(ctx context.Context, endpoint, token string, payload any) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= toolCallMaxAttempts; attempt++ {

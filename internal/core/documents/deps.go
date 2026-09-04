@@ -11,18 +11,13 @@ import (
 )
 
 // BlobStore, Embedder, and VectorIndex are Processor's 3 external
-// dependencies, cut down to just the methods it actually calls — the same
-// interface-segregation reasoning `internal/core/integrations` documents
-// for its Provider/OAuthProvider/... split. *Store already satisfies
-// BlobStore structurally (no adapter needed); Embedder and VectorIndex wrap
-// the Cohere and Pinecone SDK clients, whose concrete types can't stand in
-// for a hand-written interface directly (WithNamespace returns a concrete
-// *pinecone.IndexConnection, not an interface). Splitting these out is
-// what lets processor_integration_test.go and
-// internal/api/documents/handler_integration_test.go run the real
-// upload/process/purge/reindex pipeline against fakes — no live S3,
-// Cohere, or Pinecone dependency, and no LocalStack service or third-party
-// API keys needed in CI.
+// dependencies, cut to just the methods it calls — same interface
+// segregation as internal/core/integrations' Provider split. *Store
+// already satisfies BlobStore structurally; Embedder/VectorIndex wrap the
+// Cohere/Pinecone SDK clients, whose concrete types can't stand in
+// directly (WithNamespace returns a concrete type, not an interface).
+// This is what lets the integration tests run the real pipeline against
+// fakes — no live S3/Cohere/Pinecone or LocalStack needed in CI.
 type BlobStore interface {
 	Upload(ctx context.Context, key string, body io.Reader, contentType string) error
 	Download(ctx context.Context, key string) (io.ReadCloser, error)
@@ -43,13 +38,11 @@ type cohereEmbedder struct {
 	client *coherecli.Client
 }
 
-// NewCohereEmbedder adapts a real Cohere client to the Embedder interface
-// Processor depends on. The client passed in must be built with
-// option.WithMaxAttempts set high enough to survive a rate-limit window —
-// see cmd/api/main.go::newDocumentsProcessor's comment for why. cohere-go's
-// client already retries 429/408/5xx internally with jittered exponential
-// backoff and Retry-After support (internal/retrier.go) — an outer retry
-// loop here would just be a worse duplicate of that, not an improvement.
+// NewCohereEmbedder adapts a real Cohere client to the Embedder interface.
+// The client must be built with option.WithMaxAttempts set high enough to
+// survive a rate-limit window (see newDocumentsProcessor) — cohere-go
+// already retries 429/408/5xx with jittered backoff internally, so an
+// outer retry loop here would just duplicate it, worse.
 func NewCohereEmbedder(client *coherecli.Client) Embedder {
 	return cohereEmbedder{client: client}
 }

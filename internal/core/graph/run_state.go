@@ -38,12 +38,9 @@ type RunState struct {
 
 	PendingToolCalls []llm.ToolCall `json:"pending_tool_calls,omitempty"`
 
-	// ApprovalID/PendingApprovalRiskLevel are set by writeApprovalGate
-	// (approvalgate.go) in the same turn PendingToolCalls is populated —
-	// they identify the real `approvals` row a human decides against,
-	// letting engine.go's NodeAwaitingApproval case enrich the
-	// EventApprovalRequired SSE payload without itself needing a Gateway
-	// dependency.
+	// Set by writeApprovalGate alongside PendingToolCalls — identify the
+	// real approvals row, letting engine.go enrich EventApprovalRequired
+	// without needing a Gateway dependency itself.
 	ApprovalID               uuid.UUID `json:"approval_id,omitempty"`
 	PendingApprovalRiskLevel string    `json:"pending_approval_risk_level,omitempty"`
 

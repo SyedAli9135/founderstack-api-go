@@ -11,11 +11,9 @@ import (
 	"github.com/ledongthuc/pdf"
 )
 
-// ErrUnsupportedFileType means the upload's extension/mime type isn't
-// one of the 4 workflow 6 supports (PDF, DOCX, TXT, MD) — checked before
-// this package is ever reached (see internal/api/documents), but kept as
-// a real error here too so ExtractText never silently returns empty text
-// for a file type it doesn't understand.
+// ErrUnsupportedFileType: checked earlier in internal/api/documents too,
+// but kept here so ExtractText never silently returns empty text for a
+// file type it doesn't understand.
 var ErrUnsupportedFileType = fmt.Errorf("documents: unsupported file type")
 
 // ExtractText pulls plain text out of data, dispatching on filename's
@@ -53,14 +51,11 @@ func extractPDF(data []byte) (string, error) {
 	return string(text), nil
 }
 
-// extractDOCX reads word/document.xml out of the .docx zip and pulls
-// text out of every <w:t> run, joining paragraphs (<w:p> boundaries)
-// with a blank line. Hand-rolled on stdlib archive/zip + encoding/xml
-// rather than a docx-parsing dependency — the actual text-extraction
-// need here is narrow enough (no tables, headers/footers, tracked
-// changes, or styling) that a real dependency wasn't justified, same
-// "don't add one for less than it earns" reasoning as everywhere else
-// BYOK/integrations/documents touches a format in this codebase.
+// extractDOCX reads word/document.xml out of the .docx zip and pulls text
+// out of every <w:t> run, joining paragraphs (<w:p> boundaries) with a
+// blank line. Hand-rolled on archive/zip + encoding/xml rather than a
+// docx-parsing dependency — no tables/headers/footers/tracked changes, so
+// a real dependency wasn't justified.
 func extractDOCX(data []byte) (string, error) {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -97,10 +92,8 @@ func extractDOCX(data []byte) (string, error) {
 
 		switch t := tok.(type) {
 		case xml.StartElement:
-			// Word namespaces this element (commonly "w:t"); matching on
-			// the local name only (ignoring the namespace prefix) is
-			// deliberate — DOCX producers don't all use the same prefix,
-			// but the local name is stable.
+			// Match on local name only, ignoring the namespace prefix —
+			// DOCX producers don't all use the same prefix.
 			if t.Name.Local == "t" {
 				var text string
 				if err := dec.DecodeElement(&text, &t); err != nil {

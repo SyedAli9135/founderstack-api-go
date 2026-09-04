@@ -22,10 +22,9 @@ type Store struct {
 	bucket string
 }
 
-// NewStore builds a Store. endpointURL is config.Config.AWSS3EndpointURL
-// — empty hits real AWS; set (LocalStack's http://localhost:4566 in
-// local dev) it switches to path-style addressing, which LocalStack
-// requires and real AWS's virtual-hosted-style default doesn't need.
+// NewStore builds a Store. endpointURL empty hits real AWS; set (e.g.
+// LocalStack's http://localhost:4566) it switches to path-style
+// addressing, which LocalStack requires and real AWS doesn't.
 func NewStore(ctx context.Context, region, accessKeyID, secretAccessKey, endpointURL, bucket string) (*Store, error) {
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(region),
@@ -45,9 +44,8 @@ func NewStore(ctx context.Context, region, accessKeyID, secretAccessKey, endpoin
 	return &Store{client: client, bucket: bucket}, nil
 }
 
-// Key builds the S3 object key for one document — documents/{org_id}/{doc_id}/{filename},
-// matching WORKFLOW_PLAN_GO.md workflow 6's spec exactly (also namespaces
-// by org so two orgs uploading a same-named file never collide).
+// Key builds the S3 object key: documents/{org_id}/{doc_id}/{filename} —
+// namespaced by org so two orgs uploading a same-named file never collide.
 func Key(orgID, docID, filename string) string {
 	return fmt.Sprintf("documents/%s/%s/%s", orgID, docID, filename)
 }

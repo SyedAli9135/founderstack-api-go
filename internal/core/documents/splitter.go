@@ -2,19 +2,14 @@ package documents
 
 import "strings"
 
-// chunkSeparators is the cascade SplitText tries in order — paragraph
-// breaks first, then line breaks, then sentence-ish breaks, then plain
-// whitespace. Mirrors LangChain's RecursiveCharacterTextSplitter's
-// separator-cascade idea (there's no ready-made Go package for it, per
-// WORKFLOW_PLAN_GO.md workflow 6): try to keep whole paragraphs/sentences
-// together, only falling back to a cruder split when a piece is still
-// too big.
+// chunkSeparators is the cascade SplitText tries in order — paragraph,
+// line, sentence-ish, then plain whitespace — mirroring LangChain's
+// RecursiveCharacterTextSplitter: keep whole paragraphs/sentences
+// together, only falling back to a cruder split when a piece is too big.
 var chunkSeparators = []string{"\n\n", "\n", ". ", " "}
 
 const (
-	// DefaultChunkSize and DefaultChunkOverlap match workflow 6's spec:
-	// ~1024 characters per chunk, 128 characters of overlap between
-	// consecutive chunks so a fact split across a chunk boundary is
+	// 128 chars of overlap so a fact split across a chunk boundary is
 	// still findable from either side.
 	DefaultChunkSize    = 1024
 	DefaultChunkOverlap = 128
@@ -32,11 +27,10 @@ func SplitText(text string, chunkSize, chunkOverlap int) []string {
 }
 
 // splitRecursive breaks text on the first separator in seps, then
-// recurses into any resulting piece still longer than chunkSize using
-// the remaining separators. A piece with no separator left to try (fell
-// through the whole cascade — one very long word, e.g.) is returned
-// as-is, oversized: silently truncating it would drop content, which is
-// worse than one chunk running over the target size.
+// recurses into any resulting piece still longer than chunkSize using the
+// remaining separators. A piece that falls through the whole cascade (one
+// very long word) is returned as-is, oversized — truncating would drop
+// content, worse than a chunk running over target size.
 func splitRecursive(text string, seps []string, chunkSize int) []string {
 	if len(text) <= chunkSize || len(seps) == 0 {
 		return []string{text}
@@ -52,8 +46,7 @@ func splitRecursive(text string, seps []string, chunkSize int) []string {
 			continue
 		}
 		// Put the separator back (except after the last part) so
-		// mergePieces reproduces the original text's whitespace and
-		// punctuation instead of silently collapsing it away.
+		// mergePieces reproduces the original whitespace/punctuation.
 		if i < len(parts)-1 {
 			part += sep
 		}
@@ -66,10 +59,9 @@ func splitRecursive(text string, seps []string, chunkSize int) []string {
 	return out
 }
 
-// mergePieces greedily packs consecutive small pieces from splitRecursive
-// into chunks up to chunkSize (so a chunk isn't just "one paragraph" when
-// several short ones would fit together), carrying the last chunkOverlap
-// characters of each chunk into the start of the next.
+// mergePieces greedily packs consecutive small pieces into chunks up to
+// chunkSize (so a chunk isn't just "one paragraph" when several short ones
+// would fit), carrying the last chunkOverlap chars into the next chunk.
 func mergePieces(pieces []string, chunkSize, chunkOverlap int) []string {
 	var chunks []string
 	var current strings.Builder

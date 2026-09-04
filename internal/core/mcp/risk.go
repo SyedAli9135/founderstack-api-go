@@ -2,8 +2,8 @@ package mcp
 
 import gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
-// RiskLevel classifies how much latitude a tool call gets before the
-// graph engine's approval gate is required
+// RiskLevel gates how much latitude a tool call gets before the graph
+// engine's approval gate is required.
 type RiskLevel string
 
 const (
@@ -12,13 +12,9 @@ const (
 	RiskWriteDestructiveOrFinancial RiskLevel = "write_destructive_or_financial"
 )
 
-// RiskLevelFor derives a tool's RiskLevel from its MCP-protocol-native
-// ToolAnnotations (ReadOnlyHint/DestructiveHint) rather than a separate,
-// parallel classification scheme — every tool server in this codebase is
-// first-party and runs in-process, so the MCP spec's warning against
-// trusting a remote/untrusted server's self-reported annotations doesn't
-// apply: we wrote every annotation ourselves, at the same call site as
-// the tool's schema and handler.
+// RiskLevelFor reads MCP-native ToolAnnotations directly rather than a
+// parallel classification scheme — safe here since every server is
+// first-party and in-process, unlike the MCP spec's remote-server case.
 func RiskLevelFor(annotations *gomcp.ToolAnnotations) RiskLevel {
 	if annotations == nil {
 		return RiskWriteDestructiveOrFinancial
@@ -32,8 +28,6 @@ func RiskLevelFor(annotations *gomcp.ToolAnnotations) RiskLevel {
 	return RiskWriteReversible
 }
 
-// ReadOnly, ReversibleWrite, and DestructiveOrFinancial build the
-// *gomcp.ToolAnnotations value for each of the 3 RiskLevel tiers
 func ReadOnly() *gomcp.ToolAnnotations {
 	return &gomcp.ToolAnnotations{ReadOnlyHint: true}
 }

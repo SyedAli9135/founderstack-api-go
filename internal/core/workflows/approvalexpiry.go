@@ -13,21 +13,13 @@ import (
 	"github.com/founderstack/api/internal/db/dbgen"
 )
 
-// approvalExpiryInterval is deliberately tighter than the 24h window
-// itself being enforced —  spec calls
-// for a 5-minute sweep, matching that exactly (not reusing pollInterval,
-// which is workflow 8's own 60s spec for a different job).
+// 5-minute sweep per spec, not workflow 8's unrelated 60s pollInterval.
 const approvalExpiryInterval = 5 * time.Minute
 
-// RunApprovalExpiryJob sweeps pending approvals past their expires_at and
-// resumes the underlying run as a rejection — same time.Ticker shape as
-// RunScheduler/integrations.RunRefreshJob, on systemPool (BYPASSRLS) for
-// the same "sweeping across every org is inherently cross-tenant"
-// reasoning. Without the launcher.Resume call below, an expired approval
-// only flips its own approvals.status — the underlying workflow_runs row
-// stays stuck at 'awaiting_approval' forever, since nothing else ever
-// tells its state machine the wait is over (the real gap
-// WORKFLOW_PLAN_GO.md's Workflow 10 section calls out explicitly).
+// Without the launcher.Resume call below, an expired approval only flips
+// its own approvals.status — workflow_runs stays stuck at
+// 'awaiting_approval' forever, since nothing else tells its state
+// machine the wait is over.
 func RunApprovalExpiryJob(ctx context.Context, systemPool *pgxpool.Pool, launcher *graph.Launcher) {
 	expireApprovals(ctx, systemPool, launcher)
 

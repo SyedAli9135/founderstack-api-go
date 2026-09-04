@@ -8,16 +8,13 @@ import (
 	"time"
 )
 
-// httpClient is shared by every provider's plain REST calls (validate,
-// revoke, key-check) — a 10s timeout so a slow/hung third party can't
-// stall a request indefinitely; none of these calls are expected to take
-// more than a second or two in practice.
+// httpClient is shared by every provider's plain REST calls — a 10s
+// timeout so a slow/hung third party can't stall a request indefinitely.
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
-// bearerRequest issues method against url with an "Authorization: Bearer
-// token" header and returns an error unless the response status is 2xx —
-// the shared shape behind several providers' ValidateToken/RevokeToken,
-// none of which need to inspect a response body beyond that.
+// bearerRequest issues method against url with an Authorization: Bearer
+// header, erroring unless the response is 2xx. Shared by several
+// providers' ValidateToken/RevokeToken.
 func bearerRequest(ctx context.Context, method, url, token string) error {
 	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
@@ -28,8 +25,8 @@ func bearerRequest(ctx context.Context, method, url, token string) error {
 }
 
 // simpleRequest is bearerRequest without the Authorization header — for
-// the handful of endpoints (Google's revoke/tokeninfo) that take the
-// token as a query parameter instead of a Bearer header.
+// endpoints (Google's revoke/tokeninfo) that take the token as a query
+// param instead.
 func simpleRequest(ctx context.Context, method, url string) error {
 	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {

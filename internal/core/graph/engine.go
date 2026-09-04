@@ -28,8 +28,8 @@ type Engine struct {
 	cancels map[uuid.UUID]context.CancelFunc
 }
 
-// NewEngine builds an Engine against pool, which must be the app_user
-// (RLS-scoped) pool — every checkpoint write goes through tenant.WithTx, which requires it.
+// NewEngine builds an Engine. pool must be the app_user (RLS-scoped) pool —
+// checkpoint writes go through tenant.WithTx, which requires it.
 func NewEngine(pool *pgxpool.Pool) *Engine {
 	return &Engine{
 		pool:    pool,
@@ -38,15 +38,15 @@ func NewEngine(pool *pgxpool.Pool) *Engine {
 	}
 }
 
-// Run executes state's workflow starting at startNode. Callers must pass a
-// context detached from any HTTP request — context.Background(), not c.Request.Context()
+// Run executes state's workflow starting at startNode. ctx must be detached
+// from any HTTP request (context.Background(), not c.Request.Context()).
 func (e *Engine) Run(ctx context.Context, nodes Nodes, state *RunState, startNode NodeName) error {
 	return e.runFrom(ctx, nodes, state, startNode)
 }
 
 // Resume reloads runID's checkpoint, applies resumeData (an approval
-// decision), and continues execution from wherever the run suspended — the
-// interrupt()/thread_id replacement. Returns an error if the run has no resumable checkpoint
+// decision), and continues from wherever the run suspended. Errors if the
+// run has no resumable checkpoint.
 func (e *Engine) Resume(ctx context.Context, nodes Nodes, orgID, runID uuid.UUID, resumeData ResumeData) error {
 	state, currentNode, err := loadCheckpoint(ctx, e.pool, orgID, runID)
 	if err != nil {
@@ -74,8 +74,9 @@ func (e *Engine) Cancel(runID uuid.UUID) bool {
 	return true
 }
 
-// Checkpoint lets a node (or, once executor_node exists, its inner
-// tool-calling loop) persist state mid-node.
+// Checkpoint lets a node persist state mid-node (executorNode's inner
+// tool-calling loop checkpoints after every tool call, not just at
+// node transitions).
 func (e *Engine) Checkpoint(ctx context.Context, state *RunState, currentNode NodeName) error {
 	return checkpoint(ctx, e.pool, state, currentNode, "running")
 }
@@ -94,9 +95,7 @@ func (e *Engine) runFrom(ctx context.Context, nodes Nodes, state *RunState, node
 
 	for {
 		if err := ctx.Err(); err != nil {
-			// The checkpoint write itself must not inherit ctx's
-			// cancellation, or it would fail immediately — same reasoning
-			// pgx applies to any post-cancellation cleanup query.
+			// WithoutCancel: this checkpoint write must survive ctx's own cancellation.
 			_ = checkpoint(context.WithoutCancel(ctx), e.pool, state, node, "cancelled")
 			e.Bus.Publish(Event{Type: EventError, RunID: state.WorkflowRunID, Data: err.Error()})
 			return err
@@ -110,11 +109,9 @@ func (e *Engine) runFrom(ctx context.Context, nodes Nodes, state *RunState, node
 		e.Bus.Publish(Event{Type: EventNodeStart, RunID: state.WorkflowRunID, Data: NodeTransitionData{Node: string(node), AgentName: state.AgentName}})
 		next, err := fn(ctx, state)
 		if err != nil {
-			// A node blocked on ctx.Done() (e.g. an in-flight tool call)
-			// surfaces cancellation as its own returned error here, not via
-			// the top-of-loop ctx.Err() check above — classify by ctx.Err()
-			// at the time of return, not by whether err happens to be
-			// exactly context.Canceled, so a node that wraps it still counts.
+			// Classify by ctx.Err(), not err == context.Canceled — a node
+			// blocked on an in-flight call may wrap cancellation in its
+			// own error rather than return it bare.
 			status := "failed"
 			if ctx.Err() != nil {
 				status = "cancelled"

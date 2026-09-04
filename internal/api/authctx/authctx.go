@@ -7,10 +7,8 @@ import (
 
 const key = "authctx_user"
 
-// User is the local (not Clerk's) identity resolved for this request: our
-// own users/organizations rows, already checked active. OrgID is what
-// every tenant-scoped DB operation for this request should be run with,
-// via tenant.WithTx.
+// User is the local (not Clerk's) identity for this request. OrgID scopes
+// every tenant-scoped DB operation via tenant.WithTx.
 type User struct {
 	ID      pgtype.UUID
 	OrgID   pgtype.UUID

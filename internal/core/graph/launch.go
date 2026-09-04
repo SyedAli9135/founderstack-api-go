@@ -32,9 +32,7 @@ var (
 	ErrNoBYOKKey    = &PreflightError{Code: "NO_BYOK_KEY", Message: "organization has no active LLM provider key configured"}
 )
 
-// ChatClientResolver resolves a real ChatClient for one org's active
-// BYOK provider + one agent's configured model — the signature
-// llm.ResolveChatClient itself satisfies.
+// ChatClientResolver matches the signature llm.ResolveChatClient itself satisfies.
 type ChatClientResolver func(ctx context.Context, appPool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, provider llm.ProviderID, model string) (llm.ChatClient, error)
 
 // Launcher resolves everything one run needs (agent config, BYOK chat
@@ -49,25 +47,21 @@ type Launcher struct {
 	notifier          *notify.Notifier
 }
 
-// NewLauncher builds a Launcher against the real llm.ResolveChatClient.
-// appPool must be the app_user (RLS-enforced) pool — every DB operation
-// here goes through tenant.WithTx. notifier may be nil (RunDeps.Notifier
-// is nil-checked before use) — most tests don't exercise the approval-gate
-// notification path and don't need a real one.
+// NewLauncher builds a Launcher against llm.ResolveChatClient. appPool
+// must be the app_user (RLS-enforced) pool — every DB op goes through
+// tenant.WithTx. notifier may be nil (RunDeps.Notifier is nil-checked).
 func NewLauncher(engine *Engine, appPool *pgxpool.Pool, encryptionKey []byte, registry *coremcp.Registry, gateway *coremcp.Gateway, notifier *notify.Notifier) *Launcher {
 	return NewLauncherWithResolver(engine, appPool, encryptionKey, registry, gateway, notifier, llm.ResolveChatClient)
 }
 
-// NewLauncherWithResolver is NewLauncher with an injectable
-// ChatClientResolver — the constructor tests use to substitute a fake
-// resolver returning an llm.MockChatClient.
+// NewLauncherWithResolver is NewLauncher with an injectable resolver —
+// tests use it to substitute a fake returning llm.MockChatClient.
 func NewLauncherWithResolver(engine *Engine, appPool *pgxpool.Pool, encryptionKey []byte, registry *coremcp.Registry, gateway *coremcp.Gateway, notifier *notify.Notifier, resolveChatClient ChatClientResolver) *Launcher {
 	return &Launcher{engine: engine, appPool: appPool, encryptionKey: encryptionKey, registry: registry, gateway: gateway, notifier: notifier, resolveChatClient: resolveChatClient}
 }
 
-// Preflight checks the two fast-failing conditions before a run is even
-// queued: the org kill switch, and BYOK key presence. Called
-// synchronously by the HTTP handler, before it inserts the workflow_runs row
+// Preflight checks the org kill switch and BYOK key presence before a
+// run is queued — called synchronously, before the workflow_runs INSERT.
 func (l *Launcher) Preflight(ctx context.Context, orgID pgtype.UUID) error {
 	var settings dbgen.GetOrgRunSettingsRow
 	err := tenant.WithTx(ctx, l.appPool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
@@ -108,8 +102,8 @@ func (l *Launcher) Preflight(ctx context.Context, orgID pgtype.UUID) error {
 	return nil
 }
 
-// Launch resolves orgID/agentID's full RunDeps and runs the workflow in
-// a detached goroutine (context.Background(), never a caller's request context
+// Launch resolves RunDeps and runs the workflow in a detached goroutine
+// (context.Background(), never the caller's request context).
 func (l *Launcher) Launch(orgID, agentID, workflowID, runID uuid.UUID, input string) {
 	go func() {
 		ctx := context.Background()
@@ -147,9 +141,8 @@ func (l *Launcher) run(ctx context.Context, orgID, agentID, runID uuid.UUID, inp
 	return runErr
 }
 
-// Resume continues a run suspended at approval_gate — the same
-// dependency-resolution-then-drive-the-engine shape as Launch/run above,
-// just re-entering via Engine.Resume instead of Engine.Run.
+// Resume continues a run suspended at approval_gate — same
+// resolve-then-drive shape as Launch, but via Engine.Resume.
 func (l *Launcher) Resume(orgID, runID uuid.UUID, approved bool, reason string) {
 	go func() {
 		ctx := context.Background()
@@ -195,11 +188,9 @@ func (l *Launcher) resume(ctx context.Context, orgID, runID uuid.UUID, approved 
 	return resumeErr
 }
 
-// buildNodesForRun resolves everything one run/resume needs beyond
-// RunState itself — the agent's config, its BYOK chat client, and its
-// resolved tool catalog — shared by both run() and resume() so they stay
-// in lockstep (a run resumed after approval must see the exact same
-// tool/policy/model configuration it started with).
+// buildNodesForRun resolves the agent config, chat client, and tool
+// catalog shared by run() and resume() — kept in lockstep so a resumed
+// run sees the exact same tool/policy/model config it started with.
 func (l *Launcher) buildNodesForRun(ctx context.Context, orgPg, agentPg pgtype.UUID) (dbgen.GetAgentRow, Nodes, error) {
 	var agentRow dbgen.GetAgentRow
 	var settings dbgen.GetOrgRunSettingsRow
@@ -248,10 +239,9 @@ func (l *Launcher) buildNodesForRun(ctx context.Context, orgPg, agentPg pgtype.U
 	return agentRow, BuildNodes(deps), nil
 }
 
-// markRunFailedNoCheckpoint handles the pre-Engine.Run failure path —
-// dependency resolution errored before there was ever a checkpoint to
-// classify a status from, so this writes 'failed' directly rather than
-// going through checkpoint()'s NodeName-keyed machinery.
+// markRunFailedNoCheckpoint handles the pre-Engine.Run failure path: no
+// checkpoint exists yet to classify a status from, so this writes
+// 'failed' directly rather than through checkpoint()'s NodeName machinery.
 func markRunFailedNoCheckpoint(ctx context.Context, pool *pgxpool.Pool, orgID, runID pgtype.UUID) error {
 	return tenant.WithTx(ctx, pool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
 		return q.MarkRunFailedPreflight(ctx, dbgen.MarkRunFailedPreflightParams{OrgID: orgID, ID: runID})

@@ -192,10 +192,8 @@ func (h *Handler) Cancel(c *gin.Context) {
 		return
 	}
 
-	// Confirm the run belongs to this org before touching the in-memory
-	// cancel map — engine.Cancel takes a bare run_id with no org scoping
-	// of its own (it's process-wide, not RLS-scoped), so this lookup is
-	// what actually enforces tenant isolation for this endpoint.
+	// engine.Cancel is process-wide with no org scoping of its own — this lookup is what
+	// actually enforces tenant isolation here.
 	var exists bool
 	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		_, err := q.GetRunStatus(ctx, dbgen.GetRunStatusParams{OrgID: user.OrgID, ID: id})
@@ -278,10 +276,8 @@ func (h *Handler) Stream(c *gin.Context) {
 				return true // skip a malformed event, don't kill the stream over it
 			}
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, payload)
-			// A complete/error event is this run's natural end — no more
-			// events are coming for it, so close the stream instead of
-			// leaving the client waiting on an EventBus channel nothing
-			// will ever publish to again.
+			// Complete/error is the run's natural end — close rather than wait on a channel
+			// nothing will ever publish to again.
 			return ev.Type != graph.EventComplete && ev.Type != graph.EventError
 		}
 	})

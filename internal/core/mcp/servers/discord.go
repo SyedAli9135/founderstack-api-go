@@ -9,15 +9,11 @@ import (
 	mcp "github.com/founderstack/api/internal/core/mcp"
 )
 
-// NewDiscordServer builds the Discord MCP tool server — send_message
-// only. workflow 4 scoped Discord's OAuth to `identify` + `webhook.incoming`
-// (see internal/core/integrations/providers/discord.go), which grants
-// exactly one capability: posting through a single incoming webhook bound
-// to whichever channel the founder picked during the OAuth consent
-// screen. There is no channel-listing or general "post as this user" API
-// reachable from this grant — Discord's real messaging API needs a bot
-// token with guild permissions, which this integration was deliberately
-// not built to request. A list_channels tool would have nothing to call.
+// send_message only: this OAuth grant (identify + webhook.incoming) only
+// gives posting through one incoming webhook bound to whatever channel
+// the founder picked at consent — no channel-listing or general messaging
+// API is reachable without a bot token, which was deliberately not
+// requested.
 func NewDiscordServer() *gomcp.Server {
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "discord", Version: "1.0.0"}, nil)
 
@@ -52,10 +48,8 @@ func discordSendMessage(ctx context.Context, req *gomcp.CallToolRequest, in disc
 		return nil, discordSendMessageOutput{}, fmt.Errorf("discord: content is required")
 	}
 
-	// ?wait=true makes Discord return the created message (so we can
-	// report its id) instead of a bare 204 No Content. The webhook URL
-	// itself is the credential — Discord webhooks take no Authorization
-	// header at all, the token is embedded in the URL path.
+	// ?wait=true returns the created message instead of a bare 204. The
+	// webhook URL itself is the credential — no Authorization header.
 	httpReq, err := newRequestWithBody(ctx, "POST", webhookURL+"?wait=true", map[string]string{"content": in.Content})
 	if err != nil {
 		return nil, discordSendMessageOutput{}, err

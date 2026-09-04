@@ -1,6 +1,5 @@
-// Package identity holds small auth-adjacent utility endpoints — currently
-// just the dev-token minter, mirroring founderstack-api's
-// app/api/v1/endpoints/identity.py grouping under /api/v1/auth.
+// Package identity holds small auth-adjacent utility endpoints (currently
+// just the dev-token minter).
 package identity
 
 import (
@@ -13,9 +12,7 @@ import (
 	"github.com/founderstack/api/internal/pkg/devtoken"
 )
 
-// DevTokenHandler mints local test tokens for manual (Postman etc.)
-// testing — see internal/pkg/devtoken's doc comment for why this can't be
-// the simple "mint an unsigned JWT" trick the Python original uses.
+// DevTokenHandler mints local test tokens for manual testing.
 type DevTokenHandler struct {
 	cfg *config.Config
 }
@@ -33,12 +30,10 @@ type devTokenRequest struct {
 	ClerkUserID string `json:"clerk_user_id" binding:"required"`
 }
 
-// Create mints a token for clerk_user_id. Responds 404 (not 403 —
-// unauthenticated callers shouldn't learn this route exists at all) when
-// disabled: production, or DEV_TOKEN_SECRET unset. No check that
-// clerk_user_id refers to a real synced user — a mismatched one fails
-// exactly like a real Clerk token would, at middleware.RequireAuth's
-// USER_NOT_SYNCHRONIZED step, not here.
+// Create mints a token for clerk_user_id. Returns 404, not 403, when
+// disabled (production or DEV_TOKEN_SECRET unset) so the route's existence
+// isn't disclosed. Doesn't validate clerk_user_id — a bad one fails later
+// at RequireAuth like a real Clerk token would.
 func (h *DevTokenHandler) Create(c *gin.Context) {
 	if h.cfg.IsProduction() || h.cfg.DevTokenSecret.IsEmpty() {
 		response.Fail(c, http.StatusNotFound, "NOT_FOUND", "Not found")

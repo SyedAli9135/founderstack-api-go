@@ -14,15 +14,11 @@ import (
 // httptest server — same pattern as verify.go's geminiModelsURL.
 var geminiGenerateContentBaseURL = "https://generativelanguage.googleapis.com/v1beta/models"
 
-// GeminiChatClient implements ChatClient via a plain net/http call
-// against Google's generateContent API. Gets its own implementation
-// (not folded into OpenAICompatibleChatClient) for the same reason
-// verify.go's verifyGemini is separate from verifyOpenAICompatible: key
-// auth is a `?key=` query param, not a Bearer header, and — new here —
-// Gemini's tool-calling has no per-call ID concept at all, unlike
-// Anthropic/OpenAI, which both assign one. A function result is matched
-// back to its call by function *name*, not an ID, which is why
-// Message.Name (not just ToolCallID) exists on RoleTool messages.
+// GeminiChatClient implements ChatClient via a plain net/http call against
+// Google's generateContent API — its own implementation, not folded into
+// OpenAICompatibleChatClient, because key auth is a `?key=` query param
+// and Gemini's tool-calling has no per-call ID: a function result matches
+// back to its call by name, hence Message.Name on RoleTool messages.
 type GeminiChatClient struct {
 	apiKey string
 	model  string
@@ -125,9 +121,8 @@ func (c *GeminiChatClient) Send(ctx context.Context, systemPrompt string, messag
 		return ChatResponse{}, fmt.Errorf("%w: %w", ErrChatUnavailable, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		// Google returns 400, not 401/403, for a bad/invalid key — same
-		// quirk verify.go's verifyGemini already documents. classifyChatError
-		// already treats 400 as ErrChatRejected, so no special-casing needed.
+		// Google returns 400, not 401/403, for a bad key — classifyChatError
+		// already treats 400 as ErrChatRejected.
 		return ChatResponse{}, classifyChatError(resp.StatusCode, respBody)
 	}
 
@@ -158,9 +153,8 @@ func toGeminiContents(messages []Message) []geminiContent {
 			}
 			out = append(out, geminiContent{Role: "model", Parts: parts})
 		case RoleTool:
-			// Gemini has no per-call ID — a function result is matched
-			// back to its call by name, carried on Message.Name (not
-			// ToolCallID, which Gemini's wire format has no use for).
+			// Matched back to its call by Message.Name — Gemini's wire
+			// format has no use for ToolCallID.
 			response := map[string]any{"result": m.Content}
 			if m.IsError {
 				response = map[string]any{"error": m.Content}
@@ -201,13 +195,10 @@ func fromGeminiResponse(r geminiResponse) ChatResponse {
 			out.Content += part.Text
 		}
 		if part.FunctionCall != nil {
-			// Gemini assigns no call ID of its own — synthesize one
-			// (stable within this response) so the rest of the engine's
-			// generic ToolCall.ID-keyed machinery still works uniformly
-			// across providers. A RoleTool reply for this call must carry
-			// this same synthesized ID back on Message.ToolCallID (though
-			// Gemini's own adapter ignores it and matches by Message.Name
-			// instead — see toGeminiContents).
+			// Gemini assigns no call ID — synthesize one so the engine's
+			// generic ToolCall.ID-keyed machinery works uniformly across
+			// providers; this adapter itself matches replies by name (see
+			// toGeminiContents), not by this synthesized ID.
 			out.ToolCalls = append(out.ToolCalls, ToolCall{
 				ID:   "call_" + strconv.Itoa(callIndex),
 				Name: part.FunctionCall.Name,

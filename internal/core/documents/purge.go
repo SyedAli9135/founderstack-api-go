@@ -60,12 +60,9 @@ func (p *Processor) Purge(ctx context.Context, orgID, docID pgtype.UUID) error {
 	})
 }
 
-// retryOnce matches the Python original's actual behavior for this job
-// (see WORKFLOW_PLAN_GO.md workflow 6): try once, retry once on failure,
-// then give up — not a full retry loop with backoff. A transient
-// failure gets one more chance; a persistent one surfaces immediately
-// rather than retrying indefinitely against a genuinely broken
-// dependency.
+// retryOnce: try once, retry once on failure, then give up — not a full
+// backoff loop. A transient failure gets one more chance; a persistent one
+// surfaces immediately.
 func retryOnce(fn func() error) error {
 	if err := fn(); err == nil {
 		return nil

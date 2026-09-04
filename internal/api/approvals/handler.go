@@ -39,23 +39,14 @@ func NewHandler(appPool, systemPool *pgxpool.Pool, launcher *graph.Launcher, tok
 	}
 }
 
-// Register mounts the two read routes on rg — rg's group must already
-// have middleware.RequireAuth applied, same as every other authenticated
-// resource in this codebase.
+// Register mounts the two read routes; rg must already have middleware.RequireAuth applied.
 func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/approvals", h.List)
 	rg.GET("/approvals/:id", h.Get)
 }
 
-// RegisterActions mounts approve/reject on their own, deliberately
-// ungated group — each resolves its own actor via resolveActor, which
-// accepts either a normal Authorization: Bearer <Clerk JWT> (the in-app
-// ApprovalCard's path) or an ?action_token= query param (a push
-// notification's Approve/Reject button, which has no live Clerk session
-// to attach — see notify.ActionTokenSigner's doc comment). Mirrors
-// internal/api/integrations/handler.go's Register/RegisterCallback split
-// — a second, differently-authenticated route group for the same
-// resource is an established pattern in this codebase, not a new one.
+// RegisterActions is deliberately ungated: resolveActor also accepts ?action_token=,
+// since a push notification's action buttons carry no Clerk session.
 func (h *Handler) RegisterActions(rg *gin.RouterGroup) {
 	rg.POST("/approvals/:id/approve", h.Approve)
 	rg.POST("/approvals/:id/reject", h.Reject)
@@ -66,11 +57,8 @@ type approvalSummary struct {
 	RunID     string `json:"run_id"`
 	Status    string `json:"status"`
 	RiskLevel string `json:"risk_level"`
-	// ContextData is json.RawMessage, not []byte — a bare []byte field
-	// marshals as a base64 string (encoding/json's default for byte
-	// slices), which would silently hand founderstack-web a base64 blob
-	// instead of the tool-call array it expects. RawMessage's MarshalJSON
-	// passes the bytes through as literal JSON instead.
+	// json.RawMessage, not []byte — a bare []byte marshals as base64, not
+	// literal JSON.
 	ContextData json.RawMessage `json:"context_data"`
 	ExpiresAt   *string         `json:"expires_at,omitempty"`
 	CreatedAt   string          `json:"created_at"`
@@ -164,21 +152,15 @@ func (h *Handler) Get(c *gin.Context) {
 	response.OK(c, http.StatusOK, "Approval fetched", toSummary(row.ID, row.RunID, row.Status, row.RiskLevel, row.ContextData, row.ExpiresAt, row.CreatedAt))
 }
 
-// actor is the caller resolveActor identifies — either a real
-// authctx.User (Bearer path) or an action-token-verified user id (push
-// path). orgID always comes from a source the caller can't forge: the
-// authenticated user's own org, or the approval row's own org_id.
+// orgID always comes from a source the caller can't forge: the authenticated
+// user's own org, or the approval row's own org_id.
 type actor struct {
 	userID uuid.UUID
 	orgID  pgtype.UUID
 }
 
-// resolveActor tries the Authorization header first (the in-app
-// ApprovalCard always sends one), then ?action_token= (a push
-// notification's action buttons never can). Neither path trusts the
-// caller's claimed identity as authorization by itself — Approve/Reject
-// both re-check can_approve_workflows/expiry/agents_paused after this
-// returns, exactly like the authenticated path would.
+// resolveActor tries Authorization first, then ?action_token=. Neither path is trusted
+// as authorization by itself — Approve/Reject re-check permission/expiry/agents_paused after.
 func (h *Handler) resolveActor(c *gin.Context, approvalID pgtype.UUID) (actor, bool) {
 	ctx := c.Request.Context()
 
@@ -197,9 +179,7 @@ func (h *Handler) resolveActor(c *gin.Context, approvalID pgtype.UUID) (actor, b
 	}
 
 	if token := c.Query("action_token"); token != "" {
-		// The approval's own org_id is the source of truth here, looked
-		// up system-scoped since there's no tenant context yet to trust —
-		// see GetApprovalSystemScoped's doc comment.
+		// System-scoped: no tenant context exists yet to trust for org_id.
 		approval, err := dbgen.New(h.systemPool).GetApprovalSystemScoped(ctx, approvalID)
 		if err != nil {
 			response.Fail(c, http.StatusNotFound, "APPROVAL_NOT_FOUND", "Approval not found")
@@ -234,10 +214,8 @@ func (h *Handler) Reject(c *gin.Context) {
 	h.decide(c, false, req.Reason)
 }
 
-// decide is Approve/Reject's shared body: resolve actor -> re-check
-// permission/expiry/agents_paused -> UPDATE approvals (status='pending'
-// guard, so a double-click or a race with the expiry job can't double-
-// decide) -> INSERT approval_decisions -> audit log -> Launcher.Resume.
+// decide is Approve/Reject's shared body. The UPDATE guards on status='pending' so a
+// double-click or a race with the expiry job can't double-decide.
 func (h *Handler) decide(c *gin.Context, approved bool, reason string) {
 	id, ok := parseApprovalID(c)
 	if !ok {
@@ -314,10 +292,8 @@ func (h *Handler) decide(c *gin.Context, approved bool, reason string) {
 		response.Fail(c, http.StatusConflict, problem, "This approval has expired")
 		return
 	}
-	// Approving is exactly what lets a write_destructive_or_financial tool
-	// call execute — the org kill switch must block it here too, not just
-	// at POST .../run (workflow 9's Preflight only guards *starting* a new
-	// run, not resuming one already suspended).
+	// Approving lets a write_destructive_or_financial tool call execute, so the org kill
+	// switch must block it here too — Preflight only guards starting a new run, not resuming.
 	if approved && agentsPaused {
 		response.Fail(c, http.StatusForbidden, "AGENTS_PAUSED", "Agents are paused for this organization")
 		return
@@ -338,9 +314,7 @@ func (h *Handler) decide(c *gin.Context, approved bool, reason string) {
 			return err
 		}
 		if rowsAffected == 0 {
-			// Lost a race (double-click, or the expiry job beat us to it)
-			// — the pre-check above already confirmed 'pending' moments
-			// ago, but that's not a lock, so re-confirm atomically here.
+			// Lost a race (double-click, or the expiry job) — the pre-check wasn't a lock.
 			problem = "APPROVAL_ALREADY_DECIDED"
 			return nil
 		}

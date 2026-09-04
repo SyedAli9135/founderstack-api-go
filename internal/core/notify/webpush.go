@@ -10,21 +10,17 @@ import (
 	"github.com/founderstack/api/internal/pkg/secret"
 )
 
-// PushSubscription is the browser-side subscription this package needs to
-// deliver to — mirrors push_subscriptions' columns (internal/db/queries/approvals.sql).
+// Mirrors push_subscriptions' columns.
 type PushSubscription struct {
 	Endpoint  string
 	P256dhKey string
 	AuthKey   string
 }
 
-// PushPayload is the JSON body internal/core/notify/notify.go builds and
-// founderstack-web's public/sw.js's "push" event handler expects.
+// The JSON body founderstack-web's public/sw.js "push" handler expects.
 // ApproveURL/RejectURL are full, ready-to-POST URLs (already carrying
-// ?action_token=) rather than just the bare token — a static public/sw.js
-// file has no build-time access to NEXT_PUBLIC_API_URL the way the rest
-// of the frontend does, so the server builds the complete URL instead of
-// making the service worker reconstruct one.
+// ?action_token=), not bare tokens — a static sw.js has no build-time
+// access to NEXT_PUBLIC_API_URL, so the server builds the complete URL.
 type PushPayload struct {
 	Title      string `json:"title"`
 	Body       string `json:"body"`
@@ -33,10 +29,7 @@ type PushPayload struct {
 	RejectURL  string `json:"reject_url,omitempty"`
 }
 
-// WebPushSender wraps SherClockHolmes/webpush-go. NewWebPushSender returns
-// a sender whose SendToSubscription is a logged no-op when either VAPID
-// key is unset — same optional-third-party-config convention as
-// EmailSender's noopSender.
+// SendToSubscription is a logged no-op when either VAPID key is unset.
 type WebPushSender struct {
 	vapidPublicKey  string
 	vapidPrivateKey secret.Value

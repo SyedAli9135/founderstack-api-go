@@ -7,19 +7,16 @@ import (
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Registry holds one connected MCP client session per tool server,
-// keyed by the same service name internal/core/integrations uses
-// ("stripe", "slack", "github", "notion", "linkedin") — GetIntegrationToken
-// looks up credentials by that same string, so Gateway.ExecuteTool can
-// use one service name for both.
+// Registry holds one connected MCP client session per tool server, keyed
+// by the same service name internal/core/integrations uses so
+// Gateway.ExecuteTool can look up credentials and dispatch the call with
+// one name.
 type Registry struct {
 	sessions map[string]*gomcp.ClientSession
 }
 
 // NewRegistry connects one in-process client/server pair per entry in
-// servers. Servers must be connected before their paired client — see
-// mcp.NewInMemoryTransports' doc comment — so this does that connection
-// dance once, at startup, rather than lazily per call.
+// servers, once at startup rather than lazily per call.
 func NewRegistry(ctx context.Context, servers map[string]*gomcp.Server) (*Registry, error) {
 	sessions := make(map[string]*gomcp.ClientSession, len(servers))
 	for service, server := range servers {

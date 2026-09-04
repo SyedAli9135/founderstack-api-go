@@ -20,15 +20,11 @@ import (
 	"github.com/founderstack/api/internal/pkg/devtoken"
 )
 
-// JWKCache caches Clerk's JSON Web Keys by kid. Clerk's own docs recommend
-// caching and only invalidating when a replacement key is generated (i.e.
-// on an unrecognized kid) rather than fetching on every request — this is
-// exactly that, kept explicit rather than relying on undocumented internal
-// caching behavior in the SDK's higher-level helpers. Exported (was
-// package-private jwkCache) so internal/api/approvals' handler — the one
-// other call site that needs to verify a Clerk Bearer token outside
-// RequireAuth's own gin.HandlerFunc, for its dual auth-header-or-action-
-// token approve/reject endpoints — can hold its own cache instance.
+// JWKCache caches Clerk's JSON Web Keys by kid, per Clerk's own recommendation
+// (cache, invalidate only on an unrecognized kid) rather than fetching every
+// request. Exported so internal/api/approvals' handler — the other call site
+// verifying a Clerk Bearer token outside RequireAuth's gin.HandlerFunc — can
+// hold its own instance.
 type JWKCache struct {
 	mu   sync.RWMutex
 	keys map[string]*clerk.JSONWebKey
@@ -38,10 +34,9 @@ func NewJWKCache() *JWKCache {
 	return &JWKCache{keys: make(map[string]*clerk.JSONWebKey)}
 }
 
-// get returns the cached key for keyID, calling fetch only on a cache
-// miss. fetch is a parameter (rather than a hardcoded call to
-// jwt.GetJSONWebKey) so the cache's hit/miss behavior is unit-testable
-// without a real Clerk API call — see auth_test.go.
+// get calls fetch only on a cache miss. fetch is a parameter rather than a
+// hardcoded call to jwt.GetJSONWebKey so hit/miss behavior is testable
+// without a real Clerk API call.
 func (c *JWKCache) get(ctx context.Context, keyID string, fetch func(context.Context, string) (*clerk.JSONWebKey, error)) (*clerk.JSONWebKey, error) {
 	c.mu.RLock()
 	jwk, ok := c.keys[keyID]
@@ -62,27 +57,17 @@ func (c *JWKCache) get(ctx context.Context, keyID string, fetch func(context.Con
 
 // RequireAuth verifies the request's Clerk session JWT
 // (Authorization: Bearer <token>) and resolves it to a local user + org,
-// storing both on the context via authctx for handlers to read.
+// storing both on the context via authctx for handlers to read. Unlike the
+// Python original, which decodes the JWT with signature verification
+// turned off, this verifies it for real against Clerk's JWKS.
 //
-// Mirrors founderstack-api's get_current_user -> get_current_org dependency
-// chain: same two failure cases in the same order (user not synced to our
-// DB yet, then org missing/inactive), same messages. One deliberate
-// improvement over the Python original: that implementation explicitly
-// decodes the JWT with signature verification turned off
-// (jwt.decode(token, options={"verify_signature": False})); this verifies
-// it for real, against Clerk's JWKS, via the official clerk-sdk-go.
-//
-// systemPool must be app_system (BYPASSRLS) — resolving "which org does
-// this brand-new request belong to" has no org context yet to scope an
-// RLS-restricted query by, the same chicken-and-egg case as the webhook's
-// org creation. Once RequireAuth succeeds, handlers switch to app_user via
-// tenant.WithTx for their own tenant-scoped work — this middleware's use of
-// app_system stops at resolving identity, nothing more.
+// systemPool must be app_system (BYPASSRLS) — resolving which org a
+// brand-new request belongs to has no org context yet to RLS-scope by,
+// the same chicken-and-egg case as the webhook's org creation. Handlers
+// switch to app_user via tenant.WithTx once identity is resolved.
 //
 // When cfg.DevTokenSecret is set and !cfg.IsProduction(), a token that
-// fails real Clerk verification is retried against devtoken.Verify before
-// giving up — see that package's doc comment for why this exists as a
-// separate path rather than a weakened primary one.
+// fails real Clerk verification is retried against devtoken.Verify.
 func RequireAuth(systemPool *pgxpool.Pool, cfg *config.Config) gin.HandlerFunc {
 	cache := NewJWKCache()
 	q := dbgen.New(systemPool)
@@ -127,12 +112,11 @@ func fetchJWK(ctx context.Context, keyID string) (*clerk.JSONWebKey, error) {
 }
 
 // VerifyToken runs the real Clerk verification path, falling back to
-// devtoken.Verify exactly like RequireAuth always did, and returns the
-// token's subject (a clerk_user_id) on success. Exported so
-// internal/api/approvals' handler can verify the same Authorization
-// header its authenticated GET routes see, for its approve/reject
-// endpoints' Bearer-token path (the other path being a signed action
-// token, which isn't a Clerk JWT at all — see notify.ActionTokenSigner).
+// devtoken.Verify, and returns the token's subject (clerk_user_id) on
+// success. Exported so internal/api/approvals' handler can verify the same
+// Authorization header for its approve/reject Bearer-token path (the other
+// path being a signed action token, not a Clerk JWT — see
+// notify.ActionTokenSigner).
 func VerifyToken(ctx context.Context, cache *JWKCache, cfg *config.Config, token string) (string, error) {
 	clerkUserID, err := verifyClerkToken(ctx, cache, token)
 	if err != nil {
@@ -141,8 +125,7 @@ func VerifyToken(ctx context.Context, cache *JWKCache, cfg *config.Config, token
 	return clerkUserID, nil
 }
 
-// verifyClerkToken runs the real verification path and returns the
-// token's subject (a clerk_user_id) on success.
+// verifyClerkToken returns the token's subject (a clerk_user_id) on success.
 func verifyClerkToken(ctx context.Context, cache *JWKCache, token string) (string, error) {
 	unverified, err := jwt.Decode(ctx, &jwt.DecodeParams{Token: token})
 	if err != nil {
@@ -160,17 +143,14 @@ func verifyClerkToken(ctx context.Context, cache *JWKCache, token string) (strin
 }
 
 // errOrgNotFound distinguishes "no such user" from "user exists but their
-// org doesn't" for ResolveUser's caller — both are pgx.ErrNoRows from two
-// different queries, so this wraps the second one to keep them
-// distinguishable after ResolveUser returns a single error.
+// org doesn't" — both are pgx.ErrNoRows from two different queries, so this
+// wraps the second one to keep them distinguishable.
 var errOrgNotFound = errors.New("middleware: organization not found or inactive")
 
-// ResolveUser looks up clerkUserID's local user + org row and returns the
-// authctx.User RequireAuth stores on the request context — extracted so
-// internal/api/approvals' handler can resolve the same identity for its
-// Authorization-header auth path without duplicating these two dbgen
-// calls. Returns pgx.ErrNoRows when the user itself isn't
-// found/inactive, errOrgNotFound when the user's org isn't.
+// ResolveUser looks up clerkUserID's local user + org row. Extracted so
+// internal/api/approvals' handler can resolve the same identity without
+// duplicating these two dbgen calls. Returns pgx.ErrNoRows when the user
+// itself isn't found/inactive, errOrgNotFound when the user's org isn't.
 func ResolveUser(ctx context.Context, q *dbgen.Queries, clerkUserID string) (authctx.User, error) {
 	user, err := q.GetActiveUserByClerkUserID(ctx, clerkUserID)
 	if err != nil {
@@ -192,11 +172,9 @@ func ResolveUser(ctx context.Context, q *dbgen.Queries, clerkUserID string) (aut
 	}, nil
 }
 
-// devTokenFallback attempts devtoken.Verify — only ever reached after real
-// Clerk verification has already failed, and only does anything when
-// cfg.DevTokenSecret is configured and the process isn't running as
-// production. Both conditions false is the common case (most environments,
-// including every production one, should leave DEV_TOKEN_SECRET unset).
+// devTokenFallback only does anything when cfg.DevTokenSecret is configured
+// and the process isn't production — every real environment should leave
+// DEV_TOKEN_SECRET unset.
 func devTokenFallback(cfg *config.Config, token string) (string, error) {
 	if cfg.IsProduction() || cfg.DevTokenSecret.IsEmpty() {
 		return "", errors.New("dev token fallback not enabled")

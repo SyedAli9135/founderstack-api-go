@@ -21,7 +21,7 @@ type HealthHandler struct {
 }
 
 // NewHealthHandler builds a HealthHandler. pc may be nil — the Pinecone
-// check reports "skipped" rather than failing the overall health check when no API key is configured.
+// check then reports "skipped" instead of failing the overall status.
 func NewHealthHandler(db *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client) *HealthHandler {
 	return &HealthHandler{db: db, redis: rdb, pinecone: pc}
 }

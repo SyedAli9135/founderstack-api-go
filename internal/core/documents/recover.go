@@ -13,19 +13,16 @@ import (
 
 // stuckThreshold is how long a document must have sat in
 // pending/processing/deleting before RecoverStuckJobs assumes its
-// goroutine was lost (a process restart, e.g.) rather than genuinely
-// still running — generous enough that a document actively being
-// processed is never falsely re-kicked mid-job.
+// goroutine was lost (process restart) rather than genuinely still
+// running — generous enough to never falsely re-kick an active job.
 const stuckThreshold = 10 * time.Minute
 
-// RecoverStuckJobs runs once at startup (see cmd/api/main.go) and
-// re-dispatches any document whose processing or purge job was
-// abandoned by a process restart — the tradeoff that comes with plain
-// goroutines instead of a durable job queue (river, e.g.) for workflow
-// 6's background work; see WORKFLOW_PLAN_GO.md workflow 6 for why that
-// tradeoff was accepted. Runs on systemPool (BYPASSRLS): scanning across
-// every org's documents is inherently cross-tenant, same reasoning as
-// internal/core/integrations/refresh.go's RunRefreshJob.
+// RecoverStuckJobs runs once at startup and re-dispatches any document
+// whose processing/purge job was abandoned by a process restart — the
+// tradeoff of plain goroutines instead of a durable job queue for this
+// package's background work. Runs on systemPool (BYPASSRLS): scanning
+// across every org's documents is inherently cross-tenant, same reasoning
+// as integrations.RunRefreshJob.
 func (p *Processor) RecoverStuckJobs(ctx context.Context, systemPool *pgxpool.Pool) {
 	q := dbgen.New(systemPool)
 

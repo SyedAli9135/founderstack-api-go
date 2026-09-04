@@ -1,9 +1,7 @@
-// Package servers holds one file per MCP tool server (workflow 5) —
-// Stripe, Slack, GitHub, Notion, LinkedIn. Each exposes a constructor
-// (NewStripeServer, ...) returning a *mcp.Server ready for
-// internal/core/mcp.NewRegistry to connect. Every tool handler reads its
-// credential via mcp.TokenFromContext — never fetches or accepts one as
-// a tool argument. See internal/core/mcp's package doc for why.
+// Package servers holds one file per MCP tool server, each exposing a
+// constructor (NewStripeServer, ...) returning a *mcp.Server ready for
+// internal/core/mcp.NewRegistry to connect. Every handler reads its
+// credential via mcp.TokenFromRequest, never as a tool argument.
 package servers
 
 import (
@@ -22,20 +20,16 @@ import (
 )
 
 // toolCallMaxAttempts bounds retry-with-backoff for a transient tool-call
-// failure (rate limit, server error, network hiccup) — see
-// internal/core/mcp.ErrToolRetryable's doc comment for why this has to
-// live here, at the HTTP-call layer, rather than in the graph engine.
+// failure. Classification has to happen here, at the HTTP layer, not in
+// the graph engine — MCP flattens a handler's returned error before it
+// crosses the protocol boundary, so a sentinel wrapped there wouldn't
+// survive.
 const toolCallMaxAttempts = 3
 
-// retryBackoffBase is a var, not a const, purely so tests can shrink it
-// to near-zero and assert retry-count behavior without real sleeps —
-// same test-seam pattern as stripeAPIBase/geminiModelsURL elsewhere in
-// this codebase.
+// var, not const, so tests can shrink it to near-zero and assert
+// retry-count behavior without real sleeps.
 var retryBackoffBase = 300 * time.Millisecond
 
-// sleepBackoff waits attempt*retryBackoffBase before the next retry, or
-// returns false immediately if ctx is done — callers treat false as
-// "give up, don't retry."
 func sleepBackoff(ctx context.Context, attempt int) bool {
 	select {
 	case <-ctx.Done():
@@ -45,19 +39,12 @@ func sleepBackoff(ctx context.Context, attempt int) bool {
 	}
 }
 
-// httpClient is shared by every tool server's REST calls — same "don't
-// add a dependency a single HTTP call doesn't justify" reasoning already
-// applied to Stripe's ValidateKey (internal/core/integrations/providers/stripe.go)
-// and the 5-provider LLM verify calls (internal/core/llm/verify.go). 15s,
-// not 10s: unlike a cheap validation ping, some of these (Slack channel
-// listing, GitHub code search) can legitimately take a little longer.
+// 15s, not the usual 10s: some calls here (Slack channel listing, GitHub
+// code search) can legitimately take longer than a cheap validation ping.
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
-// newRequestWithBody builds a request, JSON-marshaling body onto it when
-// non-nil. Shared by every tool server here that needs provider-specific
-// headers beyond what doJSON sets (GitHub's Accept/API-Version, Notion's
-// Notion-Version) — those wrap this instead of duplicating the
-// marshal-and-build boilerplate.
+// newRequestWithBody is wrapped by servers needing headers beyond what
+// doJSON sets (GitHub's Accept/API-Version, Notion's Notion-Version).
 func newRequestWithBody(ctx context.Context, method, endpoint string, body any) (*http.Request, error) {
 	var reqBody io.Reader
 	if body != nil {
@@ -74,10 +61,8 @@ func newRequestWithBody(ctx context.Context, method, endpoint string, body any) 
 	return req, nil
 }
 
-// doJSON issues a Bearer-authed request with an optional JSON body and
-// decodes a JSON response into out (a pointer, or nil to discard the
-// body). Used by every tool server here except Stripe, which
-// authenticates with HTTP Basic instead of a Bearer header.
+// doJSON is used by every server except Stripe, which authenticates via
+// HTTP Basic instead of a Bearer header.
 func doJSON(ctx context.Context, method, endpoint, token string, body, out any) error {
 	req, err := newRequestWithBody(ctx, method, endpoint, body)
 	if err != nil {
@@ -91,19 +76,12 @@ func doJSON(ctx context.Context, method, endpoint, token string, body, out any) 
 	return doAndDecode(req, out)
 }
 
-// doStripeForm issues a Basic-auth request (Stripe's convention: secret
-// key as username, empty password) with an application/x-www-form-urlencoded
-// body — Stripe's write endpoints don't accept JSON. idempotencyKey, when
-// non-empty, is forwarded as Stripe's own native `Idempotency-Key` header
-// (https://docs.stripe.com/api/idempotent_requests) — Stripe recognizes a
-// retried request carrying the same key and returns the original result
-// instead of re-applying the effect, which is what actually protects
-// stripeCreateInvoice/stripeRefundPayment from double-executing if the
-// same logical tool call is ever retried (an approval batch
-// re-`Resume()`'d, a crash-recovery replay — see
-// internal/core/graph/nodes.go's idempotency-key computation, and
-// mcp.WithIdempotencyKey/IdempotencyKeyFromRequest for how the key
-// arrives here via `_meta`). Read-only calls pass "".
+// doStripeForm uses Basic auth (secret key as username, empty password)
+// and form-encoded bodies — Stripe's write endpoints don't accept JSON.
+// idempotencyKey, when non-empty, is forwarded as Stripe's native
+// Idempotency-Key header, which is what actually protects
+// stripeCreateInvoice/stripeRefundPayment from double-executing on a
+// retried call (approval Resume, crash replay). Read-only calls pass "".
 func doStripeForm(ctx context.Context, method, endpoint, apiKey, idempotencyKey string, form url.Values, out any) error {
 	var reqBody io.Reader
 	if form != nil {
@@ -124,16 +102,10 @@ func doStripeForm(ctx context.Context, method, endpoint, apiKey, idempotencyKey 
 }
 
 func doAndDecode(req *http.Request, out any) error {
-	// A network-level failure (httpClient.Do itself erroring) is
-	// ambiguous for a write: the request may have already landed
-	// server-side before the response was lost, so blindly retrying
-	// could double-execute a create/refund/delete. Only GET calls retry
-	// on that failure mode; a write's network error surfaces immediately
-	// as ErrToolRetryable (still classified correctly, just not
-	// auto-retried here) rather than being retried blind. An explicit
-	// 429/5xx *response* is unambiguous either way — the server rejected
-	// the request outright without applying it — so both reads and
-	// writes retry on that.
+	// A network-level failure is ambiguous for a write (the request may
+	// have already landed before the response was lost), so only GET
+	// retries on that; both retry on an explicit 429/5xx response, since
+	// that means the server rejected the request without applying it.
 	isWrite := req.Method != http.MethodGet
 
 	var lastErr error

@@ -14,16 +14,10 @@ import (
 // notionAPIBase is a var so notion_test.go can point it at a fake server.
 var notionAPIBase = "https://api.notion.com/v1"
 
-// notionAPIVersion is Notion's required, explicitly-versioned API
-// contract header — unlike most REST APIs here, Notion has no
-// content-negotiation fallback: omitting this header is itself a request
-// error, not just a risk of drift.
+// Notion has no content-negotiation fallback: omitting this header is
+// itself a request error, not just a risk of drift.
 const notionAPIVersion = "2022-06-28"
 
-// NewNotionServer builds the Notion MCP tool server (WORKFLOW_PLAN_GO.md
-// workflow 5) — read_page and write_page. Auth is a Bearer-prefixed
-// internal integration token, matching workflow 4's Notion OAuth connect
-// flow.
 func NewNotionServer() *gomcp.Server {
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "notion", Version: "1.0.0"}, nil)
 
@@ -42,11 +36,9 @@ func NewNotionServer() *gomcp.Server {
 	return server
 }
 
+// Wraps newRequestWithBody rather than teaching doJSON about one
+// provider's Notion-Version header.
 func doNotion(ctx context.Context, method, endpoint, token string, body, out any) error {
-	// doJSON's Bearer + JSON-body handling is exactly right for Notion;
-	// it just also needs the Notion-Version header, which doJSON has no
-	// reason to know about — set it via a wrapper rather than teaching
-	// the shared helper about one provider's header.
 	req, err := newRequestWithBody(ctx, method, endpoint, body)
 	if err != nil {
 		return err

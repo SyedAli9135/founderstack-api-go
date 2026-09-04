@@ -12,18 +12,12 @@ import (
 	"github.com/founderstack/api/internal/pkg/secret"
 )
 
-// EmailSender abstracts the one call this package needs — Send one plain
-// approval-notification email. brevoSender is the real implementation;
-// noopSender is what NewEmailSender returns when BREVO_API_KEY is unset,
-// so the app boots and runs fine with email simply not configured yet
-// (same "optional third-party client, degrade don't fail boot" convention
-// as every other secret in internal/config/config.go).
 type EmailSender interface {
 	Send(ctx context.Context, toEmail, subject, textBody string) error
 }
 
-// NewEmailSender picks brevoSender when apiKey/fromEmail are both set,
-// else noopSender.
+// noopSender degrades gracefully when BREVO_API_KEY/BREVO_FROM_EMAIL are
+// unset, so the app boots fine with email simply not configured yet.
 func NewEmailSender(apiKey secret.Value, fromEmail string) EmailSender {
 	if apiKey.IsEmpty() || fromEmail == "" {
 		return noopSender{}
@@ -42,11 +36,8 @@ func (noopSender) Send(ctx context.Context, toEmail, subject, textBody string) e
 	return nil
 }
 
-// brevoSender is a plain net/http POST to Brevo's transactional email API
-// — no SDK, matching this codebase's "don't add a dependency a single
-// REST call doesn't justify" policy (already applied to Stripe/Slack).
-// Chosen over SendGrid: SendGrid's free tier is now a 60-day trial only
-// ($19.95/mo after); Brevo has a genuinely free-forever tier (300/day).
+// Chosen over SendGrid: SendGrid's free tier is now a 60-day trial only;
+// Brevo has a genuinely free-forever tier (300/day).
 type brevoSender struct {
 	apiKey    secret.Value
 	fromEmail string

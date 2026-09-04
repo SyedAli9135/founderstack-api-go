@@ -13,12 +13,9 @@ import (
 	"github.com/founderstack/api/internal/core/integrations"
 )
 
-// toToken converts an *oauth2.Token (from Exchange or a refreshing
-// TokenSource) into our normalized integrations.Token. A zero Expiry
-// means "the provider didn't say" — treated the same as "never expires"
-// by tokenstore.go (a nil pgtype.Timestamptz), which is the correct
-// default: a provider that omits expires_in genuinely isn't telling us
-// when to refresh, so there is nothing to guess at.
+// toToken converts an *oauth2.Token into our normalized integrations.Token.
+// A zero Expiry ("provider didn't say") is treated as "never expires" by
+// tokenstore.go — there's nothing to guess at when expires_in is omitted.
 func toToken(t *oauth2.Token) *integrations.Token {
 	return &integrations.Token{
 		AccessToken:  t.AccessToken,
@@ -27,12 +24,9 @@ func toToken(t *oauth2.Token) *integrations.Token {
 	}
 }
 
-// refreshViaTokenSource is the shared Refreshable implementation for
-// every standard-OAuth2 provider (Google Drive, Google Calendar today):
-// golang.org/x/oauth2's TokenSource already knows how to exchange a
-// refresh token for a new access token against cfg's token endpoint, so
-// there's no need for each provider to hand-roll its own refresh HTTP
-// call.
+// refreshViaTokenSource is the shared Refreshable implementation for every
+// standard-OAuth2 provider — x/oauth2's TokenSource already knows how to
+// exchange a refresh token, so no provider hand-rolls its own refresh call.
 func refreshViaTokenSource(ctx context.Context, cfg *oauth2.Config, refreshToken string) (*integrations.Token, error) {
 	src := cfg.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken})
 	t, err := src.Token()
@@ -42,11 +36,9 @@ func refreshViaTokenSource(ctx context.Context, cfg *oauth2.Config, refreshToken
 	return toToken(t), nil
 }
 
-// revokeViaRFC7009 posts to revokeURL per RFC 7009 (token + client
-// credentials, form-encoded) — the shape Discord's, Google's, and
-// LinkedIn's revocation endpoints all accept. Not every provider's revoke
-// endpoint follows this shape (some use Basic auth + a JSON body
-// instead) — those implement their own, don't force-fit this helper.
+// revokeViaRFC7009 posts to revokeURL per RFC 7009 (Discord/Google/
+// LinkedIn's shape). Providers with a different revoke shape (Basic auth +
+// JSON) implement their own rather than force-fitting this helper.
 func revokeViaRFC7009(ctx context.Context, revokeURL, clientID, clientSecret, token string) error {
 	form := url.Values{
 		"token":         {token},

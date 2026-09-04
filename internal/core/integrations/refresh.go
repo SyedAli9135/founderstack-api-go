@@ -14,29 +14,19 @@ import (
 // soon-to-expire connections.
 const RefreshInterval = 30 * time.Minute
 
-// refreshWindow: a connection is refreshed once its token expires within
-// this long, not only once it has already expired — refreshing early
-// avoids a request failing mid-flight because the token happened to
-// expire between the last scan and the next one.
+// refreshWindow: refresh a token this long before it expires, not only
+// after — avoids a request failing mid-flight between scans.
 const refreshWindow = 10 * time.Minute
 
-// RunRefreshJob blocks, refreshing expiring OAuth connections every
-// RefreshInterval until ctx is cancelled. Intended to run in its own
-// goroutine, started once at startup (cmd/api/main.go) alongside the
-// HTTP server, cancelled on the same shutdown signal.
-//
-// Runs against systemPool (app_system, BYPASSRLS) — scanning expiring
-// connections across every org is inherently a cross-tenant system-context
-// operation, the same reasoning as the Clerk webhook's org creation and
-// this package's own ListExpiringConnectionsSystem query. Never uses
-// tenant.WithTx: there is no single org to scope this to.
+// RunRefreshJob refreshes expiring OAuth connections every RefreshInterval
+// until ctx is cancelled. Runs on systemPool (app_system, BYPASSRLS): scanning
+// across every org is cross-tenant, so tenant.WithTx doesn't apply.
 func RunRefreshJob(ctx context.Context, systemPool *pgxpool.Pool, encryptionKey []byte, registry *Registry) {
 	ticker := time.NewTicker(RefreshInterval)
 	defer ticker.Stop()
 
-	// Run once immediately rather than waiting a full interval after
-	// startup — a connection that expired while the process was down
-	// shouldn't have to wait up to RefreshInterval more to be caught.
+	// Catch anything that expired while the process was down, don't wait
+	// a full interval.
 	refreshExpiringConnections(ctx, systemPool, encryptionKey, registry)
 
 	for {
@@ -61,22 +51,15 @@ func refreshExpiringConnections(ctx context.Context, systemPool *pgxpool.Pool, e
 	for _, row := range rows {
 		provider, ok := registry.Get(row.ServiceName)
 		if !ok {
-			// A connection exists for a service no longer wired into the
-			// registry (e.g. removed from main.go but not yet cleaned up
-			// in the DB) — nothing this job can do about it; skip and
-			// leave the row for a human to investigate rather than
-			// guessing at expiring it.
+			// Service no longer registered (e.g. removed from main.go) —
+			// leave the row for a human, don't guess at expiring it.
 			continue
 		}
 		refresher, ok := provider.(Refreshable)
 		if !ok {
-			// Shouldn't happen — ListExpiringConnectionsSystem only
-			// returns rows with a token_expires_at set, and only
-			// Refreshable providers ever populate that column (see
-			// SaveConnection/toTimestamptz) — but a provider could in
-			// principle stop implementing Refreshable across a deploy
-			// while old rows still carry an expiry. Not this job's
-			// problem to resolve; skip.
+			// Shouldn't happen (only Refreshable providers ever set
+			// token_expires_at), but a provider could stop implementing
+			// it across a deploy while old rows still carry one.
 			continue
 		}
 
@@ -86,8 +69,7 @@ func refreshExpiringConnections(ctx context.Context, systemPool *pgxpool.Pool, e
 			continue
 		}
 		if tok.RefreshToken == "" {
-			// Nothing to refresh with — mark expired now rather than
-			// re-scanning this same row every 30 minutes forever.
+			// Nothing to refresh with — mark expired instead of rescanning forever.
 			if _, err := q.MarkConnectionExpiredByIDSystem(ctx, row.ID); err != nil {
 				slog.Error("integrations: mark expired (no refresh token)", "service", row.ServiceName, "org_id", row.OrgID, "error", err)
 			}
@@ -102,9 +84,8 @@ func refreshExpiringConnections(ctx context.Context, systemPool *pgxpool.Pool, e
 			}
 			continue
 		}
-		// A refresh response never re-sends provider-specific Extra
-		// fields — preserve what the connection already had, same
-		// reasoning as the Status handler's manual refresh path.
+		// A refresh response never re-sends provider-specific Extra — preserve
+		// what the connection already had.
 		if newTok.Extra == nil {
 			newTok.Extra = tok.Extra
 		}

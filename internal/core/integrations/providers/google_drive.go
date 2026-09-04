@@ -11,10 +11,8 @@ import (
 )
 
 // driveFileScope is deliberately drive.file, not drive/drive.readonly —
-// per-file access (only files this app creates or the founder explicitly
-// opens with it) keeps this out of Google's "restricted scope" bucket and
-// avoids the paid CASA security assessment full Drive access requires.
-// See WORKFLOW_PLAN_GO.md's workflow 4 implementation note.
+// per-file access keeps this out of Google's "restricted scope" bucket
+// and avoids the paid CASA security assessment full Drive access requires.
 const driveFileScope = "https://www.googleapis.com/auth/drive.file"
 
 type GoogleDrive struct {
@@ -35,10 +33,9 @@ func (g *GoogleDrive) Name() string { return "google_drive" }
 
 func (g *GoogleDrive) GetAuthURL(state string) string {
 	// AccessTypeOffline + ApprovalForce: without both, Google only issues a
-	// refresh_token on a user's *first* authorization ever for this
-	// app+scope combination — a founder reconnecting after a revoke would
-	// silently get an access-only token with nothing for the refresh job
-	// to renew it with.
+	// refresh_token on a user's first-ever authorization for this app+scope
+	// — a reconnect-after-revoke would silently get a token the refresh job
+	// can't renew.
 	return g.cfg.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.ApprovalForce)
 }
 

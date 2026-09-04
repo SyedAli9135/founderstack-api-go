@@ -15,28 +15,22 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// stateTTL bounds how long a founder has between clicking "Connect" and
-// completing the provider's authorization page before the state (and the
-// org_id/service it carries) is forgotten and the callback 400s.
+// stateTTL bounds how long a founder has to complete the provider's
+// authorization page before the callback 400s.
 const stateTTL = 10 * time.Minute
 
 var (
-	// ErrStateInvalid means the state string is malformed or its HMAC
-	// signature doesn't match — either a forged/tampered value, or one
-	// signed under a different (e.g. rotated) OAUTH_STATE_SECRET.
+	// ErrStateInvalid: malformed or forged (HMAC mismatch / rotated secret).
 	ErrStateInvalid = errors.New("integrations: malformed or forged oauth state")
-	// ErrStateExpired means the signature checked out but no matching
-	// entry exists in Redis anymore — it already expired (>10 min) or was
-	// already consumed by an earlier callback (one-time use).
+	// ErrStateExpired: signature valid but no Redis entry — TTL'd out or
+	// already consumed (one-time use).
 	ErrStateExpired = errors.New("integrations: oauth state missing or expired")
 )
 
-// StateManager mints and verifies the CSRF-protecting `state` parameter
-// used on every OAuth authorize URL. A callback request carries no JWT
-// (the provider redirects the browser here directly), so org_id and
-// service must be recoverable from the state itself — Redis is the
-// source of truth for that; the HMAC signature only proves the state
-// wasn't tampered with in transit, not what it means.
+// StateManager mints/verifies the CSRF `state` param. A callback carries no
+// JWT (the provider redirects the browser directly), so org_id/service must
+// be recovered from the state — Redis holds them; the HMAC only proves the
+// state wasn't tampered with.
 type StateManager struct {
 	rdb    *redis.Client
 	secret string
@@ -53,8 +47,8 @@ type stateValue struct {
 	Service string `json:"service"`
 }
 
-// Generate mints a one-time state token for orgID/service and records
-// them in Redis under it, keyed by a fresh random nonce.
+// Generate mints a one-time state token for orgID/service, recorded in
+// Redis under a fresh random nonce.
 func (s *StateManager) Generate(ctx context.Context, orgID, service string) (string, error) {
 	nonceBytes := make([]byte, 32)
 	if _, err := rand.Read(nonceBytes); err != nil {
@@ -73,11 +67,9 @@ func (s *StateManager) Generate(ctx context.Context, orgID, service string) (str
 	return nonce + "." + s.sign(nonce), nil
 }
 
-// Verify checks state's signature, then looks up and immediately deletes
-// its Redis entry (one-time use — a replayed callback with the same
-// state fails with ErrStateExpired on its second attempt, not just its
-// first). Signature verification runs before any Redis call so a
-// garbage/forged state costs nothing but CPU.
+// Verify checks the signature first (a forged state costs only CPU, no
+// Redis call), then deletes the entry on lookup so a replay 2nd-attempt
+// fails with ErrStateExpired.
 func (s *StateManager) Verify(ctx context.Context, state string) (orgID, service string, err error) {
 	nonce, sig, ok := strings.Cut(state, ".")
 	if !ok || nonce == "" || sig == "" {
@@ -95,9 +87,7 @@ func (s *StateManager) Verify(ctx context.Context, state string) (orgID, service
 		}
 		return "", "", fmt.Errorf("integrations: fetch oauth state: %w", err)
 	}
-	// Best-effort: if the delete itself fails, the entry still expires via
-	// its own TTL, and the HMAC check above already stops it being reused
-	// to forge a *different* request — this isn't the security boundary.
+	// Best-effort delete: the entry still expires via its own TTL either way.
 	_ = s.rdb.Del(ctx, key).Err()
 
 	var v stateValue

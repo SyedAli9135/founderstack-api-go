@@ -15,13 +15,6 @@ import (
 // fake server.
 var calendarAPIBase = "https://www.googleapis.com/calendar/v3"
 
-// NewGoogleCalendarServer builds the Google Calendar MCP tool server —
-// list_events and create_event, both against the founder's primary
-// calendar. workflow 4 granted the `calendar.events` scope (see
-// internal/core/integrations/providers/google_calendar.go), which is
-// event-level read/write on calendars the founder already has access
-// to — no calendar-creation/sharing capability, which these 2 tools
-// don't need anyway.
 func NewGoogleCalendarServer() *gomcp.Server {
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "google_calendar", Version: "1.0.0"}, nil)
 

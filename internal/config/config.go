@@ -19,10 +19,9 @@ type Config struct {
 	AppBaseURL  string `mapstructure:"APP_BASE_URL"`
 	FrontendURL string `mapstructure:"FRONTEND_URL"`
 
-	// Database. DatabaseURL connects as the postgres superuser — used by the
-	// migrate CLI (via the Makefile) to run schema migrations, and RLS never
-	// applies to it. AppDatabaseURL is what the API server itself connects
-	// with (the restricted, RLS-enforced app_user role)
+	// DatabaseURL connects as the postgres superuser (migrate CLI, RLS
+	// exempt). AppDatabaseURL is the restricted, RLS-enforced app_user role
+	// the API server itself connects with.
 	DatabaseURL       string `mapstructure:"DATABASE_URL"`
 	AppDatabaseURL    string `mapstructure:"APP_DATABASE_URL"`
 	SystemDatabaseURL string `mapstructure:"SYSTEM_DATABASE_URL"`
@@ -71,52 +70,37 @@ type Config struct {
 	// Security
 	EncryptionKey    secret.Value `mapstructure:"ENCRYPTION_KEY"`
 	OAuthStateSecret secret.Value `mapstructure:"OAUTH_STATE_SECRET"`
-	// APIKeyMockPrefix short-circuits BYOK key validation (internal/core/llm)
-	// to success without a network call, for local dev/tests. One prefix
-	// shared across all 5 llm.Catalog providers rather than one env var per
-	// provider — see internal/core/llm/llm.go's validateKey doc comment for
-	// why a single mock prefix can satisfy every provider despite their
-	// differing real key formats.
+	// APIKeyMockPrefix short-circuits BYOK key validation to success without
+	// a network call, for local dev/tests — one prefix shared across all 5
+	// llm.Catalog providers rather than one env var each.
 	APIKeyMockPrefix string `mapstructure:"API_KEY_MOCK_PREFIX"`
 
-	// DevTokenSecret signs POST /api/v1/auth/dev-token's local test JWTs
-	// and is the only thing RequireAuth accepts them against — deliberately
-	// optional (not in requiredFields): most environments, including
-	// production, should simply leave it unset, which disables the dev
-	// token fallback path entirely rather than requiring it be configured.
+	// DevTokenSecret signs local test JWTs for POST /api/v1/auth/dev-token.
+	// Deliberately optional (not in requiredFields) — unset disables the
+	// dev token fallback path entirely.
 	DevTokenSecret secret.Value `mapstructure:"DEV_TOKEN_SECRET"`
 
 	// MockLLMMode swaps every workflow run's real BYOK ChatClient for a
-	// scripted llm.MockScenarioResolver (see that file's doc comment for
-	// the full scenario catalog) and enables a dev-only approval-resume
-	// debug route — lets a founder exercise the whole agent execution
-	// engine (guardrails, approval suspend/resume, SSE events) against
-	// real Postgres with zero live LLM provider calls, for exactly the
-	// "I don't have a real API key yet" situation. Same deliberately-
-	// optional, never-in-production pattern as DevTokenSecret above —
-	// main.go additionally asserts !cfg.IsProduction() before honoring
-	// this, so a misconfigured production environment can't silently run
-	// every agent against canned responses instead of a real model.
+	// scripted llm.MockScenarioResolver and enables a dev-only
+	// approval-resume debug route, for exercising the agent execution
+	// engine with zero live LLM calls. main.go additionally asserts
+	// !cfg.IsProduction() before honoring this.
 	MockLLMMode bool `mapstructure:"MOCK_LLM_MODE"`
 
-	// (approval-gate notifications) — all 6 deliberately
-	// optional (not in requiredFields), same "app boots fine, the feature
-	// degrades to a logged no-op" convention as every other third-party
-	// secret above. BrevoAPIKey, not SendGrid: SendGrid's free tier is now
-	// a 60-day trial only; Brevo has a genuinely free-forever tier and
-	// needs no SDK (internal/core/notify/email.go is a plain net/http
-	// call). WebPushVAPIDPublicKey is intentionally not a secret.Value —
-	// it's shipped to the frontend as-is.
+	// Approval-gate notifications — all 6 deliberately optional, same
+	// "degrades to a logged no-op" convention as other third-party
+	// secrets. BrevoAPIKey, not SendGrid: Brevo has a free-forever tier.
+	// WebPushVAPIDPublicKey isn't a secret.Value — it ships to the frontend
+	// as-is.
 	BrevoAPIKey            secret.Value `mapstructure:"BREVO_API_KEY"`
 	BrevoFromEmail         string       `mapstructure:"BREVO_FROM_EMAIL"`
 	WebPushVAPIDPublicKey  string       `mapstructure:"WEBPUSH_VAPID_PUBLIC_KEY"`
 	WebPushVAPIDPrivateKey secret.Value `mapstructure:"WEBPUSH_VAPID_PRIVATE_KEY"`
 	WebPushVAPIDSubject    string       `mapstructure:"WEBPUSH_VAPID_SUBJECT"`
-	// PushActionTokenSecret signs the single-purpose action tokens embedded
-	// in a push notification's payload (internal/core/notify/actiontoken.go)
-	// so its Approve/Reject buttons work without opening the app — a
-	// dedicated secret, not reused from OAuthStateSecret, to contain blast
-	// radius between the two unrelated signing use cases.
+	// PushActionTokenSecret signs the single-purpose action tokens in a push
+	// notification's payload so its Approve/Reject buttons work without
+	// opening the app — dedicated, not reused from OAuthStateSecret, to
+	// contain blast radius between the two signing use cases.
 	PushActionTokenSecret secret.Value `mapstructure:"PUSH_ACTION_TOKEN_SECRET"`
 }
 

@@ -9,18 +9,12 @@ import (
 	mcp "github.com/founderstack/api/internal/core/mcp"
 )
 
-// slackAPIBase is a var so slack_test.go can point it at a fake server —
-// see stripe.go's stripeAPIBase for the same reasoning.
 var slackAPIBase = "https://slack.com/api"
 
-// NewSlackServer builds the Slack MCP tool server (WORKFLOW_PLAN_GO.md
-// workflow 5) — send_message (the agent posts daily briefs here) and
-// list_channels. Slack's Web API returns HTTP 200 even on a failed call,
-// with {"ok": false, "error": "..."} in the body — doJSON's status-code
-// check alone would miss that, so every response here is decoded into a
-// struct embedding slackEnvelope and checked via checkSlackOK. Same
-// quirk internal/core/integrations/providers/slack.go's OAuth exchange
-// already had to handle.
+// Slack's Web API returns HTTP 200 even on a failed call, with
+// {"ok": false, "error": "..."} in the body — doJSON's status check alone
+// would miss that, so every response here embeds slackEnvelope and is
+// checked via checkSlackOK.
 func NewSlackServer() *gomcp.Server {
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "slack", Version: "1.0.0"}, nil)
 
@@ -39,8 +33,6 @@ func NewSlackServer() *gomcp.Server {
 	return server
 }
 
-// slackEnvelope is embedded in every Slack API response struct — every
-// Slack Web API call, success or failure, carries this shape.
 type slackEnvelope struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`

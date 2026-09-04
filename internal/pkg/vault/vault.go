@@ -1,13 +1,9 @@
-// Package vault encrypts secrets (BYOK Anthropic keys, OAuth tokens) for
-// storage at rest, using AES-256-GCM against ENCRYPTION_KEY.
-//
-// This key is reused from founderstack-api's Fernet key: base64-decoded,
-// a Fernet key is exactly the 32 raw bytes AES-256 needs. The two
-// backends' encrypted values are NOT byte-compatible — Fernet's envelope
-// format (version byte, timestamp, IV, HMAC) differs from GCM's (nonce +
-// ciphertext + auth tag) — only the key material is shared. A value
-// encrypted by founderstack-api cannot be decrypted here, and vice versa;
-// this is a re-encryption of the vault, not a byte-compatible port.
+// Package vault encrypts secrets (BYOK keys, OAuth tokens) for storage at
+// rest, using AES-256-GCM against ENCRYPTION_KEY — reused from
+// founderstack-api's Fernet key (base64-decoded, exactly the 32 raw bytes
+// AES-256 needs). The two backends' encrypted values are NOT
+// byte-compatible — Fernet's envelope differs from GCM's — only the key
+// material is shared.
 package vault
 
 import (

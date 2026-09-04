@@ -15,7 +15,6 @@ import (
 	"github.com/founderstack/api/internal/core/integrations"
 )
 
-// Handler implements integration-connection endpoints.
 type Handler struct {
 	appPool       *pgxpool.Pool
 	encryptionKey []byte
@@ -24,9 +23,7 @@ type Handler struct {
 	frontendURL   string
 }
 
-// NewHandler builds a Handler. registry must already be wired with one
-// provider per non-callback catalog entry —
-// Register itself never imports internal/core/integrations/providers.
+// registry must already be wired with one provider per catalog entry.
 func NewHandler(appPool *pgxpool.Pool, encryptionKey []byte, registry *integrations.Registry, stateManager *integrations.StateManager, frontendURL string) *Handler {
 	return &Handler{
 		appPool:       appPool,
@@ -37,8 +34,7 @@ func NewHandler(appPool *pgxpool.Pool, encryptionKey []byte, registry *integrati
 	}
 }
 
-// Register mounts the 4 authenticated routes on rg. rg's group must
-// already have middleware.RequireAuth applied.
+// rg must already have middleware.RequireAuth applied.
 func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("", h.ListIntegrations)
 	rg.POST("/:service/connect", h.Connect)
@@ -46,10 +42,8 @@ func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/:service/status", h.Status)
 }
 
-// RegisterCallback mounts the one unauthenticated route on rg — the
-// OAuth provider redirects the founder's browser here directly, with no
-// JWT attached, so org_id/service come from state.StateManager.Verify
-// instead of authctx.
+// Deliberately unauthenticated: the OAuth provider redirects the browser here directly
+// with no JWT, so org_id/service come from state.StateManager.Verify instead of authctx.
 func (h *Handler) RegisterCallback(rg *gin.RouterGroup) {
 	rg.GET("/:service/callback", h.Callback)
 }
@@ -64,8 +58,6 @@ type integrationView struct {
 	Scopes      []string `json:"scopes,omitempty"`
 }
 
-// ListIntegrations merges the static catalog with the org's actual
-// connections — GET /api/v1/integrations.
 func (h *Handler) ListIntegrations(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -109,21 +101,11 @@ func (h *Handler) ListIntegrations(c *gin.Context) {
 const timeFormat = "2006-01-02T15:04:05Z07:00"
 
 type connectRequest struct {
-	// Key is only used for api_key/pat services — absent (or ignored) for
-	// oauth ones, which don't take a body at all.
-	Key string `json:"key"`
+	Key string `json:"key"` // only used for api_key/pat services; oauth ones ignore the body
 }
 
-// Connect connects a service — POST /api/v1/integrations/{service}/connect.
-// One endpoint for both auth shapes, dispatching on the catalog's
-// AuthType, matching founderstack-api's actual wire contract exactly
-// (see founderstack-api/app/api/v1/endpoints/integrations.py's
-// connect_integration): oauth services return a redirect_url; api_key/pat
-// services validate and store the key from the request body. This was
-// briefly split into a separate POST .../api-key route during the initial
-// Go build — that deviated from the real contract founderstack-web is
-// built against (it always posts here, never to a separate route), so it
-// was merged back.
+// One endpoint for both auth shapes, dispatching on the catalog's AuthType — matches
+// founderstack-web's actual call path, which always posts here regardless of auth type.
 func (h *Handler) Connect(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -184,9 +166,7 @@ func (h *Handler) Connect(c *gin.Context) {
 	response.OK(c, http.StatusOK, "", gin.H{"status": "connected"})
 }
 
-// Callback completes an OAuth flow — GET /api/v1/integrations/{service}/callback.
-// No RequireAuth: the provider redirects the browser here directly with
-// no JWT, so org_id/service are recovered from state, not authctx.
+// No RequireAuth: org_id/service are recovered from state, not authctx.
 func (h *Handler) Callback(c *gin.Context) {
 	service := c.Param("service")
 	code := c.Query("code")
@@ -248,8 +228,6 @@ func (h *Handler) Callback(c *gin.Context) {
 	c.Redirect(http.StatusFound, h.frontendURL+"/integrations?connected="+service)
 }
 
-// Disconnect revokes (best-effort) and deactivates a connection —
-// DELETE /api/v1/integrations/{service}.
 func (h *Handler) Disconnect(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -269,9 +247,7 @@ func (h *Handler) Disconnect(c *gin.Context) {
 		if provider, ok := h.registry.Get(service); ok {
 			if revocable, ok := provider.(integrations.Revocable); ok {
 				if err := revocable.RevokeToken(ctx, conn.Token.AccessToken); err != nil {
-					// Best-effort: the provider being unreachable or already
-					// having invalidated the token shouldn't block the founder
-					// from disconnecting on their end.
+					// Best-effort: an unreachable provider shouldn't block local disconnect.
 					slog.Warn("integration revoke failed, deactivating locally anyway", "service", service, "error", err)
 				}
 			}
@@ -290,8 +266,6 @@ type statusResponse struct {
 	Status string `json:"status"`
 }
 
-// Status re-validates a connection (refreshing if possible) —
-// GET /api/v1/integrations/{service}/status.
 func (h *Handler) Status(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -312,11 +286,8 @@ func (h *Handler) Status(c *gin.Context) {
 		return
 	}
 	if !conn.IsActive {
-		// Explicitly revoked (DELETE .../{service}) — report that as-is
-		// rather than asking the provider to validate a token the founder
-		// already disconnected. A provider whose ValidateToken doesn't
-		// itself detect revocation (not guaranteed for every API) would
-		// otherwise report "connected" again here.
+		// Report the stored status as-is rather than validating a token the founder already
+		// disconnected — not every provider's ValidateToken detects revocation.
 		response.OK(c, http.StatusOK, "", statusResponse{Status: conn.OAuthStatus})
 		return
 	}
@@ -328,8 +299,7 @@ func (h *Handler) Status(c *gin.Context) {
 	}
 	validator, ok := provider.(integrations.TokenValidator)
 	if !ok {
-		// No cheap "is this still good" call for this provider — report
-		// whatever mcp_connections already says rather than guessing.
+		// No cheap validity check for this provider — report the stored status.
 		response.OK(c, http.StatusOK, "", statusResponse{Status: conn.OAuthStatus})
 		return
 	}
@@ -342,8 +312,7 @@ func (h *Handler) Status(c *gin.Context) {
 	if refresher, ok := provider.(integrations.Refreshable); ok && conn.Token.RefreshToken != "" {
 		newTok, err := refresher.RefreshAccessToken(ctx, conn.Token.RefreshToken)
 		if err == nil {
-			// A refresh response never re-sends provider-specific Extra
-			// fields — preserve whatever the existing connection already had.
+			// A refresh response never re-sends provider-specific Extra fields.
 			if newTok.Extra == nil {
 				newTok.Extra = conn.Token.Extra
 			}

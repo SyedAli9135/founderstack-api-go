@@ -32,29 +32,23 @@ const (
 	minSystemPromptLen     = 50
 )
 
-// Handler implements the 6 agent-configuration endpoints (5 CRUD + the
-// available-tools listing the create/edit forms populate their multi-select
-// from).
+// Handler implements agent-configuration CRUD plus the available-tools
+// listing the create/edit forms populate their multi-select from.
 type Handler struct {
 	appPool  *pgxpool.Pool
 	registry *coremcp.Registry
 }
 
 // NewHandler builds a Handler. appPool must be the app_user (RLS-enforced)
-// pool — every DB operation here goes through tenant.WithTx, never a bare
-// query. MCP tool registry, used read-only here
-// (ListTools) to validate policy_scope.allowed_tools and to populate
-// GET .../agents/tools — never to execute a tool
+// pool. registry is used read-only, to validate policy_scope.allowed_tools
+// and populate GET .../agents/tools.
 func NewHandler(appPool *pgxpool.Pool, registry *coremcp.Registry) *Handler {
 	return &Handler{appPool: appPool, registry: registry}
 }
 
-// Register mounts all 6 routes on rg. rg's group must already have
-// middleware.RequireAuth applied. "/agents/tools" is registered before
-// "/agents/:id" only for readability — Gin's router already prefers an
-// exact static match over a param segment regardless of registration
-// order, the same way internal/api/integrations layers static suffixes
-// (".../status", ".../callback") after a shared ":service" param.
+// Register mounts all 6 routes on rg, which must already have
+// middleware.RequireAuth applied. Registration order doesn't matter —
+// Gin prefers an exact static match over a param segment either way.
 func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/agents", h.List)
 	rg.POST("/agents", h.Create)
@@ -87,18 +81,13 @@ type agentView struct {
 	Version             int32           `json:"version"`
 	CreatedAt           time.Time       `json:"created_at"`
 	UpdatedAt           time.Time       `json:"updated_at"`
-	// WorkflowCount (workflow 8) is only populated by List/Get — a
-	// freshly created or updated agent can't have any workflows pointing
-	// at it yet within the same request, so Insert/Update always report 0
-	// rather than needing their own extra query.
+	// Only List/Get populate this — a just-created/updated agent can't
+	// have workflows yet, so Insert/Update report 0 without an extra query.
 	WorkflowCount int64 `json:"workflow_count"`
 }
 
-// row is the shape shared by every agents-table sqlc row type
-// (ListAgentsRow, GetAgentRow, InsertAgentRow, UpdateAgentRow) — sqlc
-// generates one struct per query rather than reusing dbgen.Agent, so this
-// is what lets toView do the field-by-field mapping once instead of once
-// per query.
+// row is the shape shared by every agents-table sqlc row type — sqlc
+// generates one struct per query, so this lets toView map fields once.
 type row struct {
 	ID                  pgtype.UUID
 	Name                string
@@ -426,10 +415,8 @@ func (h *Handler) Update(c *gin.Context) {
 	response.OK(c, http.StatusOK, "Agent updated", view)
 }
 
-// Delete deactivates an agent (soft delete, is_active=false) — run history
-// is preserved, matching every other
-// delete-ish endpoint's convention in this codebase (integrations,
-// documents) — DELETE /api/v1/agents/{id}.
+// Delete soft-deletes an agent (is_active=false), preserving run history —
+// DELETE /api/v1/agents/{id}.
 func (h *Handler) Delete(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -466,10 +453,9 @@ type toolOption struct {
 	Description string `json:"description"`
 }
 
-// ListAvailableTools returns every tool from a service the org has
-// actually connected — GET /api/v1/agents/tools. Populates the create/edit
-// form's allowed-tools multi-select; offering a tool from an unconnected
-// service would just be a confusing choice nothing could ever execute.
+// ListAvailableTools returns tools only from services the org has
+// connected — GET /api/v1/agents/tools. An unconnected service's tools
+// would be a choice nothing could ever execute.
 func (h *Handler) ListAvailableTools(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -522,10 +508,9 @@ func (h *Handler) ListAvailableTools(c *gin.Context) {
 	response.OK(c, http.StatusOK, "", options)
 }
 
-// validatePolicyScope enforces policy rules: at least one
-// allowed tool, every tool a real "service.tool_name" the MCP registry
-// actually knows about (workflow 5), and a positive cost cap when one is
-// set. Returns ("", "") when valid, or an error code + message otherwise.
+// validatePolicyScope checks: at least one allowed tool, every tool a real
+// "service.tool_name" the MCP registry knows, positive caps. Returns
+// ("", "") when valid, else an error code + message.
 func (h *Handler) validatePolicyScope(ctx context.Context, ps policyScope) (string, string) {
 	if len(ps.AllowedTools) == 0 {
 		return "NO_ALLOWED_TOOLS", "At least one allowed tool is required"
@@ -555,10 +540,8 @@ func (h *Handler) validatePolicyScope(ctx context.Context, ps policyScope) (stri
 	return "", ""
 }
 
-// serversFromTools derives the unique set of services referenced by
-// "service.tool_name" allowed_tools entries — allowed_mcp_servers is kept
-// in sync automatically rather than accepted as a separate, independently
-// editable field, so the two columns can never drift out of agreement.
+// serversFromTools derives allowed_mcp_servers from allowed_tools so the
+// two columns can never drift out of agreement.
 func serversFromTools(toolIDs []string) []string {
 	seen := map[string]bool{}
 	var servers []string
@@ -579,12 +562,8 @@ func serversFromTools(toolIDs []string) []string {
 	return servers
 }
 
-// slugify lowercases and hyphenates name for the slug column — a 5-line
-// hand-written helper rather than gosimple/slug, per this codebase's
-// "don't add a dependency this doesn't justify" policy (see CLAUDE.md's
-// Dependency policy section); slug has no uniqueness constraint (name
-// already does, via 000006's partial index), so collisions aren't a
-// correctness concern here.
+// slugify lowercases and hyphenates name — hand-written rather than a
+// dependency, since slug has no uniqueness constraint (name does).
 func slugify(name string) string {
 	var b strings.Builder
 	lastHyphen := true // suppresses a leading hyphen
@@ -640,9 +619,8 @@ func derefBool(b *bool) bool {
 	return b != nil && *b
 }
 
-// nonNullJSON returns b, or a JSON null literal when b is empty — a
-// jsonb column read back as an empty []byte would otherwise serialize as
-// an empty (invalid-JSON) string in the response body.
+// nonNullJSON returns b, or a JSON null literal when b is empty — an
+// empty []byte would otherwise serialize as invalid JSON.
 func nonNullJSON(b []byte) json.RawMessage {
 	if len(b) == 0 {
 		return json.RawMessage("null")

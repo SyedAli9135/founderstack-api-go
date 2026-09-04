@@ -12,10 +12,8 @@ import (
 	"github.com/founderstack/api/internal/db/tenant"
 )
 
-// submitPushSubscriptionRequest mirrors the browser's
-// PushSubscription.toJSON() shape founderstack-web's usePushSubscription
-// hook sends — the keys are literally named "p256dh"/"auth" by the Push
-// API itself.
+// Mirrors the browser's PushSubscription.toJSON() shape — "p256dh"/"auth" are the Push
+// API's own key names.
 type submitPushSubscriptionRequest struct {
 	Endpoint string `json:"endpoint"`
 	Keys     struct {

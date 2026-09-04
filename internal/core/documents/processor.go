@@ -14,19 +14,13 @@ import (
 	"github.com/founderstack/api/internal/db/tenant"
 )
 
-// embedModel matches the Python original's actual model choice — not
-// the v4 string the original workflow 6 spec sketched but never used
-// (see WORKFLOW_PLAN_GO.md) — and deliberately the multilingual variant,
-// not cmd/seedtools' embed-english-v3.0: tool descriptions are
-// English-only by construction, but a founder's uploaded documents
-// aren't guaranteed to be.
+// embedModel is deliberately the multilingual variant, not cmd/seedtools'
+// embed-english-v3.0: tool descriptions are English-only by construction,
+// but a founder's uploaded documents aren't guaranteed to be.
 const embedModel = "embed-multilingual-v3.0"
 
-// embedBatchSize: workflow 6's spec sketched 100, but Cohere's Embed API
-// actually caps a single request at 96 texts — confirmed live (a 3000-word
-// text file's 28 chunks worked fine at 100, since it never hit a full
-// batch, but a real PDF with 100+ chunks failed with "total number of
-// texts must be at most 96 - received 100" the moment a batch filled up).
+// embedBatchSize: Cohere's Embed API caps a single request at 96 texts,
+// not 100 — a batch of exactly 100 gets rejected once it actually fills.
 const embedBatchSize = 96
 
 // Processor runs the actual upload -> extract -> chunk -> embed -> index

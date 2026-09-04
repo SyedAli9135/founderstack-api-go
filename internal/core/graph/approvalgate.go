@@ -15,10 +15,7 @@ import (
 	"github.com/founderstack/api/internal/db/tenant"
 )
 
-// riskRank orders the 3 tiers so batchRiskLevel can pick the single
-// highest one a mixed batch should be gated/labeled by — matches
-// executorNode's own "the whole batch suspends if any call in it needs
-// approval" semantics.
+// riskRank orders tiers so batchRiskLevel can pick the highest in a batch.
 var riskRank = map[coremcp.RiskLevel]int{
 	coremcp.RiskRead:                        0,
 	coremcp.RiskWriteReversible:             1,
@@ -36,12 +33,8 @@ func batchRiskLevel(deps RunDeps, calls []llm.ToolCall) coremcp.RiskLevel {
 	return highest
 }
 
-// writeApprovalGate INSERTs the approvals row a human will actually see
-// and decide against, then fires notifications best-effort. Called from
-// executorNode right before it returns NodeAwaitingApproval — this INSERT
-// is not best-effort: if it fails, the run fails loudly rather than
-// suspending with no approvals row anyone could ever act on (the gap this
-// workflow closes; nothing wrote to this table before).
+// writeApprovalGate inserts the approvals row and notifies. The insert is
+// not best-effort: a failure fails the run rather than suspending silently.
 func writeApprovalGate(ctx context.Context, deps RunDeps, state *RunState, calls []llm.ToolCall) error {
 	riskLevel := string(batchRiskLevel(deps, calls))
 	contextData, err := json.Marshal(calls)
@@ -68,12 +61,8 @@ func writeApprovalGate(ctx context.Context, deps RunDeps, state *RunState, calls
 	state.PendingApprovalRiskLevel = riskLevel
 
 	if deps.Notifier != nil {
-		// Detached, not awaited: a slow Slack/email/webpush call must never
-		// delay the checkpoint+SSE-publish that follows in engine.go — each
-		// channel inside Notifier is independently logged-not-propagated.
-		// Takes explicit fields (not RunDeps) so internal/core/notify never
-		// needs to import internal/core/graph — this package imports
-		// notify, not the other way around.
+		// Fire-and-forget: must not delay the checkpoint that follows.
+		// Explicit fields, not deps — notify must not import graph.
 		go deps.Notifier.NotifyApprovalRequired(context.Background(), deps.AppPool, deps.Gateway, deps.OrgID, approvalID.Bytes, riskLevel, calls)
 	}
 	return nil

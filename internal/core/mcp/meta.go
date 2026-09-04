@@ -6,8 +6,7 @@ import gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 // the org's decrypted integration token under.
 const tokenMetaKey = "founderstack.integration_token"
 
-// WithToken returns CallToolParams.Meta carrying token — Gateway.ExecuteTool
-// is the one real caller in production
+// WithToken returns CallToolParams.Meta carrying token.
 func WithToken(token string) gomcp.Meta {
 	return gomcp.Meta{tokenMetaKey: token}
 }
@@ -22,14 +21,12 @@ func TokenFromRequest(req *gomcp.CallToolRequest) (string, bool) {
 	return tok, ok
 }
 
-// extraMetaKey carries a connection's Token.Extra map — additive to tokenMetaKey, not a replacement: the 5 original
-// tool servers only ever need the bare token, so WithToken/TokenFromRequest
-// keep their existing signatures unchanged.
+// extraMetaKey carries a connection's Token.Extra map (e.g. Discord's
+// webhook URL) — additive to tokenMetaKey, not a replacement.
 const extraMetaKey = "founderstack.integration_extra"
 
-// WithExtra returns CallToolParams.Meta carrying extra, for merging with
-// WithToken's map (Gateway.ExecuteTool does this whenever a connection's
-// Token.Extra is non-empty — most connections have none).
+// WithExtra returns CallToolParams.Meta carrying extra, merged with
+// WithToken's map by Gateway.ExecuteTool when Token.Extra is non-empty.
 func WithExtra(extra map[string]string) gomcp.Meta {
 	return gomcp.Meta{extraMetaKey: extra}
 }
@@ -61,7 +58,7 @@ func ExtraFromRequest(req *gomcp.CallToolRequest) (map[string]string, bool) {
 }
 
 // idempotencyKeyMetaKey carries a deterministic per-tool-call key
-// (`{run_id}-{tool_call_index}`
+// (`{run_id}-{tool_call_index}`), set only for financial-tier calls.
 const idempotencyKeyMetaKey = "founderstack.idempotency_key"
 
 // WithIdempotencyKey returns CallToolParams.Meta carrying key.

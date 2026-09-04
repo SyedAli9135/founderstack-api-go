@@ -19,32 +19,25 @@ import (
 	"github.com/founderstack/api/internal/pkg/svix"
 )
 
-// ClerkHandler syncs Clerk organization/user events into the local
-// database. It runs against the app_system (BYPASSRLS) pool, never
-// app_user — an organization.created event is, by definition, creating a
-// tenant the RLS-scoped pool has no session context for yet.
+// Runs against app_system (BYPASSRLS), never app_user — organization.created is, by
+// definition, creating a tenant the RLS-scoped pool has no session context for yet.
 type ClerkHandler struct {
 	db     *dbgen.Queries
 	secret string
 }
 
-// NewClerkHandler builds a ClerkHandler. pool must be the app_system pool;
-// webhookSecret is CLERK_WEBHOOK_SECRET ("whsec_...").
+// pool must be the app_system pool; webhookSecret is CLERK_WEBHOOK_SECRET.
 func NewClerkHandler(pool *pgxpool.Pool, webhookSecret string) *ClerkHandler {
 	return &ClerkHandler{db: dbgen.New(pool), secret: webhookSecret}
 }
 
-// Register mounts POST /clerk on rg.
 func (h *ClerkHandler) Register(rg *gin.RouterGroup) {
 	rg.POST("/clerk", h.Handle)
 }
 
-// handlerTimeout bounds how long processing a single webhook delivery may
-// take — DB writes here are simple upserts, so this is generous headroom,
-// not a tight budget.
 const handlerTimeout = 10 * time.Second
 
-// envelope is Clerk's outer webhook shape: {"type": "...", "data": {...}}.
+// Clerk's outer webhook shape: {"type": "...", "data": {...}}.
 type envelope struct {
 	Type string          `json:"type"`
 	Data json.RawMessage `json:"data"`
@@ -83,9 +76,7 @@ func (h *ClerkHandler) Handle(c *gin.Context) {
 
 	slog.Info("received clerk webhook", "type", evt.Type, "request_id", response.RequestID(c))
 
-	// Bounds how long a single webhook delivery can hold open a DB
-	// connection — without this, a hung query blocks indefinitely since
-	// Gin sets no request deadline of its own.
+	// Gin sets no request deadline of its own, so without this a hung query blocks forever.
 	ctx, cancel := context.WithTimeout(c.Request.Context(), handlerTimeout)
 	defer cancel()
 
@@ -104,16 +95,9 @@ func (h *ClerkHandler) Handle(c *gin.Context) {
 	case "user.deleted":
 		handleErr = h.softDeleteUser(ctx, evt.Data)
 	default:
-		// Deliberately unhandled, not just "not implemented yet":
-		//   session.*             — sessions table has no reader; would be
-		//                           write-only data nothing consumes.
-		//   organizationInvitation.* — no invitations table, and an accepted
-		//                           invite already fires
-		//                           organizationMembership.created, which we
-		//                           do handle — nothing left to add.
-		//   user.created          — fires before any org membership exists;
-		//                           users.org_id is NOT NULL, so there's no
-		//                           valid row to create yet.
+		// Deliberately unhandled: session.* has no reader here; organizationInvitation.*
+		// is superseded by the membership.created event an accepted invite already fires;
+		// user.created fires before org membership exists (users.org_id is NOT NULL).
 		// Ack every other type so Clerk doesn't retry something we'll never act on.
 		slog.Debug("ignoring unhandled clerk webhook type", "type", evt.Type)
 	}
@@ -121,8 +105,8 @@ func (h *ClerkHandler) Handle(c *gin.Context) {
 	var notFound *orgNotFoundYetError
 	switch {
 	case errors.As(handleErr, &notFound):
-		// 422 tells Clerk/Svix to retry with backoff — self-heals the rare
-		// case where a membership event arrives before its org's event.
+		// 422 tells Clerk/Svix to retry with backoff — self-heals a membership event
+		// that arrived before its org's event.
 		response.Fail(c, http.StatusUnprocessableEntity, "ORG_NOT_FOUND_YET", notFound.Error())
 	case handleErr != nil:
 		slog.Error("clerk webhook processing failed", "type", evt.Type, "error", handleErr, "request_id", response.RequestID(c))
@@ -145,9 +129,8 @@ type organizationPayload struct {
 	Slug string `json:"slug"`
 }
 
-// upsertOrganization backs organization.created and organization.updated —
-// both are the same idempotent write (INSERT ... ON CONFLICT DO UPDATE on
-// clerk_org_id), so a redelivered or out-of-order event is harmless.
+// Backs both created and updated — the same idempotent UPSERT on clerk_org_id, so a
+// redelivered or out-of-order event is harmless.
 func (h *ClerkHandler) upsertOrganization(ctx context.Context, raw json.RawMessage) error {
 	var data organizationPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
@@ -174,7 +157,6 @@ type membershipPayload struct {
 	Role string `json:"role"`
 }
 
-// upsertMembership backs organizationMembership.created and .updated.
 func (h *ClerkHandler) upsertMembership(ctx context.Context, raw json.RawMessage) error {
 	var data membershipPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
@@ -205,13 +187,8 @@ func (h *ClerkHandler) upsertMembership(ctx context.Context, raw json.RawMessage
 	return nil
 }
 
-// canApproveByDefault decides a brand-new user's initial
-// can_approve_workflows value (see UpsertUserForMembership's doc comment
-// for why this only matters on first insert). Clerk's own default role
-// for whoever creates an organization is "admin" — treating admin/owner
-// as pre-authorized to approve their own agents' actions is what makes
-// Workflow 10 usable at all before workflow 13 (team management) exists
-// to grant this explicitly.
+// Clerk's default role for whoever creates an org is "admin" — pre-authorizing admin/owner
+// to approve is what makes workflow 10 usable before workflow 13 (team management) exists.
 func canApproveByDefault(role string) bool {
 	return role == "admin" || role == "owner"
 }
@@ -223,10 +200,8 @@ type userPayload struct {
 	ImageURL  string `json:"image_url"`
 }
 
-// updateUserProfile backs user.updated. A user not yet synced (0 rows
-// affected) is not an error — matches the Python backend's silent no-op,
-// since the membership webhook that will create them may simply not have
-// arrived yet.
+// A user not yet synced (0 rows affected) is not an error — the membership webhook that
+// will create them may simply not have arrived yet.
 func (h *ClerkHandler) updateUserProfile(ctx context.Context, raw json.RawMessage) error {
 	var data userPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
@@ -243,14 +218,9 @@ func (h *ClerkHandler) updateUserProfile(ctx context.Context, raw json.RawMessag
 	return nil
 }
 
-// softDeleteOrganization backs organization.deleted. Deliberately a
-// soft-delete (is_active=false), not the Python backend's hard DELETE:
-// (a) it matches this codebase's own convention for every other
-// delete-ish endpoint (agents, documents), (b) workflow_runs and approvals
-// reference organizations.id without ON DELETE CASCADE, so a hard delete
-// would fail outright once an org has any run history, and (c) it
-// preserves audit_logs/cost_ledger history for a deleted tenant instead of
-// destroying it.
+// Deliberately soft-delete, not the Python backend's hard DELETE: workflow_runs/approvals
+// reference organizations.id without ON DELETE CASCADE (a hard delete would fail once an
+// org has run history), and this preserves audit_logs/cost_ledger history.
 func (h *ClerkHandler) softDeleteOrganization(ctx context.Context, raw json.RawMessage) error {
 	var data organizationPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
@@ -262,12 +232,8 @@ func (h *ClerkHandler) softDeleteOrganization(ctx context.Context, raw json.RawM
 	return nil
 }
 
-// softDeleteMembership backs organizationMembership.deleted — a member was
-// removed from an org (but their Clerk account still exists elsewhere).
-// Since a users row is scoped to exactly one org_id in this schema,
-// removing that membership means this backend should treat them as
-// deactivated, not partially-linked to an org they no longer belong to. No
-// cascade beyond the users row itself, same as organization.deleted.
+// A users row is scoped to exactly one org_id in this schema, so a removed membership
+// means deactivated, not partially-linked to an org they no longer belong to.
 func (h *ClerkHandler) softDeleteMembership(ctx context.Context, raw json.RawMessage) error {
 	var data membershipPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
@@ -279,11 +245,8 @@ func (h *ClerkHandler) softDeleteMembership(ctx context.Context, raw json.RawMes
 	return nil
 }
 
-// softDeleteUser backs user.deleted — the Clerk account itself was deleted,
-// not just removed from one org. Same soft-delete as softDeleteMembership;
-// kept as a separate function because the payload shape differs (a bare
-// {"id": ...}, not nested under public_user_data) even though the DB write
-// is identical.
+// Same DB write as softDeleteMembership; kept separate because the payload shape differs
+// (a bare {"id": ...}, not nested under public_user_data).
 func (h *ClerkHandler) softDeleteUser(ctx context.Context, raw json.RawMessage) error {
 	var data userPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
@@ -302,9 +265,7 @@ func nilIfEmpty(s string) *string {
 	return &s
 }
 
-// normalizeRole strips Clerk's namespace prefix from a role string, e.g.
-// "org:admin" -> "admin". A role with no colon (or an empty string) is
-// returned unchanged.
+// Strips Clerk's namespace prefix, e.g. "org:admin" -> "admin".
 func normalizeRole(role string) string {
 	if i := strings.LastIndex(role, ":"); i != -1 {
 		return role[i+1:]

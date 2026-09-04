@@ -1446,6 +1446,31 @@ dependency (plain `net/http`, same reasoning as Slack/Stripe), so this is the wo
 addition to `go.mod`. `sentry-go` and `otel` are still planned but not yet in `go.mod` — add each
 when its workflow lands.
 
+### Comment Style
+
+Keep a comment only if it explains a non-obvious **why**. Cut anything that explains *what* the
+code does (redundant with well-named identifiers), restates history/dates ("found and fixed
+2026-08-28", session-narrative), or runs more than 1-2 lines when it could be one. Real
+correctness/concurrency/security reasoning (e.g. `internal/core/graph`'s checkpoint/cancellation
+races, `internal/api/approvals/handler.go`'s actor-resolution/race-guard logic) should be kept,
+just condensed — don't cut substance to hit a line count in packages like that.
+
+Example (from `internal/core/graph/approvalgate.go`):
+```go
+// Before
+// riskRank orders the 3 tiers so batchRiskLevel can pick the single
+// highest one a mixed batch should be gated/labeled by — matches
+// executorNode's own "the whole batch suspends if any call in it needs
+// approval" semantics.
+
+// After
+// riskRank orders tiers so batchRiskLevel can pick the highest in a batch.
+```
+
+Applies to new code as it's written, not just cleanup passes — don't narrate the current task,
+a fix, or a caller in a comment (that belongs in the commit message/PR description and rots as
+the code evolves).
+
 ## Environment Variables
 
 See `.env.example` for the full list with inline notes on Go-specific deviations from the

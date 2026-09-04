@@ -22,12 +22,10 @@ var notionEndpoint = oauth2.Endpoint{
 // Notion has no implicit "latest" version; omitting the header 400s.
 const notionAPIVersion = "2022-06-28"
 
-// Notion has no publicly documented Refreshable or Revocable API — a
-// connection's access token doesn't expire on a schedule, and revoking
-// access happens from the founder's own Notion workspace settings, not
-// through this backend. It intentionally implements only OAuthProvider
-// and TokenValidator; DELETE .../notion still works fine (best-effort
-// RevokeToken is skipped via the type assertion in the HTTP handler).
+// Notion has no public Refreshable/Revocable API — revoking access happens
+// from the founder's own workspace settings, not through this backend. It
+// implements only OAuthProvider and TokenValidator; DELETE .../notion
+// still works (RevokeToken is skipped via the handler's type assertion).
 type Notion struct {
 	cfg *oauth2.Config
 }
