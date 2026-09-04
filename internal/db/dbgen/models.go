@@ -194,6 +194,7 @@ type Organization struct {
 	IsActive                *bool              `json:"is_active"`
 	AgentsPaused            bool               `json:"agents_paused"`
 	ApprovalsSlackChannelID *string            `json:"approvals_slack_channel_id"`
+	TotalHoursSaved         float64            `json:"total_hours_saved"`
 }
 
 type PushSubscription struct {
@@ -292,17 +293,21 @@ type WorkflowRun struct {
 	OutputTokens    int32              `json:"output_tokens"`
 	CachedTokens    int32              `json:"cached_tokens"`
 	DurationMs      *int32             `json:"duration_ms"`
+	HoursSaved      *float64           `json:"hours_saved"`
 }
 
 type WorkflowStep struct {
-	ID         pgtype.UUID        `json:"id"`
-	CreatedAt  pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
-	RunID      pgtype.UUID        `json:"run_id"`
-	NodeName   string             `json:"node_name"`
-	StepType   string             `json:"step_type"`
-	InputData  []byte             `json:"input_data"`
-	OutputData []byte             `json:"output_data"`
-	DurationMs *int32             `json:"duration_ms"`
-	Status     *string            `json:"status"`
+	ID           pgtype.UUID        `json:"id"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	RunID        pgtype.UUID        `json:"run_id"`
+	NodeName     string             `json:"node_name"`
+	StepType     string             `json:"step_type"`
+	InputData    []byte             `json:"input_data"`
+	OutputData   []byte             `json:"output_data"`
+	DurationMs   *int32             `json:"duration_ms"`
+	Status       *string            `json:"status"`
+	AgentName    *string            `json:"agent_name"`
+	InputTokens  *int32             `json:"input_tokens"`
+	OutputTokens *int32             `json:"output_tokens"`
 }

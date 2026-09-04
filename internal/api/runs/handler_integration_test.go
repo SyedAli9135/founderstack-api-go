@@ -300,6 +300,157 @@ func TestRunsHandler_Get_CrossOrgIsolation(t *testing.T) {
 	}
 }
 
+func TestRunsHandler_Steps(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	engine := graph.NewEngine(appPool)
+	router := testRouter(t, systemPool, appPool, cfg, engine)
+
+	_, clerkUserID, runID := testOrgUserAgentWorkflowRun(t, systemPool, "completed")
+	if _, err := systemPool.Exec(context.Background(),
+		`insert into workflow_steps (run_id, node_name, step_type, agent_name, input_data, output_data, input_tokens, output_tokens, duration_ms, status)
+		 values ($1, 'planner', 'planning', 'Test Agent', '{"input":"do it"}'::jsonb, null, null, null, 5, 'completed'),
+		        ($1, 'executor', 'tool_call', 'Test Agent', '{"tool":"fake.get_data"}'::jsonb, '{"result":"ok"}'::jsonb, null, null, 42, 'completed')`,
+		runID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	req := authedRequest(t, cfg, clerkUserID, http.MethodGet, "/api/v1/runs/"+runID.String()+"/steps")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	var env apiEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Steps []workflowStep `json:"steps"`
+	}
+	if err := json.Unmarshal(env.Data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Steps) != 2 {
+		t.Fatalf("Steps = %d, want 2; got %+v", len(got.Steps), got.Steps)
+	}
+	if got.Steps[0].NodeName != "planner" || got.Steps[0].StepType != "planning" {
+		t.Fatalf("Steps[0] = %+v, want planner/planning first (ordered by created_at)", got.Steps[0])
+	}
+	if got.Steps[1].NodeName != "executor" || got.Steps[1].StepType != "tool_call" {
+		t.Fatalf("Steps[1] = %+v, want executor/tool_call second", got.Steps[1])
+	}
+	if got.Steps[1].AgentName == nil || *got.Steps[1].AgentName != "Test Agent" {
+		t.Fatalf("Steps[1].AgentName = %v, want %q", got.Steps[1].AgentName, "Test Agent")
+	}
+}
+
+func TestRunsHandler_Steps_NotFound(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	engine := graph.NewEngine(appPool)
+	router := testRouter(t, systemPool, appPool, cfg, engine)
+
+	_, clerkUserID, _ := testOrgUserAgentWorkflowRun(t, systemPool, "completed")
+
+	req := authedRequest(t, cfg, clerkUserID, http.MethodGet, "/api/v1/runs/00000000-0000-0000-0000-000000000000/steps")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestRunsHandler_Steps_CrossOrgIsolation(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	engine := graph.NewEngine(appPool)
+	router := testRouter(t, systemPool, appPool, cfg, engine)
+
+	_, _, otherOrgRunID := testOrgUserAgentWorkflowRun(t, systemPool, "completed")
+	_, clerkUserID, _ := testOrgUserAgentWorkflowRun(t, systemPool, "completed")
+
+	req := authedRequest(t, cfg, clerkUserID, http.MethodGet, "/api/v1/runs/"+otherOrgRunID.String()+"/steps")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (another org's run must not be visible)", rec.Code)
+	}
+}
+
+func TestRunsHandler_Cost(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	engine := graph.NewEngine(appPool)
+	router := testRouter(t, systemPool, appPool, cfg, engine)
+
+	orgID, clerkUserID, runID := testOrgUserAgentWorkflowRun(t, systemPool, "completed")
+	if _, err := systemPool.Exec(context.Background(),
+		`insert into cost_ledger (org_id, run_id, cost_type, model, input_tokens, output_tokens, estimated_cost_usd)
+		 values ($1, $2, 'llm_inference', 'claude-sonnet-4-5', 100, 20, 0.005),
+		        ($1, $2, 'llm_inference', 'claude-sonnet-4-5', 50, 10, 0.0025),
+		        ($1, $2, 'tool_call', 'fake.get_data', 0, 0, 0)`,
+		orgID, runID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	req := authedRequest(t, cfg, clerkUserID, http.MethodGet, "/api/v1/runs/"+runID.String()+"/cost")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	var env apiEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Items    []costBreakdownItem `json:"items"`
+		TotalUSD float64             `json:"total_usd"`
+	}
+	if err := json.Unmarshal(env.Data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 2 {
+		t.Fatalf("Items = %d, want 2 (llm_inference, tool_call); got %+v", len(got.Items), got.Items)
+	}
+	if diff := got.TotalUSD - 0.0075; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("TotalUSD = %v, want 0.0075", got.TotalUSD)
+	}
+	for _, item := range got.Items {
+		if item.CostType == "llm_inference" {
+			if item.InputTokens != 150 || item.OutputTokens != 30 {
+				t.Fatalf("llm_inference tokens = (%d, %d), want (150, 30)", item.InputTokens, item.OutputTokens)
+			}
+		}
+	}
+}
+
+func TestRunsHandler_Cost_NotFound(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	engine := graph.NewEngine(appPool)
+	router := testRouter(t, systemPool, appPool, cfg, engine)
+
+	_, clerkUserID, _ := testOrgUserAgentWorkflowRun(t, systemPool, "completed")
+
+	req := authedRequest(t, cfg, clerkUserID, http.MethodGet, "/api/v1/runs/00000000-0000-0000-0000-000000000000/cost")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
 func TestRunsHandler_Cancel_NotInFlight(t *testing.T) {
 	appPool := testAppPool(t)
 	systemPool := testSystemPool(t)

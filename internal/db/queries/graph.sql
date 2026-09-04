@@ -78,3 +78,57 @@ WHERE org_id = $1
   AND (sqlc.narg(workflow_id)::uuid IS NULL OR workflow_id = sqlc.narg(workflow_id))
 ORDER BY created_at DESC
 LIMIT $2 OFFSET $3;
+
+-- Workflow 11 (run trace + cost). writeWorkflowStep (internal/core/graph/
+-- observability.go) is the one place InsertWorkflowStep is called from,
+-- fired at each of the 5 node functions plus once per LLM turn and once
+-- per tool call inside executorNode -- see BuildNodes' doc comment.
+
+-- name: InsertWorkflowStep :exec
+INSERT INTO workflow_steps (run_id, node_name, step_type, agent_name, input_data,
+                             output_data, input_tokens, output_tokens, duration_ms, status)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
+
+-- name: ListWorkflowSteps :many
+-- Joins workflow_runs for org-scoping (workflow_steps itself has no
+-- org_id column) -- same shape as GetRunAgentID's join above.
+SELECT ws.id, ws.node_name, ws.step_type, ws.agent_name, ws.input_data, ws.output_data,
+       ws.input_tokens, ws.output_tokens, ws.duration_ms, ws.status, ws.created_at
+FROM workflow_steps ws
+JOIN workflow_runs r ON r.id = ws.run_id
+WHERE r.org_id = $1 AND r.id = $2
+ORDER BY ws.created_at ASC;
+
+-- name: GetRunCostBreakdown :many
+SELECT cost_type,
+       COALESCE(SUM(estimated_cost_usd), 0)::double precision AS total_usd,
+       COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+       COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+       COALESCE(SUM(cached_tokens), 0)::bigint AS cached_tokens
+FROM cost_ledger
+WHERE org_id = $1 AND run_id = $2
+GROUP BY cost_type;
+
+-- name: FinalizeRunHoursSaved :one
+-- Only ever called once, right after FinalizeRun, guarded on the run
+-- having just reached status='completed' -- see finalizeIfTerminal.
+-- estimated_manual_minutes defaults to 15 (a conservative baseline) when
+-- the workflow never had one set.
+UPDATE workflow_runs
+SET hours_saved = COALESCE(
+    (SELECT w.estimated_manual_minutes FROM workflows w WHERE w.id = workflow_runs.workflow_id),
+    15
+)::double precision / 60.0
+WHERE workflow_runs.org_id = $1 AND workflow_runs.id = $2
+RETURNING hours_saved;
+
+-- name: IncrementOrgTotalHoursSaved :exec
+UPDATE organizations SET total_hours_saved = total_hours_saved + $2 WHERE id = $1;
+
+-- name: GetOrgTotalHoursSaved :one
+SELECT total_hours_saved FROM organizations WHERE id = $1;
+
+-- name: GetHoursSavedSince :one
+SELECT COALESCE(SUM(hours_saved), 0)::double precision AS hours_saved
+FROM workflow_runs
+WHERE org_id = $1 AND completed_at >= $2;

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -380,6 +381,57 @@ func TestBuildNodes_IdempotencyKeySetForFinancialToolOnly(t *testing.T) {
 	}
 }
 
+// TestBuildNodes_WritesWorkflowStepsTrace covers workflow 11's core gap:
+// workflow_steps existed in the schema since migration 000001 but nothing
+// ever wrote to it before this workflow. Also verifies the pii package is
+// actually wired in, not just unit-tested in isolation.
+func TestBuildNodes_WritesWorkflowStepsTrace(t *testing.T) {
+	mock := llm.NewMockChatClient(
+		llm.ChatResponse{
+			ToolCalls:  []llm.ToolCall{{ID: "call_0", Name: "fake.get_data", Args: json.RawMessage(`{"query":"contact founder@example.com"}`)}},
+			StopReason: llm.StopReasonToolUse,
+			Usage:      llm.TokenUsage{InputTokens: 42, OutputTokens: 7},
+		},
+		llm.ChatResponse{Content: "Found the data.", StopReason: llm.StopReasonEndTurn, Usage: llm.TokenUsage{InputTokens: 50, OutputTokens: 3}},
+	)
+	deps, orgID, agentID, runID := nodesTestDeps(t, mock, []string{"fake.get_data"})
+	nodes := BuildNodes(deps)
+	state := &RunState{OrgID: orgID, AgentID: agentID, WorkflowRunID: runID, Input: "look something up"}
+
+	if err := deps.Engine.Run(context.Background(), nodes, state, "planner"); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	rows, err := fetchWorkflowSteps(t, testSystemPool(t), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantTypes := map[string]int{"planning": 1, "reasoning": 2, "tool_call": 1, "validation": 1, "report": 1}
+	gotTypes := map[string]int{}
+	for _, r := range rows {
+		gotTypes[r.stepType]++
+		if r.durationMs == nil {
+			t.Errorf("step %s/%s has no duration_ms", r.nodeName, r.stepType)
+		}
+		if r.status == nil || (*r.status != "completed" && *r.status != "failed") {
+			t.Errorf("step %s/%s has unexpected status %v", r.nodeName, r.stepType, r.status)
+		}
+		blob := string(r.inputData) + string(r.outputData)
+		if strings.Contains(blob, "founder@example.com") {
+			t.Errorf("step %s/%s leaked an unsanitized email into its trace: %s", r.nodeName, r.stepType, blob)
+		}
+		if r.stepType == "tool_call" && !strings.Contains(blob, "[REDACTED]") {
+			t.Errorf("tool_call step's data should show the redaction marker in place of the email, got: %s", blob)
+		}
+	}
+	for stepType, want := range wantTypes {
+		if gotTypes[stepType] != want {
+			t.Errorf("step_type %q count = %d, want %d (got all: %+v)", stepType, gotTypes[stepType], want, gotTypes)
+		}
+	}
+}
+
 func TestBuildNodes_WritesAuditLogAndCostLedger(t *testing.T) {
 	mock := llm.NewMockChatClient(
 		llm.ChatResponse{
@@ -440,4 +492,37 @@ func TestBuildNodes_WritesAuditLogAndCostLedger(t *testing.T) {
 	if llmLedgerCount != 2 {
 		t.Fatalf("cost_ledger llm_inference rows = %d, want 2 (one per model turn)", llmLedgerCount)
 	}
+}
+
+type workflowStepRow struct {
+	nodeName, stepType        string
+	agentName                 *string
+	inputData, outputData     []byte
+	inputTokens, outputTokens *int32
+	durationMs                *int32
+	status                    *string
+}
+
+func fetchWorkflowSteps(t *testing.T, systemPool *pgxpool.Pool, runID uuid.UUID) ([]workflowStepRow, error) {
+	t.Helper()
+	rows, err := systemPool.Query(context.Background(),
+		`select node_name, step_type, agent_name, input_data, output_data, input_tokens, output_tokens, duration_ms, status
+		 from workflow_steps where run_id = $1 order by created_at asc`,
+		pgtype.UUID{Bytes: runID, Valid: true},
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []workflowStepRow
+	for rows.Next() {
+		var r workflowStepRow
+		if err := rows.Scan(&r.nodeName, &r.stepType, &r.agentName, &r.inputData, &r.outputData,
+			&r.inputTokens, &r.outputTokens, &r.durationMs, &r.status); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

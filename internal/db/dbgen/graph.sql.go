@@ -43,6 +43,50 @@ func (q *Queries) FinalizeRun(ctx context.Context, arg FinalizeRunParams) error 
 	return err
 }
 
+const finalizeRunHoursSaved = `-- name: FinalizeRunHoursSaved :one
+UPDATE workflow_runs
+SET hours_saved = COALESCE(
+    (SELECT w.estimated_manual_minutes FROM workflows w WHERE w.id = workflow_runs.workflow_id),
+    15
+)::double precision / 60.0
+WHERE workflow_runs.org_id = $1 AND workflow_runs.id = $2
+RETURNING hours_saved
+`
+
+type FinalizeRunHoursSavedParams struct {
+	OrgID pgtype.UUID `json:"org_id"`
+	ID    pgtype.UUID `json:"id"`
+}
+
+// Only ever called once, right after FinalizeRun, guarded on the run
+// having just reached status='completed' -- see finalizeIfTerminal.
+// estimated_manual_minutes defaults to 15 (a conservative baseline) when
+// the workflow never had one set.
+func (q *Queries) FinalizeRunHoursSaved(ctx context.Context, arg FinalizeRunHoursSavedParams) (*float64, error) {
+	row := q.db.QueryRow(ctx, finalizeRunHoursSaved, arg.OrgID, arg.ID)
+	var hours_saved *float64
+	err := row.Scan(&hours_saved)
+	return hours_saved, err
+}
+
+const getHoursSavedSince = `-- name: GetHoursSavedSince :one
+SELECT COALESCE(SUM(hours_saved), 0)::double precision AS hours_saved
+FROM workflow_runs
+WHERE org_id = $1 AND completed_at >= $2
+`
+
+type GetHoursSavedSinceParams struct {
+	OrgID       pgtype.UUID        `json:"org_id"`
+	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+}
+
+func (q *Queries) GetHoursSavedSince(ctx context.Context, arg GetHoursSavedSinceParams) (float64, error) {
+	row := q.db.QueryRow(ctx, getHoursSavedSince, arg.OrgID, arg.CompletedAt)
+	var hours_saved float64
+	err := row.Scan(&hours_saved)
+	return hours_saved, err
+}
+
 const getOrgRunSettings = `-- name: GetOrgRunSettings :one
 
 SELECT llm_provider, agents_paused FROM organizations WHERE id = $1
@@ -62,6 +106,17 @@ func (q *Queries) GetOrgRunSettings(ctx context.Context, id pgtype.UUID) (GetOrg
 	var i GetOrgRunSettingsRow
 	err := row.Scan(&i.LlmProvider, &i.AgentsPaused)
 	return i, err
+}
+
+const getOrgTotalHoursSaved = `-- name: GetOrgTotalHoursSaved :one
+SELECT total_hours_saved FROM organizations WHERE id = $1
+`
+
+func (q *Queries) GetOrgTotalHoursSaved(ctx context.Context, id pgtype.UUID) (float64, error) {
+	row := q.db.QueryRow(ctx, getOrgTotalHoursSaved, id)
+	var total_hours_saved float64
+	err := row.Scan(&total_hours_saved)
+	return total_hours_saved, err
 }
 
 const getRunAgentID = `-- name: GetRunAgentID :one
@@ -116,6 +171,56 @@ func (q *Queries) GetRunCheckpoint(ctx context.Context, arg GetRunCheckpointPara
 		&i.Status,
 	)
 	return i, err
+}
+
+const getRunCostBreakdown = `-- name: GetRunCostBreakdown :many
+SELECT cost_type,
+       COALESCE(SUM(estimated_cost_usd), 0)::double precision AS total_usd,
+       COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+       COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+       COALESCE(SUM(cached_tokens), 0)::bigint AS cached_tokens
+FROM cost_ledger
+WHERE org_id = $1 AND run_id = $2
+GROUP BY cost_type
+`
+
+type GetRunCostBreakdownParams struct {
+	OrgID pgtype.UUID `json:"org_id"`
+	RunID pgtype.UUID `json:"run_id"`
+}
+
+type GetRunCostBreakdownRow struct {
+	CostType     string  `json:"cost_type"`
+	TotalUsd     float64 `json:"total_usd"`
+	InputTokens  int64   `json:"input_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
+	CachedTokens int64   `json:"cached_tokens"`
+}
+
+func (q *Queries) GetRunCostBreakdown(ctx context.Context, arg GetRunCostBreakdownParams) ([]GetRunCostBreakdownRow, error) {
+	rows, err := q.db.Query(ctx, getRunCostBreakdown, arg.OrgID, arg.RunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetRunCostBreakdownRow
+	for rows.Next() {
+		var i GetRunCostBreakdownRow
+		if err := rows.Scan(
+			&i.CostType,
+			&i.TotalUsd,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.CachedTokens,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getRunDetail = `-- name: GetRunDetail :one
@@ -192,6 +297,60 @@ func (q *Queries) GetRunStatus(ctx context.Context, arg GetRunStatusParams) (str
 	return status, err
 }
 
+const incrementOrgTotalHoursSaved = `-- name: IncrementOrgTotalHoursSaved :exec
+UPDATE organizations SET total_hours_saved = total_hours_saved + $2 WHERE id = $1
+`
+
+type IncrementOrgTotalHoursSavedParams struct {
+	ID              pgtype.UUID `json:"id"`
+	TotalHoursSaved float64     `json:"total_hours_saved"`
+}
+
+func (q *Queries) IncrementOrgTotalHoursSaved(ctx context.Context, arg IncrementOrgTotalHoursSavedParams) error {
+	_, err := q.db.Exec(ctx, incrementOrgTotalHoursSaved, arg.ID, arg.TotalHoursSaved)
+	return err
+}
+
+const insertWorkflowStep = `-- name: InsertWorkflowStep :exec
+
+INSERT INTO workflow_steps (run_id, node_name, step_type, agent_name, input_data,
+                             output_data, input_tokens, output_tokens, duration_ms, status)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+`
+
+type InsertWorkflowStepParams struct {
+	RunID        pgtype.UUID `json:"run_id"`
+	NodeName     string      `json:"node_name"`
+	StepType     string      `json:"step_type"`
+	AgentName    *string     `json:"agent_name"`
+	InputData    []byte      `json:"input_data"`
+	OutputData   []byte      `json:"output_data"`
+	InputTokens  *int32      `json:"input_tokens"`
+	OutputTokens *int32      `json:"output_tokens"`
+	DurationMs   *int32      `json:"duration_ms"`
+	Status       *string     `json:"status"`
+}
+
+// Workflow 11 (run trace + cost). writeWorkflowStep (internal/core/graph/
+// observability.go) is the one place InsertWorkflowStep is called from,
+// fired at each of the 5 node functions plus once per LLM turn and once
+// per tool call inside executorNode -- see BuildNodes' doc comment.
+func (q *Queries) InsertWorkflowStep(ctx context.Context, arg InsertWorkflowStepParams) error {
+	_, err := q.db.Exec(ctx, insertWorkflowStep,
+		arg.RunID,
+		arg.NodeName,
+		arg.StepType,
+		arg.AgentName,
+		arg.InputData,
+		arg.OutputData,
+		arg.InputTokens,
+		arg.OutputTokens,
+		arg.DurationMs,
+		arg.Status,
+	)
+	return err
+}
+
 const listRunsForOrg = `-- name: ListRunsForOrg :many
 SELECT id, workflow_id, status, output, cost_so_far_usd, started_at, completed_at,
        duration_ms, created_at
@@ -247,6 +406,68 @@ func (q *Queries) ListRunsForOrg(ctx context.Context, arg ListRunsForOrgParams) 
 			&i.StartedAt,
 			&i.CompletedAt,
 			&i.DurationMs,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkflowSteps = `-- name: ListWorkflowSteps :many
+SELECT ws.id, ws.node_name, ws.step_type, ws.agent_name, ws.input_data, ws.output_data,
+       ws.input_tokens, ws.output_tokens, ws.duration_ms, ws.status, ws.created_at
+FROM workflow_steps ws
+JOIN workflow_runs r ON r.id = ws.run_id
+WHERE r.org_id = $1 AND r.id = $2
+ORDER BY ws.created_at ASC
+`
+
+type ListWorkflowStepsParams struct {
+	OrgID pgtype.UUID `json:"org_id"`
+	ID    pgtype.UUID `json:"id"`
+}
+
+type ListWorkflowStepsRow struct {
+	ID           pgtype.UUID        `json:"id"`
+	NodeName     string             `json:"node_name"`
+	StepType     string             `json:"step_type"`
+	AgentName    *string            `json:"agent_name"`
+	InputData    []byte             `json:"input_data"`
+	OutputData   []byte             `json:"output_data"`
+	InputTokens  *int32             `json:"input_tokens"`
+	OutputTokens *int32             `json:"output_tokens"`
+	DurationMs   *int32             `json:"duration_ms"`
+	Status       *string            `json:"status"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+// Joins workflow_runs for org-scoping (workflow_steps itself has no
+// org_id column) -- same shape as GetRunAgentID's join above.
+func (q *Queries) ListWorkflowSteps(ctx context.Context, arg ListWorkflowStepsParams) ([]ListWorkflowStepsRow, error) {
+	rows, err := q.db.Query(ctx, listWorkflowSteps, arg.OrgID, arg.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListWorkflowStepsRow
+	for rows.Next() {
+		var i ListWorkflowStepsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.NodeName,
+			&i.StepType,
+			&i.AgentName,
+			&i.InputData,
+			&i.OutputData,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.DurationMs,
+			&i.Status,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err

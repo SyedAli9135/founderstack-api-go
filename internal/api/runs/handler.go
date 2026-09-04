@@ -36,6 +36,8 @@ func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/runs/:id", h.Get)
 	rg.POST("/runs/:id/cancel", h.Cancel)
 	rg.GET("/runs/:id/stream", h.Stream)
+	rg.GET("/runs/:id/steps", h.Steps)
+	rg.GET("/runs/:id/cost", h.Cost)
 }
 
 func parseRunID(c *gin.Context) (pgtype.UUID, bool) {
@@ -194,24 +196,7 @@ func (h *Handler) Cancel(c *gin.Context) {
 
 	// engine.Cancel is process-wide with no org scoping of its own — this lookup is what
 	// actually enforces tenant isolation here.
-	var exists bool
-	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
-		_, err := q.GetRunStatus(ctx, dbgen.GetRunStatusParams{OrgID: user.OrgID, ID: id})
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil
-			}
-			return err
-		}
-		exists = true
-		return nil
-	})
-	if err != nil {
-		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not look up run")
-		return
-	}
-	if !exists {
-		response.Fail(c, http.StatusNotFound, "RUN_NOT_FOUND", "Run not found")
+	if !h.runExists(c, user.OrgID, id) {
 		return
 	}
 
@@ -233,24 +218,7 @@ func (h *Handler) Stream(c *gin.Context) {
 		return
 	}
 
-	var exists bool
-	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
-		_, err := q.GetRunStatus(ctx, dbgen.GetRunStatusParams{OrgID: user.OrgID, ID: id})
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil
-			}
-			return err
-		}
-		exists = true
-		return nil
-	})
-	if err != nil {
-		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not look up run")
-		return
-	}
-	if !exists {
-		response.Fail(c, http.StatusNotFound, "RUN_NOT_FOUND", "Run not found")
+	if !h.runExists(c, user.OrgID, id) {
 		return
 	}
 
@@ -281,6 +249,133 @@ func (h *Handler) Stream(c *gin.Context) {
 			return ev.Type != graph.EventComplete && ev.Type != graph.EventError
 		}
 	})
+}
+
+type workflowStep struct {
+	NodeName     string          `json:"node_name"`
+	StepType     string          `json:"step_type"`
+	AgentName    *string         `json:"agent_name,omitempty"`
+	InputData    json.RawMessage `json:"input_data,omitempty"`
+	OutputData   json.RawMessage `json:"output_data,omitempty"`
+	InputTokens  *int32          `json:"input_tokens,omitempty"`
+	OutputTokens *int32          `json:"output_tokens,omitempty"`
+	DurationMs   *int32          `json:"duration_ms,omitempty"`
+	Status       *string         `json:"status,omitempty"`
+	CreatedAt    string          `json:"created_at"`
+}
+
+// Steps returns the run's persisted trace — one row per node
+// transition plus one per LLM turn and tool call inside executor, written
+// by internal/core/graph's writeWorkflowStep as the run actually executes.
+func (h *Handler) Steps(c *gin.Context) {
+	user, ok := authctx.FromContext(c)
+	if !ok {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
+		return
+	}
+	id, ok := parseRunID(c)
+	if !ok {
+		return
+	}
+	if !h.runExists(c, user.OrgID, id) {
+		return // runExists already wrote the 404 or 500 response
+	}
+
+	var rows []dbgen.ListWorkflowStepsRow
+	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		var err error
+		rows, err = q.ListWorkflowSteps(ctx, dbgen.ListWorkflowStepsParams{OrgID: user.OrgID, ID: id})
+		return err
+	})
+	if err != nil {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not fetch run steps")
+		return
+	}
+
+	out := make([]workflowStep, len(rows))
+	for i, r := range rows {
+		out[i] = workflowStep{
+			NodeName: r.NodeName, StepType: r.StepType, AgentName: r.AgentName,
+			InputData: r.InputData, OutputData: r.OutputData,
+			InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
+			DurationMs: r.DurationMs, Status: r.Status, CreatedAt: r.CreatedAt.Time.Format(rfc3339),
+		}
+	}
+	response.OK(c, http.StatusOK, "Run steps fetched", gin.H{"steps": out})
+}
+
+type costBreakdownItem struct {
+	CostType     string  `json:"cost_type"`
+	TotalUSD     float64 `json:"total_usd"`
+	InputTokens  int64   `json:"input_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
+	CachedTokens int64   `json:"cached_tokens"`
+}
+
+// Cost returns the run's itemized cost_ledger breakdown by cost_type
+// (llm_inference, tool_call today
+func (h *Handler) Cost(c *gin.Context) {
+	user, ok := authctx.FromContext(c)
+	if !ok {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
+		return
+	}
+	id, ok := parseRunID(c)
+	if !ok {
+		return
+	}
+	if !h.runExists(c, user.OrgID, id) {
+		return // runExists already wrote the 404 or 500 response
+	}
+
+	var rows []dbgen.GetRunCostBreakdownRow
+	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		var err error
+		rows, err = q.GetRunCostBreakdown(ctx, dbgen.GetRunCostBreakdownParams{OrgID: user.OrgID, RunID: id})
+		return err
+	})
+	if err != nil {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not fetch run cost")
+		return
+	}
+
+	items := make([]costBreakdownItem, len(rows))
+	var total float64
+	for i, r := range rows {
+		items[i] = costBreakdownItem{
+			CostType: r.CostType, TotalUSD: r.TotalUsd,
+			InputTokens: r.InputTokens, OutputTokens: r.OutputTokens, CachedTokens: r.CachedTokens,
+		}
+		total += r.TotalUsd
+	}
+	response.OK(c, http.StatusOK, "Run cost fetched", gin.H{"items": items, "total_usd": total})
+}
+
+// runExists is the same tenant-scoped existence check Cancel/Stream already
+// use — a 404 on someone else's run_id shouldn't leak whether that id
+// exists at all. On false, it has already written the response (404 or
+// 500) — the caller should just return without writing its own.
+func (h *Handler) runExists(c *gin.Context, orgID, runID pgtype.UUID) bool {
+	var exists bool
+	err := tenant.WithTx(c.Request.Context(), h.appPool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
+		_, err := q.GetRunStatus(ctx, dbgen.GetRunStatusParams{OrgID: orgID, ID: runID})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		exists = true
+		return nil
+	})
+	if err != nil {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not look up run")
+		return false
+	}
+	if !exists {
+		response.Fail(c, http.StatusNotFound, "RUN_NOT_FOUND", "Run not found")
+	}
+	return exists
 }
 
 const rfc3339 = "2006-01-02T15:04:05Z07:00"

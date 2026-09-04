@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/founderstack/api/internal/core/llm"
+	"github.com/founderstack/api/internal/core/pii"
 	"github.com/founderstack/api/internal/db/dbgen"
 	"github.com/founderstack/api/internal/db/tenant"
 )
@@ -58,4 +60,54 @@ func writeCostLedgerLLMCall(ctx context.Context, deps RunDeps, state *RunState, 
 			EstimatedCostUsd: llm.EstimateCostUSD(model, usage),
 		})
 	})
+}
+
+// writeWorkflowStep persists one row of the run's trace —
+// input/output are PII-sanitized before storage since a founder's browser
+// is the audience. Best-effort like the cost_ledger/audit_log writers
+// above: a trace gap shouldn't fail the run itself.
+func writeWorkflowStep(ctx context.Context, deps RunDeps, state *RunState, nodeName, stepType string, input, output any, tokens *llm.TokenUsage, duration time.Duration, status string) error {
+	runID := pgtype.UUID{Bytes: state.WorkflowRunID, Valid: true}
+	var agentName *string
+	if state.AgentName != "" {
+		agentName = &state.AgentName
+	}
+
+	inputData, err := marshalSanitized(input)
+	if err != nil {
+		return fmt.Errorf("graph: marshal step input: %w", err)
+	}
+	outputData, err := marshalSanitized(output)
+	if err != nil {
+		return fmt.Errorf("graph: marshal step output: %w", err)
+	}
+
+	durationMs := int32(duration.Milliseconds())
+	var inputTokens, outputTokens *int32
+	if tokens != nil {
+		it, ot := int32(tokens.InputTokens), int32(tokens.OutputTokens)
+		inputTokens, outputTokens = &it, &ot
+	}
+
+	return tenant.WithTx(ctx, deps.AppPool, deps.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		return q.InsertWorkflowStep(ctx, dbgen.InsertWorkflowStepParams{
+			RunID: runID, NodeName: nodeName, StepType: stepType, AgentName: agentName,
+			InputData: inputData, OutputData: outputData,
+			InputTokens: inputTokens, OutputTokens: outputTokens,
+			DurationMs: &durationMs, Status: &status,
+		})
+	})
+}
+
+// marshalSanitized JSON-encodes v (nil-safe — a nil v stores no row data)
+// then redacts it via pii.SanitizeJSON before it's written.
+func marshalSanitized(v any) ([]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return pii.SanitizeJSON(raw), nil
 }

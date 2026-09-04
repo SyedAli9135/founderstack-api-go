@@ -46,12 +46,44 @@ func finalizeIfTerminal(ctx context.Context, pool *pgxpool.Pool, orgID, runID pg
 	if state.Output != "" {
 		output = &state.Output
 	}
-	return tenant.WithTx(ctx, pool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
+	if err := tenant.WithTx(ctx, pool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
 		return q.FinalizeRun(ctx, dbgen.FinalizeRunParams{
 			OrgID: orgID, ID: runID, Output: output,
 			InputTokens:  int32(state.TokenUsage.InputTokens),
 			OutputTokens: int32(state.TokenUsage.OutputTokens),
 			CachedTokens: int32(state.TokenUsage.CachedTokens),
+		})
+	}); err != nil {
+		return err
+	}
+
+	// hours_saved only accrues on a genuine success — a failed or
+	// cancelled run (and, per this table's own semantics, a rejected
+	// approval — the engine still reaches NodeComplete/'completed' there,
+	// same as an approved one) delivered no time savings to count.
+	if status == "completed" {
+		if err := accrueHoursSaved(ctx, pool, orgID, runID); err != nil {
+			return fmt.Errorf("graph: accrue hours_saved: %w", err)
+		}
+	}
+	return nil
+}
+
+// accrueHoursSaved sets workflow_runs.hours_saved (from the workflow's own
+// estimated_manual_minutes, defaulting to 15) and folds it into the org's
+// running total — both in one transaction so the two numbers can't drift
+// apart if something crashes between them.
+func accrueHoursSaved(ctx context.Context, pool *pgxpool.Pool, orgID, runID pgtype.UUID) error {
+	return tenant.WithTx(ctx, pool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
+		hoursSaved, err := q.FinalizeRunHoursSaved(ctx, dbgen.FinalizeRunHoursSavedParams{OrgID: orgID, ID: runID})
+		if err != nil {
+			return err
+		}
+		if hoursSaved == nil {
+			return nil
+		}
+		return q.IncrementOrgTotalHoursSaved(ctx, dbgen.IncrementOrgTotalHoursSavedParams{
+			ID: orgID, TotalHoursSaved: *hoursSaved,
 		})
 	})
 }

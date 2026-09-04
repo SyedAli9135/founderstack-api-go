@@ -34,6 +34,11 @@ type Querier interface {
 	// (status stays checkpoint()'s alone) — only called once a run reaches a
 	// genuinely terminal status, never for awaiting_approval.
 	FinalizeRun(ctx context.Context, arg FinalizeRunParams) error
+	// Only ever called once, right after FinalizeRun, guarded on the run
+	// having just reached status='completed' -- see finalizeIfTerminal.
+	// estimated_manual_minutes defaults to 15 (a conservative baseline) when
+	// the workflow never had one set.
+	FinalizeRunHoursSaved(ctx context.Context, arg FinalizeRunHoursSavedParams) (*float64, error)
 	// Queries backing BYOK API key management (workflow 3). Run through
 	// app_user via tenant.WithTx — this is genuinely tenant-scoped data, not a
 	// system-context lookup like clerk_sync.sql or auth.sql. Provider is a
@@ -62,6 +67,7 @@ type Querier interface {
 	GetApprovalSystemScoped(ctx context.Context, id pgtype.UUID) (GetApprovalSystemScopedRow, error)
 	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
 	GetDocument(ctx context.Context, arg GetDocumentParams) (GetDocumentRow, error)
+	GetHoursSavedSince(ctx context.Context, arg GetHoursSavedSinceParams) (float64, error)
 	GetKeyStatusByProvider(ctx context.Context, arg GetKeyStatusByProviderParams) (GetKeyStatusByProviderRow, error)
 	GetOrgApprovalsSlackChannel(ctx context.Context, id pgtype.UUID) (*string, error)
 	// graph.Launcher's run lifecycle (POST /workflows/{id}/run's async goroutine
@@ -69,6 +75,7 @@ type Querier interface {
 	// (GET /runs, GET /runs/{id}).
 	// Preflight (kill switch) + provider resolution for Launcher.Launch.
 	GetOrgRunSettings(ctx context.Context, id pgtype.UUID) (GetOrgRunSettingsRow, error)
+	GetOrgTotalHoursSaved(ctx context.Context, id pgtype.UUID) (float64, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
 	GetOrganizationMaxAgents(ctx context.Context, id pgtype.UUID) (*int32, error)
 	// Resolves a run's agent_id via its workflow — Launcher.Resume needs this
@@ -76,6 +83,7 @@ type Querier interface {
 	// alone doesn't carry (agent_id isn't part of RunState's own JSON).
 	GetRunAgentID(ctx context.Context, arg GetRunAgentIDParams) (pgtype.UUID, error)
 	GetRunCheckpoint(ctx context.Context, arg GetRunCheckpointParams) (GetRunCheckpointRow, error)
+	GetRunCostBreakdown(ctx context.Context, arg GetRunCostBreakdownParams) ([]GetRunCostBreakdownRow, error)
 	GetRunDetail(ctx context.Context, arg GetRunDetailParams) (GetRunDetailRow, error)
 	// Read back the definitive status Engine's own checkpoint() already
 	// wrote (completed/failed/cancelled/awaiting_approval) — Launcher can't
@@ -93,6 +101,7 @@ type Querier interface {
 	// Only called after purgeDocumentJob has successfully removed the
 	// Pinecone vectors and the S3 object — see internal/core/documents/purge.go.
 	HardDeleteDocument(ctx context.Context, arg HardDeleteDocumentParams) error
+	IncrementOrgTotalHoursSaved(ctx context.Context, arg IncrementOrgTotalHoursSavedParams) error
 	// ON CONFLICT ... DO NOTHING against the partial unique index added in
 	// 000006_agents_unique_org_name_active: a real duplicate name returns 0
 	// rows (pgx.ErrNoRows on the :one Scan), which the handler translates to a
@@ -140,6 +149,11 @@ type Querier interface {
 	// 'pending' rows into actual execution is Workflow 9's job
 	// (internal/core/graph, not built).
 	InsertWorkflowRun(ctx context.Context, arg InsertWorkflowRunParams) (InsertWorkflowRunRow, error)
+	// Workflow 11 (run trace + cost). writeWorkflowStep (internal/core/graph/
+	// observability.go) is the one place InsertWorkflowStep is called from,
+	// fired at each of the 5 node functions plus once per LLM turn and once
+	// per tool call inside executorNode -- see BuildNodes' doc comment.
+	InsertWorkflowStep(ctx context.Context, arg InsertWorkflowStepParams) error
 	// Queries backing workflow 7 (agent configuration CRUD). All tenant-scoped,
 	// run through app_user via tenant.WithTx like every other feature area in
 	// this file set — nothing here is cross-tenant, unlike the recovery-sweep
@@ -186,6 +200,9 @@ type Querier interface {
 	// exists to cover. olderThan guards against re-kicking a job that's
 	// still genuinely in flight in *this* process, not actually stuck.
 	ListStuckDocuments(ctx context.Context, updatedAt pgtype.Timestamptz) ([]ListStuckDocumentsRow, error)
+	// Joins workflow_runs for org-scoping (workflow_steps itself has no
+	// org_id column) -- same shape as GetRunAgentID's join above.
+	ListWorkflowSteps(ctx context.Context, arg ListWorkflowStepsParams) ([]ListWorkflowStepsRow, error)
 	// Deliberately NOT filtered by is_active, unlike ListAgents/ListDocuments
 	// — pausing a workflow (PATCH is_active=false) must keep it visible so the
 	// founder can toggle it back on; is_active in the response drives the

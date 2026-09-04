@@ -237,6 +237,68 @@ func TestLauncher_LaunchRunsToCompletionAndFinalizes(t *testing.T) {
 	}
 }
 
+// TestLauncher_LaunchAccruesHoursSaved covers the other half of workflow
+// 11's schema gap: workflow_runs.hours_saved/organizations.total_hours_saved
+// didn't exist before this workflow, and nothing computed either. The test
+// fixture's workflow never sets estimated_manual_minutes, so this exercises
+// the 15-minute (0.25h) default specifically.
+func TestLauncher_LaunchAccruesHoursSaved(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	fx := newLaunchFixture(t, systemPool, map[string]any{"allowed_tools": []string{"fake.get_data"}}, "anthropic", true)
+
+	var orgHoursBefore float64
+	if err := systemPool.QueryRow(context.Background(), "select total_hours_saved from organizations where id = $1", pgtype.UUID{Bytes: fx.orgID, Valid: true}).Scan(&orgHoursBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := integrations.SaveConnection(context.Background(), appPool, fx.encKey, pgtype.UUID{Bytes: fx.orgID, Valid: true}, "fake", "Fake", "manual", "connected",
+		integrations.Token{AccessToken: "fake-token"},
+	); err != nil {
+		t.Fatalf("save fake connection: %v", err)
+	}
+	registry, err := coremcp.NewRegistry(context.Background(), map[string]*gomcp.Server{"fake": fakeToolServer()})
+	if err != nil {
+		t.Fatalf("build registry: %v", err)
+	}
+	gateway := coremcp.NewGateway(appPool, fx.encKey, registry, nil)
+	mock := llm.NewMockChatClient(llm.ChatResponse{Content: "Done.", StopReason: llm.StopReasonEndTurn})
+
+	engine := NewEngine(appPool)
+	launcher := NewLauncherWithResolver(engine, appPool, fx.encKey, registry, gateway, nil, mockChatClientResolver(mock))
+	if err := launcher.Preflight(context.Background(), pgtype.UUID{Bytes: fx.orgID, Valid: true}); err != nil {
+		t.Fatalf("Preflight() error = %v, want nil", err)
+	}
+	launcher.Launch(fx.orgID, fx.agentID, fx.workflowID, fx.runID, "do a thing")
+
+	var hoursSaved *float64
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := systemPool.QueryRow(context.Background(), "select hours_saved from workflow_runs where id = $1", pgtype.UUID{Bytes: fx.runID, Valid: true}).Scan(&hoursSaved); err != nil {
+			t.Fatalf("query run hours_saved: %v", err)
+		}
+		if hoursSaved != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if hoursSaved == nil {
+		t.Fatal("workflow_runs.hours_saved was never set within the test deadline")
+	}
+	if *hoursSaved != 0.25 {
+		t.Fatalf("hours_saved = %v, want 0.25 (15-minute default, no estimated_manual_minutes set)", *hoursSaved)
+	}
+
+	var orgHoursAfter float64
+	if err := systemPool.QueryRow(context.Background(), "select total_hours_saved from organizations where id = $1", pgtype.UUID{Bytes: fx.orgID, Valid: true}).Scan(&orgHoursAfter); err != nil {
+		t.Fatal(err)
+	}
+	if orgHoursAfter-orgHoursBefore != 0.25 {
+		t.Fatalf("organizations.total_hours_saved delta = %v, want 0.25", orgHoursAfter-orgHoursBefore)
+	}
+}
+
 func TestLauncher_LaunchMarksFailedWhenAgentHasNoModel(t *testing.T) {
 	appPool := testAppPool(t)
 	systemPool := testSystemPool(t)

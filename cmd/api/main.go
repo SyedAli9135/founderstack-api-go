@@ -22,6 +22,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/founderstack/api/internal/api/agents"
+	"github.com/founderstack/api/internal/api/analytics"
 	approvalsapi "github.com/founderstack/api/internal/api/approvals"
 	"github.com/founderstack/api/internal/api/documents"
 	"github.com/founderstack/api/internal/api/identity"
@@ -296,6 +297,10 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiRuns := router.Group("/api/v1")
 	apiRuns.Use(middleware.RequireAuth(systemDB, cfg))
 	runsapi.NewHandler(db, graphEngine).Register(apiRuns)
+
+	apiAnalytics := router.Group("/api/v1")
+	apiAnalytics.Use(middleware.RequireAuth(systemDB, cfg))
+	analytics.NewHandler(db).Register(apiAnalytics)
 
 	// Dev-only stand-in for the real approve/reject endpoints, registered
 	// only when MOCK_LLM_MODE is on.

@@ -52,7 +52,11 @@ func BuildNodes(deps RunDeps) Nodes {
 // to executor_node, which owns the actual call-model/execute-tools loop.
 func plannerNode(deps RunDeps) NodeFunc {
 	return func(ctx context.Context, state *RunState) (NodeName, error) {
+		start := time.Now()
 		state.Conversation = []llm.Message{{Role: llm.RoleUser, Content: state.Input}}
+		if err := writeWorkflowStep(ctx, deps, state, "planner", "planning", map[string]any{"input": state.Input}, nil, nil, time.Since(start), "completed"); err != nil {
+			slog.Error("graph: write workflow_steps for planner failed", "run_id", state.WorkflowRunID, "err", err)
+		}
 		return "executor", nil
 	}
 }
@@ -67,6 +71,7 @@ func executorNode(deps RunDeps) NodeFunc {
 				return "", err
 			}
 
+			turnStart := time.Now()
 			resp, err := sendWithRetry(ctx, deps.ChatClient, deps.SystemPrompt, state.Conversation, deps.Tools.Schemas)
 			if err != nil {
 				return "", fmt.Errorf("graph: executor chat call: %w", err)
@@ -74,6 +79,10 @@ func executorNode(deps RunDeps) NodeFunc {
 			accumulateUsage(state, deps.Model, resp.Usage)
 			if err := writeCostLedgerLLMCall(ctx, deps, state, deps.Model, resp.Usage); err != nil {
 				slog.Error("graph: write cost_ledger for LLM call failed", "run_id", state.WorkflowRunID, "err", err)
+			}
+			stepOutput := map[string]any{"content": resp.Content, "tool_calls": toolCallNames(resp.ToolCalls)}
+			if err := writeWorkflowStep(ctx, deps, state, "executor", "reasoning", nil, stepOutput, &resp.Usage, time.Since(turnStart), "completed"); err != nil {
+				slog.Error("graph: write workflow_steps for reasoning turn failed", "run_id", state.WorkflowRunID, "err", err)
 			}
 			state.Conversation = append(state.Conversation, llm.Message{
 				Role: llm.RoleAssistant, Content: resp.Content, ToolCalls: resp.ToolCalls,
@@ -132,11 +141,18 @@ func executorNode(deps RunDeps) NodeFunc {
 // state.Approval from the human's decision by the time this runs.
 func approvalGateNode(deps RunDeps) NodeFunc {
 	return func(ctx context.Context, state *RunState) (NodeName, error) {
+		start := time.Now()
 		if state.Approval == nil {
 			return "", errors.New("graph: approval_gate node reached with no Approval decision set")
 		}
 		pending := state.PendingToolCalls
 		state.PendingToolCalls = nil
+
+		if err := writeWorkflowStep(ctx, deps, state, "approval_gate", "approval", nil,
+			map[string]any{"approved": state.Approval.Approved, "reason": state.Approval.Reason},
+			nil, time.Since(start), "completed"); err != nil {
+			slog.Error("graph: write workflow_steps for approval_gate failed", "run_id", state.WorkflowRunID, "err", err)
+		}
 
 		if !state.Approval.Approved {
 			reason := state.Approval.Reason
@@ -177,6 +193,7 @@ var suspiciousInstructionPatterns = []string{
 // injected instruction.
 func validatorNode(deps RunDeps) NodeFunc {
 	return func(ctx context.Context, state *RunState) (NodeName, error) {
+		start := time.Now()
 		for _, msg := range state.Conversation {
 			if msg.Role != llm.RoleTool {
 				continue
@@ -190,6 +207,10 @@ func validatorNode(deps RunDeps) NodeFunc {
 				}
 			}
 		}
+		if err := writeWorkflowStep(ctx, deps, state, "validator", "validation", nil,
+			map[string]any{"warnings": state.Warnings}, nil, time.Since(start), "completed"); err != nil {
+			slog.Error("graph: write workflow_steps for validator failed", "run_id", state.WorkflowRunID, "err", err)
+		}
 		return "reporter", nil
 	}
 }
@@ -198,9 +219,14 @@ func validatorNode(deps RunDeps) NodeFunc {
 // warnings rather than dropping them.
 func reporterNode(deps RunDeps) NodeFunc {
 	return func(ctx context.Context, state *RunState) (NodeName, error) {
+		start := time.Now()
 		if len(state.Warnings) > 0 {
 			state.Output = fmt.Sprintf("⚠️ %d warning(s):\n%s\n\n%s",
 				len(state.Warnings), strings.Join(state.Warnings, "\n"), state.Output)
+		}
+		if err := writeWorkflowStep(ctx, deps, state, "reporter", "report", nil,
+			map[string]any{"output": state.Output}, nil, time.Since(start), "completed"); err != nil {
+			slog.Error("graph: write workflow_steps for reporter failed", "run_id", state.WorkflowRunID, "err", err)
 		}
 		return NodeComplete, nil
 	}
@@ -233,7 +259,9 @@ func executeOneToolCall(ctx context.Context, deps RunDeps, state *RunState, tc l
 		idempotencyKey = fmt.Sprintf("%s-%d", state.WorkflowRunID, state.ToolCallCount)
 	}
 
+	callStart := time.Now()
 	result, execErr := gatewayCallWithRetry(ctx, deps.Gateway, deps.OrgID, service, toolName, args, idempotencyKey)
+	callDuration := time.Since(callStart)
 	if err := writeCostLedgerToolCall(ctx, deps, state, tc.Name, execErr == nil); err != nil {
 		slog.Error("graph: write cost_ledger for tool call failed", "run_id", state.WorkflowRunID, "tool", tc.Name, "err", err)
 	}
@@ -250,6 +278,15 @@ func executeOneToolCall(ctx context.Context, deps RunDeps, state *RunState, tc l
 	}
 	if err := writeAuditLog(ctx, deps, state, "tool.executed", service, isError); err != nil {
 		slog.Error("graph: write audit_logs for tool call failed", "run_id", state.WorkflowRunID, "tool", tc.Name, "err", err)
+	}
+	stepStatus := "completed"
+	if isError {
+		stepStatus = "failed"
+	}
+	if err := writeWorkflowStep(ctx, deps, state, "executor", "tool_call",
+		map[string]any{"tool": tc.Name, "args": args}, map[string]any{"result": resultText, "is_error": isError},
+		nil, callDuration, stepStatus); err != nil {
+		slog.Error("graph: write workflow_steps for tool call failed", "run_id", state.WorkflowRunID, "tool", tc.Name, "err", err)
 	}
 
 	deps.Engine.Bus.Publish(Event{Type: EventToolResult, RunID: state.WorkflowRunID, Data: map[string]any{
