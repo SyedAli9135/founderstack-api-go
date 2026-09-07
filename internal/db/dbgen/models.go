@@ -144,6 +144,7 @@ type Document struct {
 	ErrorDetail      *string            `json:"error_detail"`
 	VectorID         *string            `json:"vector_id"`
 	UploadedBy       pgtype.UUID        `json:"uploaded_by"`
+	Visibility       string             `json:"visibility"`
 }
 
 type DocumentChunk struct {

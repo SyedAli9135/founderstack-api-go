@@ -82,6 +82,13 @@ func (e *fakeEmbedder) Embed(ctx context.Context, texts []string) ([][]float64, 
 	return out, nil
 }
 
+func (e *fakeEmbedder) EmbedOne(ctx context.Context, text string, mode EmbedMode) ([]float64, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	return []float64{0.1, 0.2, 0.3}, nil
+}
+
 type fakeVectorIndexState struct {
 	mu       sync.Mutex
 	upserted map[string][]string // namespace -> pinecone IDs upserted
@@ -118,6 +125,10 @@ func (v *fakeVectorIndex) DeleteByID(ctx context.Context, ids []string) error {
 	defer v.state.mu.Unlock()
 	v.state.deleted[v.ns] = append(v.state.deleted[v.ns], ids...)
 	return nil
+}
+
+func (v *fakeVectorIndex) Query(ctx context.Context, vector []float32, topK uint32, filter *pinecone.MetadataFilter) ([]QueryMatch, error) {
+	return nil, nil
 }
 
 // --- shared test scaffolding (Postgres, org/user) ---
@@ -225,6 +236,7 @@ func insertPendingDocument(t *testing.T, appPool *pgxpool.Pool, orgID, uploadedB
 			Filename:   filename,
 			S3Path:     s3Path,
 			UploadedBy: uploadedBy,
+			Visibility: "all_members",
 		})
 	})
 	if err != nil {

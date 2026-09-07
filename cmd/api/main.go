@@ -156,7 +156,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("build documents s3 store: %w", err)
 	}
-	docsProcessor, err := newDocumentsProcessor(ctx, cfg, dbPool, docsStore, pineconeClient)
+	docsProcessor, docsSearcher, err := newDocumentsProcessor(ctx, cfg, dbPool, docsStore, pineconeClient)
 	if err != nil {
 		return fmt.Errorf("build documents processor: %w", err)
 	}
@@ -165,7 +165,7 @@ func run() error {
 	// to a prior process restart.
 	docsProcessor.RecoverStuckJobs(ctx, systemPool)
 
-	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, mcpRegistry, graphEngine, launcher, actionTokens)
+	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, docsSearcher, mcpRegistry, graphEngine, launcher, actionTokens)
 
 	// All 3 background jobs run on systemPool (BYPASSRLS) — each scans
 	// across every org, which is inherently cross-tenant — and stop when
@@ -244,7 +244,7 @@ func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	return client, nil
 }
 
-func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, mcpRegistry *coremcp.Registry, graphEngine *graph.Engine, launcher *graph.Launcher, actionTokens *notify.ActionTokenSigner) *gin.Engine {
+func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, docsSearcher *coredocs.Searcher, mcpRegistry *coremcp.Registry, graphEngine *graph.Engine, launcher *graph.Launcher, actionTokens *notify.ActionTokenSigner) *gin.Engine {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -284,7 +284,7 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 
 	apiDocuments := router.Group("/api/v1")
 	apiDocuments.Use(middleware.RequireAuth(systemDB, cfg))
-	documents.NewHandler(db, docsStore, docsProcessor).Register(apiDocuments)
+	documents.NewHandler(db, docsStore, docsProcessor, docsSearcher, rdb, encryptionKey).Register(apiDocuments)
 
 	apiAgents := router.Group("/api/v1")
 	apiAgents.Use(middleware.RequireAuth(systemDB, cfg))
@@ -352,23 +352,32 @@ func newMCPRegistry(ctx context.Context) (*coremcp.Registry, error) {
 
 // newDocumentsProcessor builds the Cohere + Pinecone-backed Processor.
 // pineconeClient is assumed non-nil.
-func newDocumentsProcessor(ctx context.Context, cfg *config.Config, appPool *pgxpool.Pool, store *coredocs.Store, pineconeClient *pinecone.Client) (*coredocs.Processor, error) {
+// newDocumentsProcessor builds both the ingestion pipeline Processor,
+// and the search pipeline (Searcher) off the same
+// Cohere client and Pinecone index connection — no reason to pay for a
+// second DescribeIndex/connection setup or a second Cohere retry policy.
+func newDocumentsProcessor(ctx context.Context, cfg *config.Config, appPool *pgxpool.Pool, store *coredocs.Store, pineconeClient *pinecone.Client) (*coredocs.Processor, *coredocs.Searcher, error) {
 	// WithMaxAttempts(7): a large (480+ chunk) document can outlast
 	// Cohere's own retrier's default 2 attempts against its per-minute
 	// rate limit — 7 gives ~63s of cumulative backoff, enough to cover one
-	// full window reset.
+	// full window reset. Reused as-is for query/rerank calls at search
+	// time, which are far smaller but benefit from the same resilience.
 	cohereClient := coherecli.NewClient(coreoption.WithToken(cfg.CohereAPIKey.Expose()), coreoption.WithMaxAttempts(7))
 
 	idx, err := pineconeClient.DescribeIndex(ctx, cfg.PineconeIndexRAG)
 	if err != nil {
-		return nil, fmt.Errorf("describe pinecone rag index %q: %w", cfg.PineconeIndexRAG, err)
+		return nil, nil, fmt.Errorf("describe pinecone rag index %q: %w", cfg.PineconeIndexRAG, err)
 	}
 	idxConn, err := pineconeClient.Index(pinecone.NewIndexConnParams{Host: idx.Host})
 	if err != nil {
-		return nil, fmt.Errorf("connect to pinecone rag index: %w", err)
+		return nil, nil, fmt.Errorf("connect to pinecone rag index: %w", err)
 	}
 
-	return coredocs.NewProcessor(appPool, store, coredocs.NewCohereEmbedder(cohereClient), coredocs.NewPineconeIndex(idxConn)), nil
+	embedder := coredocs.NewCohereEmbedder(cohereClient)
+	index := coredocs.NewPineconeIndex(idxConn)
+	processor := coredocs.NewProcessor(appPool, store, embedder, index)
+	searcher := coredocs.NewSearcher(embedder, index, coredocs.NewCohereReranker(cohereClient))
+	return processor, searcher, nil
 }
 
 // corsConfig is wide open in development, locked to the app's own origins

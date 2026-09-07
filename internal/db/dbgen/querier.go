@@ -67,6 +67,10 @@ type Querier interface {
 	GetApprovalSystemScoped(ctx context.Context, id pgtype.UUID) (GetApprovalSystemScopedRow, error)
 	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
 	GetDocument(ctx context.Context, arg GetDocumentParams) (GetDocumentRow, error)
+	// Batch-hydrates a page of search results' filename/category — Pinecone's
+	// own vector metadata only carries doc_id/chunk_index/text (see
+	// processor.go), not display fields.
+	GetDocumentsByIDs(ctx context.Context, arg GetDocumentsByIDsParams) ([]GetDocumentsByIDsRow, error)
 	GetHoursSavedSince(ctx context.Context, arg GetHoursSavedSinceParams) (float64, error)
 	GetKeyStatusByProvider(ctx context.Context, arg GetKeyStatusByProviderParams) (GetKeyStatusByProviderRow, error)
 	GetOrgApprovalsSlackChannel(ctx context.Context, id pgtype.UUID) (*string, error)
@@ -194,6 +198,13 @@ type Querier interface {
 	ListKeyStatuses(ctx context.Context, orgID pgtype.UUID) ([]ListKeyStatusesRow, error)
 	ListPushSubscriptionsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListPushSubscriptionsForOrgRow, error)
 	ListRunsForOrg(ctx context.Context, arg ListRunsForOrgParams) ([]ListRunsForOrgRow, error)
+	// Workflow 12 (RAG search). ListSearchableDocumentIDs is the ACL + category
+	// filter, resolved *before* any embedding/Pinecone call so a query that
+	// can't match anything (e.g. a member with only owner_only docs uploaded)
+	// skips the expensive calls entirely. include_owner_only is the
+	// requesting user's own role check (role IN ('owner','admin')), computed
+	// in Go, not SQL — see internal/api/documents/handler.go's Search.
+	ListSearchableDocumentIDs(ctx context.Context, arg ListSearchableDocumentIDsParams) ([]pgtype.UUID, error)
 	// Documents whose background job (processDocument or purgeDocumentJob)
 	// may have been running in a process that restarted mid-job — the
 	// goroutine-based tradeoff internal/core/documents.RecoverStuckJobs

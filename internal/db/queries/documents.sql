@@ -11,23 +11,44 @@
 -- default) so the handler knows the S3 key (documents/{org_id}/{doc_id}/{filename})
 -- before uploading, rather than uploading first and updating s3_path
 -- after — one INSERT instead of an insert-then-update dance.
-INSERT INTO documents (id, org_id, filename, s3_path, mime_type, byte_size, category, processing_status, uploaded_by)
-VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8);
+INSERT INTO documents (id, org_id, filename, s3_path, mime_type, byte_size, category, processing_status, uploaded_by, visibility)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9);
 
 -- name: ListDocuments :many
 -- Excludes 'deleting': once DELETE .../{id} has been called, the
 -- document shouldn't reappear in a normal list view while
 -- purgeDocumentJob finishes removing it (the row itself is only ever
 -- hard-deleted after that succeeds — see HardDeleteDocument).
-SELECT id, filename, category, processing_status, total_chunks, byte_size, created_at, indexed_at
+SELECT id, filename, category, processing_status, total_chunks, byte_size, created_at, indexed_at, visibility
 FROM documents
 WHERE org_id = $1 AND processing_status != 'deleting'
 ORDER BY created_at DESC;
 
 -- name: GetDocument :one
-SELECT id, filename, s3_path, mime_type, byte_size, category, processing_status, total_chunks, indexed_at, error_detail, created_at
+SELECT id, filename, s3_path, mime_type, byte_size, category, processing_status, total_chunks, indexed_at, error_detail, created_at, visibility
 FROM documents
 WHERE org_id = $1 AND id = $2;
+
+-- Workflow 12 (RAG search). ListSearchableDocumentIDs is the ACL + category
+-- filter, resolved *before* any embedding/Pinecone call so a query that
+-- can't match anything (e.g. a member with only owner_only docs uploaded)
+-- skips the expensive calls entirely. include_owner_only is the
+-- requesting user's own role check (role IN ('owner','admin')), computed
+-- in Go, not SQL — see internal/api/documents/handler.go's Search.
+
+-- name: ListSearchableDocumentIDs :many
+SELECT id FROM documents
+WHERE org_id = $1
+  AND processing_status = 'indexed'
+  AND (visibility = 'all_members' OR sqlc.arg(include_owner_only)::bool)
+  AND (sqlc.narg(category)::varchar IS NULL OR category = sqlc.narg(category));
+
+-- name: GetDocumentsByIDs :many
+-- Batch-hydrates a page of search results' filename/category — Pinecone's
+-- own vector metadata only carries doc_id/chunk_index/text (see
+-- processor.go), not display fields.
+SELECT id, filename, category FROM documents
+WHERE org_id = $1 AND id = ANY(sqlc.arg(doc_ids)::uuid[]);
 
 -- name: UpdateDocumentProcessing :exec
 UPDATE documents SET processing_status = $3 WHERE org_id = $1 AND id = $2;

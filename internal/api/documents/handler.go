@@ -1,9 +1,10 @@
-// Package documents implements the upload/list/get/delete/reindex HTTP endpoints over
-// internal/core/documents' S3/extract/chunk/embed/index pipeline.
 package documents
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,10 +17,13 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pinecone-io/go-pinecone/v5/pinecone"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/founderstack/api/internal/api/authctx"
 	"github.com/founderstack/api/internal/api/response"
 	coredocs "github.com/founderstack/api/internal/core/documents"
+	"github.com/founderstack/api/internal/core/llm"
 	"github.com/founderstack/api/internal/db/dbgen"
 	"github.com/founderstack/api/internal/db/tenant"
 )
@@ -35,25 +39,44 @@ var allowedExtensions = map[string]string{
 	".md":   "text/markdown",
 }
 
+// chatClientResolver matches llm.ResolveChatClient's signature — an
+// injectable test seam, same pattern graph.NewLauncherWithResolver uses.
+type chatClientResolver func(ctx context.Context, appPool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, provider llm.ProviderID, model string) (llm.ChatClient, error)
+
 type Handler struct {
-	appPool   *pgxpool.Pool
-	store     coredocs.BlobStore
-	processor *coredocs.Processor
+	appPool           *pgxpool.Pool
+	store             coredocs.BlobStore
+	processor         *coredocs.Processor
+	searcher          *coredocs.Searcher
+	redis             *redis.Client
+	encryptionKey     []byte
+	resolveChatClient chatClientResolver
 }
 
 // store takes the BlobStore interface, not the concrete *coredocs.Store, so tests can
 // inject a fake instead of needing a real S3/LocalStack dependency.
-func NewHandler(appPool *pgxpool.Pool, store coredocs.BlobStore, processor *coredocs.Processor) *Handler {
-	return &Handler{appPool: appPool, store: store, processor: processor}
+func NewHandler(appPool *pgxpool.Pool, store coredocs.BlobStore, processor *coredocs.Processor, searcher *coredocs.Searcher, rdb *redis.Client, encryptionKey []byte) *Handler {
+	return NewHandlerWithResolver(appPool, store, processor, searcher, rdb, encryptionKey, llm.ResolveChatClient)
 }
 
-// Register mounts all 5 routes; rg must already have middleware.RequireAuth applied.
+// NewHandlerWithResolver is NewHandler with an injectable ChatClient
+// resolver — tests use it to substitute a fake HyDE response without a
+// real BYOK key.
+func NewHandlerWithResolver(appPool *pgxpool.Pool, store coredocs.BlobStore, processor *coredocs.Processor, searcher *coredocs.Searcher, rdb *redis.Client, encryptionKey []byte, resolveChatClient chatClientResolver) *Handler {
+	return &Handler{
+		appPool: appPool, store: store, processor: processor, searcher: searcher,
+		redis: rdb, encryptionKey: encryptionKey, resolveChatClient: resolveChatClient,
+	}
+}
+
+// Register mounts all 6 routes; rg must already have middleware.RequireAuth applied.
 func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.POST("/documents/upload", h.Upload)
 	rg.GET("/documents", h.List)
 	rg.GET("/documents/:id", h.Get)
 	rg.DELETE("/documents/:id", h.Delete)
 	rg.POST("/documents/:id/reindex", h.Reindex)
+	rg.POST("/documents/search", h.Search)
 }
 
 // Upload returns 202 immediately; the founder polls GET .../{id} for processing_status.
@@ -86,6 +109,15 @@ func (h *Handler) Upload(c *gin.Context) {
 		category = "general"
 	}
 
+	visibility := c.PostForm("visibility")
+	if visibility == "" {
+		visibility = "all_members"
+	}
+	if visibility != "all_members" && visibility != "owner_only" {
+		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "visibility must be all_members or owner_only")
+		return
+	}
+
 	file, err := fileHeader.Open()
 	if err != nil {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not read uploaded file")
@@ -115,6 +147,7 @@ func (h *Handler) Upload(c *gin.Context) {
 			ByteSize:   &byteSize,
 			Category:   &category,
 			UploadedBy: user.ID,
+			Visibility: visibility,
 		})
 	})
 	if err != nil {
@@ -144,6 +177,7 @@ type documentSummary struct {
 	ByteSize         int32      `json:"byte_size"`
 	CreatedAt        time.Time  `json:"created_at"`
 	IndexedAt        *time.Time `json:"indexed_at,omitempty"`
+	Visibility       string     `json:"visibility"`
 }
 
 func (h *Handler) List(c *gin.Context) {
@@ -170,6 +204,7 @@ func (h *Handler) List(c *gin.Context) {
 				ByteSize:         derefInt32(row.ByteSize),
 				CreatedAt:        row.CreatedAt.Time,
 				IndexedAt:        timestamptzPtr(row.IndexedAt),
+				Visibility:       row.Visibility,
 			})
 		}
 		return nil
@@ -216,6 +251,7 @@ func (h *Handler) Get(c *gin.Context) {
 				ByteSize:         derefInt32(row.ByteSize),
 				CreatedAt:        row.CreatedAt.Time,
 				IndexedAt:        timestamptzPtr(row.IndexedAt),
+				Visibility:       row.Visibility,
 			},
 			ErrorDetail: row.ErrorDetail,
 		}
@@ -334,4 +370,255 @@ func timestamptzPtr(t pgtype.Timestamptz) *time.Time {
 
 func logProcessingError(op string, docID pgtype.UUID, err error) {
 	fmt.Printf("documents: background %s failed for %s: %v\n", op, docID.String(), err)
+}
+
+// hydeModelByProvider: HyDE only needs a short, cheap completion (a
+// plausible hypothetical passage, not real reasoning) — each provider's
+// fastest/cheapest publicly available chat model, not whatever model an
+// agent happens to be configured with (search isn't agent-scoped).
+var hydeModelByProvider = map[llm.ProviderID]string{
+	llm.ProviderAnthropic: "claude-3-5-haiku-20241022",
+	llm.ProviderOpenAI:    "gpt-4o-mini",
+	llm.ProviderGemini:    "gemini-2.0-flash",
+	llm.ProviderQwen:      "qwen-turbo",
+	llm.ProviderDeepSeek:  "deepseek-chat",
+}
+
+// hydeSystemPrompt asks for brevity in the prompt itself — llm.ChatClient
+// has no per-call max-tokens override (internal/core/llm/chat_anthropic.go
+// fixes anthropicMaxTokens=4096 for every call), so length is
+// prompt-enforced here rather than API-enforced.
+const hydeSystemPrompt = "You are helping retrieve information from a document knowledge base. " +
+	"Given a question, write a short, plausible hypothetical passage (2-3 sentences, well under 100 words) " +
+	"that might appear in a real document answering it. Write only the passage itself, in a natural, " +
+	"factual tone — no preamble, no caveats, no mention that it's hypothetical."
+
+// chatClientHyDE adapts a resolved llm.ChatClient to coredocs.HyDEGenerator
+// — built fresh per search request once the org's provider/key is known,
+// not a Searcher field (see Searcher.Search's doc comment).
+type chatClientHyDE struct {
+	client llm.ChatClient
+}
+
+func (h chatClientHyDE) GenerateHypotheticalAnswer(ctx context.Context, query string) (string, error) {
+	resp, err := h.client.Send(ctx, hydeSystemPrompt, []llm.Message{{Role: llm.RoleUser, Content: query}}, nil)
+	if err != nil {
+		return "", err
+	}
+	return resp.Content, nil
+}
+
+// resolveHyDE is best-effort: no configured provider, no active key, or
+// any resolution error all mean "skip HyDE," never "fail the search" — a
+// founder without a BYOK key configured can still search their documents,
+// just without the retrieval-quality boost. See Searcher.Search's own
+// graceful-degradation handling of a nil/failing HyDEGenerator.
+func (h *Handler) resolveHyDE(ctx context.Context, orgID pgtype.UUID) coredocs.HyDEGenerator {
+	var provider *string
+	err := tenant.WithTx(ctx, h.appPool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
+		settings, err := q.GetOrgRunSettings(ctx, orgID)
+		if err != nil {
+			return err
+		}
+		provider = settings.LlmProvider
+		return nil
+	})
+	if err != nil || provider == nil || *provider == "" {
+		return nil
+	}
+	model, ok := hydeModelByProvider[llm.ProviderID(*provider)]
+	if !ok {
+		return nil
+	}
+	client, err := h.resolveChatClient(ctx, h.appPool, h.encryptionKey, orgID, llm.ProviderID(*provider), model)
+	if err != nil {
+		return nil
+	}
+	return chatClientHyDE{client: client}
+}
+
+type searchRequest struct {
+	Query    string  `json:"query"`
+	Category *string `json:"category,omitempty"`
+	TopK     *int    `json:"top_k,omitempty"`
+}
+
+type searchResult struct {
+	Content        string  `json:"content"`
+	DocFilename    string  `json:"doc_filename"`
+	Category       string  `json:"category"`
+	RelevanceScore float64 `json:"relevance_score"`
+	ChunkIndex     int     `json:"chunk_index"`
+}
+
+const (
+	defaultSearchTopK = 5
+	maxSearchTopK     = 20
+	searchCacheTTL    = time.Hour
+)
+
+// searchCacheKey follows WORKFLOW_PLAN_GO.md's own convention
+// (cache:rag:{org_id}:{sha256(query+category)}) with one addition: the
+// requesting user's ACL scope is folded into the hash too. Without that,
+// an owner's search populating the cache could leak an owner_only
+// document's content to a member who later issues the identical
+// query+category — the literal plan spec would cache across roles and
+// leak cross-role content. Caught during implementation, not after.
+func searchCacheKey(orgID pgtype.UUID, canSeeOwnerOnly bool, query string, category *string) string {
+	h := sha256.New()
+	h.Write([]byte(query))
+	if category != nil {
+		h.Write([]byte(*category))
+	}
+	if canSeeOwnerOnly {
+		h.Write([]byte{1})
+	}
+	return "cache:rag:" + orgID.String() + ":" + hex.EncodeToString(h.Sum(nil))
+}
+
+// Search implements workflow 12 (RAG query): Redis cache check -> resolve
+// which documents this user is allowed to see (ACL + category) -> HyDE ->
+// embed -> Pinecone query -> rerank -> hydrate -> cache -> audit log.
+func (h *Handler) Search(c *gin.Context) {
+	user, ok := authctx.FromContext(c)
+	if !ok {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
+		return
+	}
+
+	var req searchRequest
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Query) == "" {
+		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "query is required")
+		return
+	}
+	topK := defaultSearchTopK
+	if req.TopK != nil && *req.TopK > 0 && *req.TopK <= maxSearchTopK {
+		topK = *req.TopK
+	}
+
+	ctx := c.Request.Context()
+	canSeeOwnerOnly := user.Role == "owner" || user.Role == "admin"
+	cacheKey := searchCacheKey(user.OrgID, canSeeOwnerOnly, req.Query, req.Category)
+
+	if h.redis != nil {
+		if cached, err := h.redis.Get(ctx, cacheKey).Bytes(); err == nil {
+			var results []searchResult
+			if err := json.Unmarshal(cached, &results); err == nil {
+				h.auditSearch(ctx, user, req.Category, len(results))
+				response.OK(c, http.StatusOK, "", gin.H{"results": results, "from_cache": true})
+				return
+			}
+		}
+	}
+
+	var allowedIDs []pgtype.UUID
+	err := tenant.WithTx(ctx, h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		var err error
+		allowedIDs, err = q.ListSearchableDocumentIDs(ctx, dbgen.ListSearchableDocumentIDsParams{
+			OrgID: user.OrgID, IncludeOwnerOnly: canSeeOwnerOnly, Category: req.Category,
+		})
+		return err
+	})
+	if err != nil {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not resolve searchable documents")
+		return
+	}
+	if len(allowedIDs) == 0 {
+		// Nothing this user is allowed to see matches — skip the
+		// HyDE/embed/Pinecone calls entirely rather than searching a
+		// namespace we're just going to filter down to nothing anyway.
+		// Still audited: a search that matched nothing because of ACL is
+		// exactly the kind of attempt a compliance-minded founder cares
+		// about seeing, not less interesting than a successful one.
+		h.auditSearch(ctx, user, req.Category, 0)
+		response.OK(c, http.StatusOK, "", gin.H{"results": []searchResult{}, "from_cache": false})
+		return
+	}
+
+	docIDStrs := make([]any, len(allowedIDs))
+	for i, id := range allowedIDs {
+		docIDStrs[i] = uuid.UUID(id.Bytes).String()
+	}
+	filter, err := pinecone.NewMetadataFilter(map[string]any{"doc_id": map[string]any{"$in": docIDStrs}})
+	if err != nil {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not build search filter")
+		return
+	}
+
+	hyde := h.resolveHyDE(ctx, user.OrgID)
+	chunks, err := h.searcher.Search(ctx, user.OrgID, req.Query, hyde, filter, topK)
+	if err != nil {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Search failed")
+		return
+	}
+
+	results := make([]searchResult, 0, len(chunks))
+	if len(chunks) > 0 {
+		docMeta := map[string]dbgen.GetDocumentsByIDsRow{}
+		err := tenant.WithTx(ctx, h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+			rows, err := q.GetDocumentsByIDs(ctx, dbgen.GetDocumentsByIDsParams{OrgID: user.OrgID, DocIds: uniqueDocIDs(chunks)})
+			if err != nil {
+				return err
+			}
+			for _, row := range rows {
+				docMeta[row.ID.String()] = row
+			}
+			return nil
+		})
+		if err != nil {
+			response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not hydrate search results")
+			return
+		}
+		for _, chunk := range chunks {
+			meta := docMeta[chunk.DocID]
+			results = append(results, searchResult{
+				Content: chunk.Text, DocFilename: meta.Filename, Category: derefOr(meta.Category, "general"),
+				RelevanceScore: chunk.RelevanceScore, ChunkIndex: chunk.ChunkIndex,
+			})
+		}
+	}
+
+	if h.redis != nil {
+		if payload, err := json.Marshal(results); err == nil {
+			if err := h.redis.Set(ctx, cacheKey, payload, searchCacheTTL).Err(); err != nil {
+				fmt.Printf("documents: cache search result failed: %v\n", err)
+			}
+		}
+	}
+
+	h.auditSearch(ctx, user, req.Category, len(results))
+	response.OK(c, http.StatusOK, "", gin.H{"results": results, "from_cache": false})
+}
+
+// auditSearch logs every search attempt — cache hit, ACL-empty, and the
+// full path alike, so a compliance-minded founder sees a contractor's
+// zero-result attempt at an owner_only document too, not just successful
+// searches. No content stored: the query text itself isn't audit-log
+// material, per WORKFLOW_PLAN_GO.md's own instruction. Best-effort: an
+// audit-log write failure shouldn't fail a search that already succeeded.
+func (h *Handler) auditSearch(ctx context.Context, user authctx.User, category *string, resultCount int) {
+	metadata, _ := json.Marshal(map[string]any{"result_count": resultCount, "category": category})
+	_ = tenant.WithTx(ctx, h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		return q.InsertAuditLog(ctx, dbgen.InsertAuditLogParams{
+			OrgID: user.OrgID, ActorID: user.ID, ActorType: "user",
+			Action: "rag.search", MetadataInfo: metadata,
+		})
+	})
+}
+
+func uniqueDocIDs(chunks []coredocs.SearchChunk) []pgtype.UUID {
+	seen := make(map[string]bool, len(chunks))
+	out := make([]pgtype.UUID, 0, len(chunks))
+	for _, c := range chunks {
+		if seen[c.DocID] {
+			continue
+		}
+		seen[c.DocID] = true
+		parsed, err := uuid.Parse(c.DocID)
+		if err != nil {
+			continue // malformed doc_id in vector metadata shouldn't crash the whole search response
+		}
+		out = append(out, pgtype.UUID{Bytes: parsed, Valid: true})
+	}
+	return out
 }

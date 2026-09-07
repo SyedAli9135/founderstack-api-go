@@ -21,7 +21,7 @@ func (q *Queries) DeleteDocumentChunks(ctx context.Context, docID pgtype.UUID) e
 }
 
 const getDocument = `-- name: GetDocument :one
-SELECT id, filename, s3_path, mime_type, byte_size, category, processing_status, total_chunks, indexed_at, error_detail, created_at
+SELECT id, filename, s3_path, mime_type, byte_size, category, processing_status, total_chunks, indexed_at, error_detail, created_at, visibility
 FROM documents
 WHERE org_id = $1 AND id = $2
 `
@@ -43,6 +43,7 @@ type GetDocumentRow struct {
 	IndexedAt        pgtype.Timestamptz `json:"indexed_at"`
 	ErrorDetail      *string            `json:"error_detail"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	Visibility       string             `json:"visibility"`
 }
 
 func (q *Queries) GetDocument(ctx context.Context, arg GetDocumentParams) (GetDocumentRow, error) {
@@ -60,8 +61,48 @@ func (q *Queries) GetDocument(ctx context.Context, arg GetDocumentParams) (GetDo
 		&i.IndexedAt,
 		&i.ErrorDetail,
 		&i.CreatedAt,
+		&i.Visibility,
 	)
 	return i, err
+}
+
+const getDocumentsByIDs = `-- name: GetDocumentsByIDs :many
+SELECT id, filename, category FROM documents
+WHERE org_id = $1 AND id = ANY($2::uuid[])
+`
+
+type GetDocumentsByIDsParams struct {
+	OrgID  pgtype.UUID   `json:"org_id"`
+	DocIds []pgtype.UUID `json:"doc_ids"`
+}
+
+type GetDocumentsByIDsRow struct {
+	ID       pgtype.UUID `json:"id"`
+	Filename string      `json:"filename"`
+	Category *string     `json:"category"`
+}
+
+// Batch-hydrates a page of search results' filename/category — Pinecone's
+// own vector metadata only carries doc_id/chunk_index/text (see
+// processor.go), not display fields.
+func (q *Queries) GetDocumentsByIDs(ctx context.Context, arg GetDocumentsByIDsParams) ([]GetDocumentsByIDsRow, error) {
+	rows, err := q.db.Query(ctx, getDocumentsByIDs, arg.OrgID, arg.DocIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetDocumentsByIDsRow
+	for rows.Next() {
+		var i GetDocumentsByIDsRow
+		if err := rows.Scan(&i.ID, &i.Filename, &i.Category); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const hardDeleteDocument = `-- name: HardDeleteDocument :exec
@@ -82,8 +123,8 @@ func (q *Queries) HardDeleteDocument(ctx context.Context, arg HardDeleteDocument
 
 const insertDocument = `-- name: InsertDocument :exec
 
-INSERT INTO documents (id, org_id, filename, s3_path, mime_type, byte_size, category, processing_status, uploaded_by)
-VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+INSERT INTO documents (id, org_id, filename, s3_path, mime_type, byte_size, category, processing_status, uploaded_by, visibility)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)
 `
 
 type InsertDocumentParams struct {
@@ -95,6 +136,7 @@ type InsertDocumentParams struct {
 	ByteSize   *int32      `json:"byte_size"`
 	Category   *string     `json:"category"`
 	UploadedBy pgtype.UUID `json:"uploaded_by"`
+	Visibility string      `json:"visibility"`
 }
 
 // Queries backing workflow 6 (document upload / RAG). Tenant-scoped reads
@@ -118,6 +160,7 @@ func (q *Queries) InsertDocument(ctx context.Context, arg InsertDocumentParams) 
 		arg.ByteSize,
 		arg.Category,
 		arg.UploadedBy,
+		arg.Visibility,
 	)
 	return err
 }
@@ -162,7 +205,7 @@ func (q *Queries) ListDocumentChunkPineconeIDs(ctx context.Context, docID pgtype
 }
 
 const listDocuments = `-- name: ListDocuments :many
-SELECT id, filename, category, processing_status, total_chunks, byte_size, created_at, indexed_at
+SELECT id, filename, category, processing_status, total_chunks, byte_size, created_at, indexed_at, visibility
 FROM documents
 WHERE org_id = $1 AND processing_status != 'deleting'
 ORDER BY created_at DESC
@@ -177,6 +220,7 @@ type ListDocumentsRow struct {
 	ByteSize         *int32             `json:"byte_size"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	IndexedAt        pgtype.Timestamptz `json:"indexed_at"`
+	Visibility       string             `json:"visibility"`
 }
 
 // Excludes 'deleting': once DELETE .../{id} has been called, the
@@ -201,10 +245,52 @@ func (q *Queries) ListDocuments(ctx context.Context, orgID pgtype.UUID) ([]ListD
 			&i.ByteSize,
 			&i.CreatedAt,
 			&i.IndexedAt,
+			&i.Visibility,
 		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSearchableDocumentIDs = `-- name: ListSearchableDocumentIDs :many
+
+SELECT id FROM documents
+WHERE org_id = $1
+  AND processing_status = 'indexed'
+  AND (visibility = 'all_members' OR $2::bool)
+  AND ($3::varchar IS NULL OR category = $3)
+`
+
+type ListSearchableDocumentIDsParams struct {
+	OrgID            pgtype.UUID `json:"org_id"`
+	IncludeOwnerOnly bool        `json:"include_owner_only"`
+	Category         *string     `json:"category"`
+}
+
+// Workflow 12 (RAG search). ListSearchableDocumentIDs is the ACL + category
+// filter, resolved *before* any embedding/Pinecone call so a query that
+// can't match anything (e.g. a member with only owner_only docs uploaded)
+// skips the expensive calls entirely. include_owner_only is the
+// requesting user's own role check (role IN ('owner','admin')), computed
+// in Go, not SQL — see internal/api/documents/handler.go's Search.
+func (q *Queries) ListSearchableDocumentIDs(ctx context.Context, arg ListSearchableDocumentIDsParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listSearchableDocumentIDs, arg.OrgID, arg.IncludeOwnerOnly, arg.Category)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
