@@ -22,11 +22,11 @@ BYOK is **not** Claude-only: `internal/core/llm` validates and stores keys for 5
 Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 from an
 Anthropic-only original). See "BYOK API Keys" below.
 
-**Workflows 1 (bootstrap) through 10 (human approval gates) are implemented.** Workflow 10
-(2026-08-30) closed the gap the previous line here described — real `GET/POST /approvals*`
-endpoints, Slack/email/push notifications, and a 24h auto-expiry sweep, all built on top of
-workflow 9's suspend/resume mechanism (see "Human Approval Gate (workflow 10)" below). Don't
-assume routes, tables, or packages from workflow 11+ in `WORKFLOW_PLAN_GO.md` exist — check
+**Workflows 1 (bootstrap) through 12 (RAG document search) are implemented.** Workflow 11 (run
+trace/cost, 2026-09-04) and workflow 12 (RAG search, 2026-09-05/06) are the two most recent — see
+"View Run Trace & Cost (workflow 11)" and "Search Knowledge Base / RAG Query (workflow 12)"
+below. Don't assume routes, tables, or packages from workflow 13+ in `WORKFLOW_PLAN_GO.md` exist —
+check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
 `internal/api/workflows/`, `internal/api/runs/`, and `internal/api/approvals/` for what's actually
@@ -964,8 +964,9 @@ will call; today it's also reachable via the dev-only `POST /runs/{id}/dev-resum
 actually trip. Fixed via `internal/core/llm/pricing.go`'s `EstimateCostUSD` (a deliberately rough,
 clearly-labeled-as-an-estimate per-token price table, keyed by loose substring match against the
 agent's `model` string, with a fallback rate for anything unmatched — same "estimate for planning
-purposes, not billing-grade" framing this codebase already uses for Stripe's `get_mrr`; **real,
-billing-grade per-token pricing is still workflow 11's job**), called from both
+purposes, not billing-grade" framing this codebase already uses for Stripe's `get_mrr`; workflow
+11 (run trace/cost) reuses this same estimate rather than adding real billing-grade pricing — no
+workflow has built that yet), called from both
 `accumulateUsage` (adds to `RunState.CostSoFarUSD`, which `CheckCaps` reads) and
 `writeCostLedgerLLMCall` (the persisted `cost_ledger.estimated_cost_usd`, previously hardcoded
 `0`). `writeCostLedgerToolCall`'s `EstimatedCostUsd` stays `0` deliberately, not as a gap — none
@@ -1164,6 +1165,132 @@ approval's `expires_at` rather than waiting 24h (this codebase's established "ma
 condition live" pattern), calls `expireApprovals` directly, and asserts the underlying
 `workflow_runs.status` actually left `awaiting_approval` — not just that the `approvals` row
 flipped.
+
+### View Run Trace & Cost (workflow 11) — `internal/core/pii`, `internal/api/analytics`, extends `internal/core/graph`, `internal/api/runs`
+
+Closes a gap that had existed since migration `000001`: `workflow_steps` was a real table with a
+real index from day one, but nothing ever wrote to it — every prior workflow's run trace was
+whatever SSE events happened to still be in a browser's memory, not a persisted record. Built
+2026-09-04.
+
+**`writeWorkflowStep` (`internal/core/graph/observability.go`) is the single write path**, called
+from all 5 node functions in `nodes.go` plus once per LLM turn and once per tool call inside
+`executorNode` — the same "best-effort, log on error, never fail the run" discipline
+`writeCostLedgerLLMCall`/`writeAuditLog` already established, since a trace gap is an
+observability problem, not a correctness one. `step_type` values: `planning`, `reasoning`,
+`tool_call`, `approval`, `validation`, `report`. `workflow_steps.agent_name`/`input_tokens`/
+`output_tokens` are new columns (migration `000011_workflow11_trace_and_hours_saved`) — the
+original table was missing fields the acceptance criteria assume exist.
+
+**Every `input_data`/`output_data` value is redacted through `internal/core/pii.SanitizeJSON`
+before it's written** — a founder's own browser is this data's audience, but a tool's arguments
+or result can still contain a customer's email, an API key echoed back in an error message, etc.
+Two mechanisms, both key-name-substring match (`api_key`, `password`, `token`, ...) and
+value-pattern match (email, SSN, Stripe/Slack/GitHub-token-shaped strings, bearer tokens) via
+regex — deliberately conservative (a false-positive redaction is harmless, a missed one isn't).
+Package has no dependency on `internal/core/graph`; `graph` imports `pii`, never the reverse.
+
+**`hours_saved`/`organizations.total_hours_saved`** are set in `finalizeIfTerminal`→
+`accrueHoursSaved` (`internal/core/graph/lifecycle.go`), not literally `reporter_node` as the
+plan's Backend checklist says — `reporter_node` doesn't own terminal-status finalization in this
+codebase's actual design, `finalizeIfTerminal` does (see workflow 9's `FinalizeRun`). Reads
+`workflows.estimated_manual_minutes`, defaults to 15 minutes when unset, and only accrues on
+`status='completed'` — a rejected-approval run still reaches `'completed'` (same engine semantics
+as any other completed run) and does accrue; a failed/cancelled run does not. Both the per-run
+figure and the org-wide accumulation happen in one `tenant.WithTx`, so they can't drift apart on a
+crash between the two writes.
+
+**`GET /runs/{id}/steps`, `GET /runs/{id}/cost` (`internal/api/runs/handler.go`)** and
+**`GET /analytics/hours-saved` (new `internal/api/analytics` package — workflow 14 adds
+token-usage/agent-performance endpoints to the same package later)** are all read-only, all
+tenant-scoped the same way every other `GET` in this codebase is. Cost breakdown groups
+`cost_ledger` by whatever `cost_type` exists for the run — `llm_inference`/`tool_call` are the
+only ones any code writes today; `embedding`/`reranking` are supported by the query but have no
+writer until workflow 12's RAG-query path (and even then, workflow 6's own ingestion-time
+embedding isn't run-scoped, so it was never a candidate for this endpoint either).
+
+**Testing**: `TestBuildNodes_WritesWorkflowStepsTrace` and `TestLauncher_LaunchAccruesHoursSaved`
+(both in `internal/core/graph`) plus HTTP-level tests for `Steps`/`Cost`/`HoursSaved` with
+cross-org isolation checks. The "trace available for failed runs too" acceptance criterion was
+verified live, not assumed: a real `[TEST] stuck-loop workflow` run produced 4 real trace rows
+(planning, 2 reasoning turns, 1 tool call) before the stuck-loop detector aborted it with
+`status='failed'`.
+
+**A real incident worth knowing about if you touch `internal/core/pii`'s tests**: a test fixture
+using a fake Slack bot token shaped like Slack's real 3-segment format (prefix, workspace-like
+digits, alphanumeric suffix) tripped GitHub's push-protection secret scanner on this commit,
+blocking the push even though it was never a real credential — and that push-protection scanner
+flags a realistic-looking token in prose (e.g. this very sentence, in an earlier draft) exactly as
+readily as one in code, so don't requote the original fixture value here either. Fixed by
+rewriting the fixture to something unambiguously fake (`xoxb-test-fixture-not-a-real-token`) and
+amending the commit (safe only because it had never
+reached `origin/main`). Don't use realistic-provider-shaped fake tokens in test data for
+secret-detection code going forward.
+
+### Search Knowledge Base / RAG Query (workflow 12) — `internal/core/documents/search.go`, extends `internal/api/documents`
+
+Builds the query-side counterpart to workflow 6's ingestion pipeline: query-embed → optional
+HyDE-averaged vector → Pinecone query → Cohere rerank → hydrate from Postgres. Built 2026-09-05/06.
+Full scope-deviation reasoning (4 items) lives in `WORKFLOW_PLAN_GO.md`'s Workflow 12 section —
+this doc doesn't duplicate it, only the parts worth knowing before touching this code.
+
+**Role-based ACL did not exist anywhere in this codebase before this workflow** — `documents` had
+no visibility column at all, just tenant-level isolation via RLS + the Pinecone namespace. Added
+`documents.visibility` (`all_members` default / `owner_only`, migration
+`000012_workflow12_document_visibility`) plus an optional `visibility` form field on
+`POST /documents/upload`. The ACL check itself is `role IN ('owner','admin')` sees everything,
+anything else (today just `member` — no `viewer` role exists yet, that's workflow 13's job) only
+sees `all_members` docs — resolved via a new `ListSearchableDocumentIDs` query **before** any
+embedding or Pinecone call, so a user with nothing allowed short-circuits before ever calling
+Cohere/Pinecone. The resulting doc-id set becomes a Pinecone `doc_id $in [...]` metadata filter —
+one mechanism doing triple duty as ACL enforcement, category filtering, and a second layer of
+tenant isolation on top of the namespace.
+
+**`Searcher` (`internal/core/documents/search.go`) is the search-side mirror of `Processor`** —
+same interface-segregation reasoning, extended onto the existing `Embedder`/`VectorIndex`
+interfaces (`EmbedOne` with a package-local `EmbedMode` enum — not `cohere.EmbedInputType`
+directly, keeping the SDK type out of the interface — and `VectorIndex.Query`) plus a new
+`Reranker` interface. `HyDEGenerator` is defined in this package (the consumer) but implemented in
+`internal/api/documents` (`chatClientHyDE`, wrapping a resolved `llm.ChatClient`) — `documents`
+deliberately never imports `internal/core/llm` itself. HyDE is a **per-call** parameter to
+`Searcher.Search`, not a `Searcher` field: whether it runs at all depends on the requesting org's
+own BYOK configuration, resolved fresh per request (`Handler.resolveHyDE`), since `Searcher`
+itself is a shared, org-agnostic singleton. A HyDE failure — no active key, or the resolved
+client's `Send` call itself failing — never fails the search; it degrades to the raw query
+embedding, same "logged no-op" philosophy workflow 10's `internal/core/notify` already
+established. `hydeModelByProvider` (in the api-layer handler, not `internal/core/llm`) picks a
+cheap/fast model per provider — HyDE only needs a short hypothetical passage, not real reasoning.
+
+**A real bug caught during implementation, not after**: the plan's own literal Redis cache-key
+spec (`cache:rag:{org_id}:{sha256(query+category)}`) would let one user's search populate a cache
+entry a *different-role* user could later hit with the identical query+category — concretely, an
+owner searching an `owner_only` document, then a member issuing the same search and silently
+getting the owner's cached (ACL-violating) results. Fixed by folding the requester's ACL scope
+(`role IN ('owner','admin')`, one bit) into the hashed cache key.
+
+**A second real bug, caught via a live curl smoke test against real Cohere/Pinecone/Redis, not a
+unit test**: the cache-hit and ACL-empty-result code paths in `Handler.Search` both returned
+before ever reaching the `audit_logs` insert, so `rag.search` was only ever logged on a full
+cache-miss search. A compliance-minded founder cares about a zero-result attempt at an
+`owner_only` document at least as much as a successful search — fixed by extracting a shared
+`auditSearch` helper called from all 3 return paths, with regression tests added for both
+previously-silent paths.
+
+**Verified live end to end against real infrastructure (not fakes), via a disposable smoke-test
+org, cleaned up after**: real upload → Cohere embed → Pinecone upsert → indexed; a real uncached
+search at 0.96s (budget: 5s); a cache hit at 47ms (budget: 200ms); real cross-role ACL enforcement
+(a real member-role user got 0 results on an `owner_only` doc, a real owner saw it).
+
+**Testing**: `internal/core/documents/search_test.go` (pure `Searcher` unit tests — vector
+averaging, HyDE/rerank graceful-degradation, topK truncation, namespace scoping, all via stub
+interfaces, no network) and `internal/api/documents/handler_integration_test.go`'s
+`TestDocumentsHandler_Search_*` (9 subtests: reranked/hydrated results, ACL enforcement both
+directions, the ACL-empty short-circuit — proven via a `panicIfQueriedIndex` fake that panics if
+`Searcher` is ever reached — category filtering, HyDE-failure resilience, empty-query rejection,
+audit-log content redaction, and cache isolation-by-role via a real local Redis). `fakeVectorIndex`
+in the test file genuinely decodes and respects a `doc_id $in` `*pinecone.MetadataFilter` (not a
+stub that ignores it) — otherwise an ACL test could pass for the wrong reason, the filter never
+actually reaching "Pinecone" at all.
 
 ### No ORM — `pgx` + `sqlc`, not GORM
 
@@ -1399,6 +1526,7 @@ machine — CI runs the authoritative version of the same check regardless.
 | `/api/v1/integrations`, `/api/v1/integrations/{service}/connect` (all auth types), `.../status`, `DELETE .../{service}` | `internal/api/integrations/handler.go` | `middleware.RequireAuth` | Connect/manage third-party integrations (workflow 4) |
 | `/api/v1/integrations/{service}/callback` | `internal/api/integrations/handler.go` | none — org/service recovered from `state`, not a JWT | OAuth provider redirect target (workflow 4) |
 | `/api/v1/documents/upload`, `GET /documents`, `GET /documents/{id}`, `DELETE /documents/{id}`, `POST /documents/{id}/reindex` | `internal/api/documents/handler.go` | `middleware.RequireAuth` | Upload/list/reindex/delete founder documents for RAG (workflow 6) |
+| `POST /api/v1/documents/search` | `internal/api/documents/handler.go` | `middleware.RequireAuth` | RAG query over uploaded documents, ACL + category filtered, Redis-cached (workflow 12) |
 | `GET/POST /api/v1/agents`, `GET /agents/tools`, `GET/PATCH/DELETE /agents/{id}` | `internal/api/agents/handler.go` | `middleware.RequireAuth` | Agent configuration CRUD — no execution (workflow 7) |
 | `GET/POST /api/v1/workflows`, `GET/PATCH/DELETE /workflows/{id}`, `POST /workflows/{id}/run` | `internal/api/workflows/handler.go` | `middleware.RequireAuth` | Workflow config CRUD + **launches a real run** (workflow 8 CRUD, workflow 9 execution) |
 | `GET /api/v1/runs`, `GET /runs/{id}`, `POST /runs/{id}/cancel`, `GET /runs/{id}/stream` (SSE) | `internal/api/runs/handler.go` | `middleware.RequireAuth` | List/inspect/cancel/live-stream a run (workflow 9) |
@@ -1406,9 +1534,11 @@ machine — CI runs the authoritative version of the same check regardless.
 | `POST /api/v1/approvals/{id}/approve`, `POST /approvals/{id}/reject` | `internal/api/approvals/handler.go` (`RegisterActions`) | none — dual auth inside the handler (Bearer JWT or `?action_token=`) | Decide a pending approval; the action-token path is what lets a push notification's buttons work with the app closed (workflow 10) |
 | `GET/PUT /api/v1/settings/approvals` | `internal/api/settings/approvals.go` | `middleware.RequireAuth` | Org's configured Slack approvals channel (workflow 10) |
 | `POST/DELETE /api/v1/settings/push-subscription` | `internal/api/settings/pushsubscription.go` | `middleware.RequireAuth` | Register/remove a browser's Web Push subscription (workflow 10) |
+| `GET /api/v1/runs/{id}/steps`, `GET /runs/{id}/cost` | `internal/api/runs/handler.go` | `middleware.RequireAuth` | Persisted run trace / itemized cost breakdown (workflow 11) |
+| `GET /api/v1/analytics/hours-saved` | `internal/api/analytics/handler.go` | `middleware.RequireAuth` | Org-wide + this-month/this-week hours-saved figures (workflow 11) |
 
-(Everything else in `WORKFLOW_PLAN_GO.md` — run traces/cost breakdown (workflow 11) — is unbuilt.
-Add rows here as routers land.)
+(Everything else in `WORKFLOW_PLAN_GO.md` — team/role management (workflow 13) onward — is
+unbuilt. Add rows here as routers land.)
 
 ### Dependency policy
 
