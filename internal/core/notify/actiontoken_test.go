@@ -1,6 +1,8 @@
 package notify
 
 import (
+	"encoding/base64"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,10 +61,23 @@ func TestActionTokenSigner_TamperedRejected(t *testing.T) {
 	approvalID, userID := uuid.New(), uuid.New()
 
 	token := signer.Sign(approvalID, userID, time.Now().Add(time.Hour))
-	tampered := token[:len(token)-1] + "x"
-	if tampered == token {
-		t.Fatal("tampered token equals original — test setup bug")
+	parts := strings.SplitN(token, ".", 2)
+	if len(parts) != 2 {
+		t.Fatalf("token has unexpected shape: %q", token)
 	}
+	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode signature: %v", err)
+	}
+	// Flip a full byte well inside the digest, not the string's last
+	// character — RawURLEncoding's final base64 character for a 32-byte
+	// SHA256 digest carries 2 padding bits alongside 4 real ones, so a
+	// literal last-char string edit only actually changes the decoded
+	// bytes ~75% of the time (this was a real, ~1-in-8-runs flaky test,
+	// caught live via `make coverage`, not a hypothetical).
+	sigBytes[0] ^= 0xFF
+	tampered := parts[0] + "." + base64.RawURLEncoding.EncodeToString(sigBytes)
+
 	if _, err := signer.Verify(tampered, approvalID); err != ErrActionTokenInvalid {
 		t.Fatalf("Verify() error = %v, want ErrActionTokenInvalid", err)
 	}
