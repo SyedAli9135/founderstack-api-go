@@ -79,8 +79,12 @@ func testOrgAndUser(t *testing.T, systemPool *pgxpool.Pool) (orgID, userID pgtyp
 	if err != nil {
 		t.Fatalf("insert test org: %v", err)
 	}
+	// role='admin': this file's tests exercise workflow CRUD/run itself, not
+	// the CanModifyWorkflows/CanTriggerWorkflows permission gates — those
+	// get their own dedicated fixtures (see TestWorkflowsHandler_Run_ViewerBlocked
+	// and the create-permission tests below).
 	err = systemPool.QueryRow(ctx,
-		`insert into users (org_id, clerk_user_id, email) values ($1, $2, 'workflows-test@example.com') returning id`,
+		`insert into users (org_id, clerk_user_id, email, role) values ($1, $2, 'workflows-test@example.com', 'admin') returning id`,
 		orgID, clerkUserID,
 	).Scan(&userID)
 	if err != nil {
@@ -90,6 +94,18 @@ func testOrgAndUser(t *testing.T, systemPool *pgxpool.Pool) (orgID, userID pgtyp
 	t.Cleanup(func() {
 		_, _ = systemPool.Exec(context.Background(), "delete from organizations where id = $1", orgID)
 	})
+	return orgID, userID, clerkUserID
+}
+
+// testOrgAndUserWithRole is testOrgAndUser plus an explicit role override,
+// for the CanModifyWorkflows permission tests below — mirrors
+// internal/api/agents/handler_integration_test.go's helper of the same name.
+func testOrgAndUserWithRole(t *testing.T, systemPool *pgxpool.Pool, role string) (orgID pgtype.UUID, userID pgtype.UUID, clerkUserID string) {
+	t.Helper()
+	orgID, userID, clerkUserID = testOrgAndUser(t, systemPool)
+	if _, err := systemPool.Exec(context.Background(), "update users set role = $1 where clerk_user_id = $2", role, clerkUserID); err != nil {
+		t.Fatalf("set user role: %v", err)
+	}
 	return orgID, userID, clerkUserID
 }
 
@@ -575,6 +591,136 @@ func TestWorkflowsHandler_Run_Preflight(t *testing.T) {
 			t.Fatalf("error.code = %q, want AGENTS_PAUSED", env.Error.Code)
 		}
 	})
+}
+
+// TestWorkflowsHandler_Run_ViewerBlocked covers workflow 13's own
+// acceptance criterion — a member can trigger workflows (see
+// TestWorkflowsHandler_CreateBlockedForMemberAndViewer's own "member can
+// still run" check below), a viewer cannot.
+func TestWorkflowsHandler_Run_ViewerBlocked(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg)
+
+	orgID, userID, clerkUserID := testOrgAndUser(t, systemPool)
+	agentID := testAgent(t, appPool, orgID, userID, "Viewer Test Agent")
+	testBYOKKey(t, systemPool, orgID)
+	wfID := createTestWorkflow(t, cfg, router, clerkUserID, agentID)
+
+	if _, err := systemPool.Exec(context.Background(), "update users set role = 'viewer' where clerk_user_id = $1", clerkUserID); err != nil {
+		t.Fatal(err)
+	}
+
+	req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/workflows/"+wfID+"/run", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWorkflowsHandler_CreateBlockedForMemberAndViewer covers
+// CanModifyWorkflows — a workflow's config (which agent, schedule, input
+// template) is treated the same as an agent's own config (see
+// authctx.User.CanModifyWorkflows' doc comment): only owner/admin can
+// create one. Mirrors internal/api/agents/handler_integration_test.go's
+// TestAgentsHandler_MemberAndViewerCannotCreate.
+func TestWorkflowsHandler_CreateBlockedForMemberAndViewer(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+
+	for _, role := range []string{"member", "viewer"} {
+		t.Run(role, func(t *testing.T) {
+			orgID, userID, clerkUserID := testOrgAndUserWithRole(t, systemPool, role)
+			agentID := testAgent(t, appPool, orgID, userID, "Blocked Create Agent "+role)
+			router := testRouter(t, systemPool, appPool, cfg)
+
+			req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/workflows", map[string]any{
+				"agent_id": agentID.String(), "name": "Blocked Workflow", "trigger_type": "manual",
+			})
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("%s: status = %d, want 403; body = %s", role, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestWorkflowsHandler_UpdateAndDeleteBlockedForMemberAndViewer creates the
+// workflow as an admin first, then confirms a demoted member/viewer can't
+// modify or remove it — the guard is on the acting user's role, not the
+// workflow's own creator. Mirrors
+// TestAgentsHandler_MemberAndViewerCannotDelete's shape.
+func TestWorkflowsHandler_UpdateAndDeleteBlockedForMemberAndViewer(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg)
+
+	for _, role := range []string{"member", "viewer"} {
+		t.Run(role, func(t *testing.T) {
+			orgID, userID, clerkUserID := testOrgAndUser(t, systemPool)
+			agentID := testAgent(t, appPool, orgID, userID, "Blocked Modify Agent "+role)
+			wfID := createTestWorkflow(t, cfg, router, clerkUserID, agentID)
+
+			if _, err := systemPool.Exec(context.Background(), "update users set role = $1 where clerk_user_id = $2", role, clerkUserID); err != nil {
+				t.Fatal(err)
+			}
+
+			updateReq := authedRequest(t, cfg, clerkUserID, http.MethodPatch, "/api/v1/workflows/"+wfID, map[string]any{
+				"name": "Renamed",
+			})
+			updateRec := httptest.NewRecorder()
+			router.ServeHTTP(updateRec, updateReq)
+			if updateRec.Code != http.StatusForbidden {
+				t.Fatalf("%s update: status = %d, want 403; body = %s", role, updateRec.Code, updateRec.Body.String())
+			}
+
+			deleteReq := authedRequest(t, cfg, clerkUserID, http.MethodDelete, "/api/v1/workflows/"+wfID, nil)
+			deleteRec := httptest.NewRecorder()
+			router.ServeHTTP(deleteRec, deleteReq)
+			if deleteRec.Code != http.StatusForbidden {
+				t.Fatalf("%s delete: status = %d, want 403; body = %s", role, deleteRec.Code, deleteRec.Body.String())
+			}
+		})
+	}
+}
+
+// TestWorkflowsHandler_MemberCanRunButNotModify pins the exact split
+// workflow 13's user story draws: a member can trigger a workflow but not
+// reconfigure or remove it. Created as admin (Create is gated), demoted to
+// member, then Run must succeed while Update/Delete still 403.
+func TestWorkflowsHandler_MemberCanRunButNotModify(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg)
+
+	orgID, userID, clerkUserID := testOrgAndUser(t, systemPool)
+	agentID := testAgent(t, appPool, orgID, userID, "Member Run Agent")
+	testBYOKKey(t, systemPool, orgID)
+	wfID := createTestWorkflow(t, cfg, router, clerkUserID, agentID)
+
+	if _, err := systemPool.Exec(context.Background(), "update users set role = 'member' where clerk_user_id = $1", clerkUserID); err != nil {
+		t.Fatal(err)
+	}
+
+	runReq := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/workflows/"+wfID+"/run", nil)
+	runRec := httptest.NewRecorder()
+	router.ServeHTTP(runRec, runReq)
+	if runRec.Code != http.StatusAccepted {
+		t.Fatalf("run: status = %d, want 202; body = %s", runRec.Code, runRec.Body.String())
+	}
+
+	deleteReq := authedRequest(t, cfg, clerkUserID, http.MethodDelete, "/api/v1/workflows/"+wfID, nil)
+	deleteRec := httptest.NewRecorder()
+	router.ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusForbidden {
+		t.Fatalf("delete: status = %d, want 403; body = %s", deleteRec.Code, deleteRec.Body.String())
+	}
 }
 
 // createTestWorkflow is a small helper for tests that only need a

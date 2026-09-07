@@ -204,6 +204,10 @@ func (h *Handler) Create(c *gin.Context) {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
 		return
 	}
+	if !user.CanModifyWorkflows() {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Only an owner or admin can create workflows")
+		return
+	}
 
 	var req createWorkflowRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -287,6 +291,10 @@ func (h *Handler) Update(c *gin.Context) {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
 		return
 	}
+	if !user.CanModifyWorkflows() {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Only an owner or admin can update workflows")
+		return
+	}
 	id, ok := parseWorkflowID(c)
 	if !ok {
 		return
@@ -365,6 +373,10 @@ func (h *Handler) Delete(c *gin.Context) {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
 		return
 	}
+	if !user.CanModifyWorkflows() {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Only an owner or admin can delete workflows")
+		return
+	}
 	id, ok := parseWorkflowID(c)
 	if !ok {
 		return
@@ -394,6 +406,10 @@ func (h *Handler) Run(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
+		return
+	}
+	if !user.CanTriggerWorkflows() {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Viewers cannot trigger workflow runs")
 		return
 	}
 	id, ok := parseWorkflowID(c)

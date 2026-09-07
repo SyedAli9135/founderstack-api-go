@@ -281,13 +281,24 @@ func TestClerkWebhook_FullLifecycle(t *testing.T) {
 			t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
 		}
 		var role string
+		var canApprove, canManageKeys, canManageIntegrations bool
 		if err := pool.QueryRow(context.Background(),
-			"select role from users where clerk_user_id = $1", userClerkID,
-		).Scan(&role); err != nil {
+			"select role, can_approve_workflows, can_manage_api_keys, can_manage_integrations from users where clerk_user_id = $1", userClerkID,
+		).Scan(&role, &canApprove, &canManageKeys, &canManageIntegrations); err != nil {
 			t.Fatalf("query user: %v", err)
 		}
 		if role != "member" {
 			t.Fatalf("role = %q, want %q", role, "member")
+		}
+		// The user was active throughout this role change (created as
+		// org:admin, never removed) — its permission flags must survive
+		// untouched even though the new role would compute false for all 3.
+		// A membership re-sync must never silently clobber a flag that
+		// could since have been hand-adjusted via workflow 13's PATCH
+		// .../role.
+		if !canApprove || !canManageKeys || !canManageIntegrations {
+			t.Fatalf("flags = (%v, %v, %v), want all true — an active member's flags must not reset on a role-changing re-sync",
+				canApprove, canManageKeys, canManageIntegrations)
 		}
 	})
 
@@ -315,6 +326,45 @@ func TestClerkWebhook_FullLifecycle(t *testing.T) {
 		}
 		if isActive {
 			t.Fatal("is_active = true, want false after organizationMembership.deleted")
+		}
+	})
+
+	t.Run("organizationMembership.created after removal resets stale permission flags", func(t *testing.T) {
+		// Regression test for a real bug found live 2026-09-07: userClerkID
+		// is currently is_active=false with can_approve_workflows/
+		// can_manage_api_keys/can_manage_integrations all still true from
+		// its original org:admin creation earlier in this test. A brand new
+		// membership (this user was removed, then re-invited as a plain
+		// member) must reset those stale admin-era flags to the new role's
+		// default — unlike the still-active case above, there's no existing
+		// grant here worth protecting; the prior membership is over.
+		rec := postWebhook(t, router, secretBytes, map[string]any{
+			"type": "organizationMembership.created",
+			"data": map[string]any{
+				"organization": map[string]any{"id": orgClerkID, "name": "Test Org", "slug": orgSlug},
+				"public_user_data": map[string]any{
+					"user_id": userClerkID, "identifier": "founder@example.com",
+					"first_name": "Ada", "last_name": "Lovelace",
+				},
+				"role": "org:member",
+			},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+		}
+
+		var isActive, canApprove, canManageKeys, canManageIntegrations bool
+		if err := pool.QueryRow(context.Background(),
+			"select is_active, can_approve_workflows, can_manage_api_keys, can_manage_integrations from users where clerk_user_id = $1", userClerkID,
+		).Scan(&isActive, &canApprove, &canManageKeys, &canManageIntegrations); err != nil {
+			t.Fatalf("query user: %v", err)
+		}
+		if !isActive {
+			t.Fatal("is_active = false, want true after re-added via organizationMembership.created")
+		}
+		if canApprove || canManageKeys || canManageIntegrations {
+			t.Fatalf("flags = (%v, %v, %v), want all false — a reactivated membership must reset stale flags from a prior, terminated membership",
+				canApprove, canManageKeys, canManageIntegrations)
 		}
 	})
 

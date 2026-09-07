@@ -15,6 +15,8 @@ import (
 	coreoption "github.com/cohere-ai/cohere-go/v2/option"
 
 	"github.com/clerk/clerk-sdk-go/v2"
+	"github.com/clerk/clerk-sdk-go/v2/organizationinvitation"
+	"github.com/clerk/clerk-sdk-go/v2/organizationmembership"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -28,6 +30,7 @@ import (
 	"github.com/founderstack/api/internal/api/identity"
 	integrationsapi "github.com/founderstack/api/internal/api/integrations"
 	"github.com/founderstack/api/internal/api/middleware"
+	"github.com/founderstack/api/internal/api/org"
 	runsapi "github.com/founderstack/api/internal/api/runs"
 	"github.com/founderstack/api/internal/api/settings"
 	v1 "github.com/founderstack/api/internal/api/v1"
@@ -319,6 +322,15 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	// auth (Bearer or ?action_token=) per request instead.
 	apiApprovalsActions := router.Group("/api/v1")
 	approvalsHandler.RegisterActions(apiApprovalsActions)
+
+	// The zero-value ClientConfig is deliberate: BackendConfig.Key nil falls
+	// back to whatever clerk.SetKey(cfg.ClerkSecretKey) already configured
+	// at boot — no separate credential wiring needed.
+	membershipSyncer := org.NewClerkMembershipSyncer(organizationmembership.NewClient(&clerk.ClientConfig{}))
+	invitationLister := org.NewClerkInvitationLister(organizationinvitation.NewClient(&clerk.ClientConfig{}))
+	apiOrg := router.Group("/api/v1")
+	apiOrg.Use(middleware.RequireAuth(systemDB, cfg))
+	org.NewHandler(db, membershipSyncer, invitationLister).Register(apiOrg)
 
 	return router
 }

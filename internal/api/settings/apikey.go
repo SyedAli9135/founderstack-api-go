@@ -92,6 +92,10 @@ func (h *Handler) SubmitAPIKey(c *gin.Context) {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
 		return
 	}
+	if !user.CanManageAPIKeys {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "You don't have permission to manage BYOK keys")
+		return
+	}
 
 	var req submitAPIKeyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -219,6 +223,10 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
+		return
+	}
+	if !user.CanManageAPIKeys {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "You don't have permission to manage BYOK keys")
 		return
 	}
 

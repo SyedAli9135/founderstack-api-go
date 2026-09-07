@@ -232,6 +232,10 @@ func (h *Handler) Create(c *gin.Context) {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
 		return
 	}
+	if !user.CanModifyAgents() {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Only an owner or admin can create agents")
+		return
+	}
 
 	var req createAgentRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -345,6 +349,10 @@ func (h *Handler) Update(c *gin.Context) {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
 		return
 	}
+	if !user.CanModifyAgents() {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Only an owner or admin can modify agents")
+		return
+	}
 	id, ok := parseAgentID(c)
 	if !ok {
 		return
@@ -421,6 +429,10 @@ func (h *Handler) Delete(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
+		return
+	}
+	if !user.CanModifyAgents() {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Only an owner or admin can delete agents")
 		return
 	}
 	id, ok := parseAgentID(c)

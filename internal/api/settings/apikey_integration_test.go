@@ -83,9 +83,13 @@ func testOrgAndUser(t *testing.T, systemPool *pgxpool.Pool) (clerkUserID string)
 	if err != nil {
 		t.Fatalf("insert test org: %v", err)
 	}
+	// role='admin' + can_manage_api_keys=true: this file tests BYOK
+	// submission itself, not workflow 13's permission gate — a plain
+	// default-role fixture user would now get 403'd by
+	// Handler.SubmitAPIKey/DeleteAPIKey's CanManageAPIKeys check.
 	_, err = systemPool.Exec(ctx,
-		`insert into users (org_id, clerk_user_id, email)
-		 select id, $2, 'settings-test@example.com' from organizations where clerk_org_id = $1`,
+		`insert into users (org_id, clerk_user_id, email, role, can_manage_api_keys)
+		 select id, $2, 'settings-test@example.com', 'admin', true from organizations where clerk_org_id = $1`,
 		orgClerkID, clerkUserID,
 	)
 	if err != nil {
@@ -568,5 +572,36 @@ func TestSettingsAPIKey_ListProviders_CrossOrgIsolation(t *testing.T) {
 		if p.IsConfigured {
 			t.Fatalf("org B sees provider %q as configured — cross-tenant leak: %+v", p.Provider, got.Data)
 		}
+	}
+}
+
+func TestSettingsAPIKey_MemberAndViewerCannotManageKeys(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	encryptionKey := testEncryptionKey(t)
+	router := testRouter(t, systemPool, appPool, cfg, encryptionKey)
+
+	for _, role := range []string{"member", "viewer"} {
+		t.Run(role, func(t *testing.T) {
+			clerkUserID := testOrgAndUser(t, systemPool)
+			if _, err := systemPool.Exec(context.Background(), "update users set role = $1, can_manage_api_keys = false where clerk_user_id = $2", role, clerkUserID); err != nil {
+				t.Fatal(err)
+			}
+
+			req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/settings/api-key", map[string]any{"api_key": "sk-ant-test-key-1234567890"})
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("submit: status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+			}
+
+			delReq := authedRequest(t, cfg, clerkUserID, http.MethodDelete, "/api/v1/settings/api-key", nil)
+			delRec := httptest.NewRecorder()
+			router.ServeHTTP(delRec, delReq)
+			if delRec.Code != http.StatusForbidden {
+				t.Fatalf("delete: status = %d, want 403; body = %s", delRec.Code, delRec.Body.String())
+			}
+		})
 	}
 }

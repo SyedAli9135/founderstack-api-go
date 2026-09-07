@@ -22,10 +22,11 @@ BYOK is **not** Claude-only: `internal/core/llm` validates and stores keys for 5
 Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 from an
 Anthropic-only original). See "BYOK API Keys" below.
 
-**Workflows 1 (bootstrap) through 12 (RAG document search) are implemented.** Workflow 11 (run
-trace/cost, 2026-09-04) and workflow 12 (RAG search, 2026-09-05/06) are the two most recent — see
-"View Run Trace & Cost (workflow 11)" and "Search Knowledge Base / RAG Query (workflow 12)"
-below. Don't assume routes, tables, or packages from workflow 13+ in `WORKFLOW_PLAN_GO.md` exist —
+**Workflows 1 (bootstrap) through 13 (team members & roles) are implemented.** Workflow 11 (run
+trace/cost, 2026-09-04), workflow 12 (RAG search, 2026-09-05/06), and workflow 13 (team/roles,
+2026-09-07) are the 3 most recent — see "View Run Trace & Cost (workflow 11)", "Search Knowledge
+Base / RAG Query (workflow 12)", and "Manage Team Members & Roles (workflow 13)" below. Don't
+assume routes, tables, or packages from workflow 14+ in `WORKFLOW_PLAN_GO.md` exist —
 check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
@@ -1124,11 +1125,10 @@ verification of the real approve/reject flow: the founder's own dev account got 
 NOT_AUTHORIZED_TO_APPROVE` on their own workflow's approval. Fixed at the source, not by hand-
 patching the one account: `internal/db/queries/clerk_sync.sql`'s `UpsertUserForMembership` now
 takes `can_approve_workflows` as an INSERT column (via `clerk.go`'s new `canApproveByDefault(role)`
-— `true` for `admin`/`owner`) — deliberately **not** added to the `ON CONFLICT DO UPDATE SET`
-clause, so a membership re-sync (role change, reactivation) never silently resets a flag that
-could since have been granted or revoked by hand. Whoever creates/administers an org (Clerk's own
-default role for an org's creator is `admin`) can now approve their own agents' actions the
-moment workflow 10 first runs for them, without needing workflow 13 to exist first.
+— `true` for `admin`/`owner`). Whoever creates/administers an org (Clerk's own default role for an
+org's creator is `admin`) can now approve their own agents' actions the moment workflow 10 first
+runs for them, without needing workflow 13 to exist first. (This column's `ON CONFLICT` behavior
+was refined once workflow 13 actually existed — see that section's own permission-flags note.)
 
 **Verified live end-to-end, not just via the test suite** — the same discipline workflow 9's own
 verification pass established: booted both servers (`MOCK_LLM_MODE=true`), ran the existing
@@ -1291,6 +1291,134 @@ audit-log content redaction, and cache isolation-by-role via a real local Redis)
 in the test file genuinely decodes and respects a `doc_id $in` `*pinecone.MetadataFilter` (not a
 stub that ignores it) — otherwise an ACL test could pass for the wrong reason, the filter never
 actually reaching "Pinecone" at all.
+
+### Manage Team Members & Roles (workflow 13) — `internal/api/org`, extends `internal/api/authctx`, `internal/api/middleware`, `internal/api/webhooks`
+
+Built 2026-09-07. Full scope-deviation reasoning (5 items) lives in `WORKFLOW_PLAN_GO.md`'s
+Workflow 13 section — this doc covers what's worth knowing before touching this code, not a
+duplicate of that reasoning.
+
+**This app's role vocabulary (`owner`/`admin`/`member`/`viewer`) is finer-grained than what Clerk's
+own sync path ever actually writes.** Clerk's default role for whoever creates an org is `admin`
+— there's no distinct `owner` Clerk itself assigns — so `authctx.User.IsOwnerOrAdmin()` (`role ==
+"owner" || role == "admin"`) is the real "can administer this org" check everywhere in this
+codebase, not just this workflow (workflow 10's `canApproveByDefault`, workflow 12's document
+ACL, and now `internal/api/org`'s own guards all use the same admin/owner-equivalence). `owner` is
+still a settable value via this workflow's own `PATCH .../role`, it's just never Clerk's default.
+
+**`authctx.User` gained 3 fields this workflow needed and nothing before it did**:
+`ClerkOrgID` (from `organizations.clerk_org_id`, needed to call Clerk's org-membership API),
+`CanManageAPIKeys`, `CanManageIntegrations` (from the schema's existing, previously-unused
+`can_manage_*` columns). `ResolveUser` (`internal/api/middleware/auth.go`) now selects these
+alongside `role` in the same query that already ran on every authenticated request — no new query,
+just 2 more columns on an existing one. Two new role-derived helper methods live directly on
+`authctx.User` (`IsOwnerOrAdmin`, `CanModifyAgents`, `CanTriggerWorkflows`) rather than a separate
+package, since they're pure functions of a field that type already carries.
+
+**A real regression caught and fixed before this workflow's own enforcement ever shipped**:
+`can_manage_api_keys`/`can_manage_integrations` had existed in the schema since migration 000001
+but no code path had ever set either to `true` — not even for an org's own admin/owner, unlike
+`can_approve_workflows` which workflow 10 already defaulted correctly. Wiring up
+`internal/api/settings/apikey.go`'s new `CanManageAPIKeys` gate without first fixing this would
+have immediately locked every existing admin/owner — including a real org's own founder — out of
+their own BYOK settings the moment this code shipped. Fixed two ways: (1)
+`internal/api/webhooks/clerk.go`'s `upsertMembership` now defaults both flags to `true` for
+admin/owner, the same `canApproveByDefault` boolean already computed there; (2) migration
+`000013_backfill_admin_permission_flags` retroactively grants both flags to every existing active
+admin/owner row — a one-way backfill (its `.down.sql` is deliberately a no-op; reverting it would
+recreate the exact lockout it exists to prevent). Verified against the real dev org's own real
+account before considering the gate safe to ship.
+
+**`internal/api/org/membership.go`'s `MembershipSyncer` interface is the one external dependency**
+(same interface-segregation reasoning as `internal/core/documents`' `BlobStore`/`Embedder`/
+`VectorIndex`) — `UpdateRole`/`Remove`, backed by `clerk-sdk-go`'s `organizationmembership.Client`
+(`Update`/`Delete`, `NewClient(&clerk.ClientConfig{})` — the zero-value config's nil `Key` falls
+back to whatever `clerk.SetKey` already configured at boot, no separate credential wiring). Tests
+use a fake — calling Clerk's real API from a test would risk mutating a real org's real membership
+data, the same "never touch real third-party state from an automated test" discipline this
+codebase already follows elsewhere. **The two calls have deliberately different failure
+semantics**: `UpdateRole` is best-effort (logged, not propagated) — Clerk rejecting this app's
+finer-grained role vocabulary must not undo a local change Postgres already committed, since
+Postgres is this app's own enforcement source of truth regardless of what Clerk thinks the role
+is. `Remove` is **not** best-effort and runs **before** the local write: the Clerk webhook's own
+`UpsertUserForMembership` sets `is_active=true` unconditionally on any future
+`organizationMembership.updated` re-sync (a metadata change, Clerk resending an event) — if the
+real Clerk membership were left intact after a local-only soft-delete, an unrelated future webhook
+could silently resurrect this member's access. Deleting the real Clerk membership is what
+prevents that webhook from ever firing again for this user; a Clerk-removal failure fails the
+whole request and leaves the local row untouched (`TestOrgHandler_Remove_ClerkFailureLeavesLocalRecordUntouched`
+regression-tests exactly this).
+
+**`GET /org/members` reads Postgres directly, never calls Clerk's API** — Postgres is already kept
+in sync in real time by the Clerk webhook, so a live `clerk-sdk-go` list call on every page load
+would be pure added latency with no freshness benefit. `clerk-sdk-go` is only ever called by the 2
+mutation endpoints, to mirror a change this app itself just made.
+
+**Enforcement added in 3 other packages, all new to this workflow** (nothing enforced any of this
+before): `internal/api/agents/handler.go`'s `Create`/`Update`/`Delete` now check
+`user.CanModifyAgents()`; `internal/api/workflows/handler.go`'s `Run` checks
+`user.CanTriggerWorkflows()`; `internal/api/settings/apikey.go`'s `SubmitAPIKey`/`DeleteAPIKey`
+check `user.CanManageAPIKeys`. The member-vs-viewer split matches this workflow's own user
+story, not just its acceptance criteria: a member can trigger workflows but not modify agents or
+manage API keys; a viewer can do neither. `internal/core/graph`/`internal/core/mcp`/every other
+tool-execution path is untouched — permission checks are all at the HTTP-handler boundary, the
+same layer every other guard in this codebase (BYOK preflight, `agents_paused`,
+`can_approve_workflows`) already lives at.
+
+**A real gap in the above, found and closed 2026-09-07 while manually testing this exact
+workflow: `internal/api/workflows/handler.go`'s `Create`/`Update`/`Delete` had no permission check
+at all** — only `Run` did. Any authenticated member of the org, including a `viewer`, could
+create, reconfigure, or delete a workflow outright; the founder caught this live by asking "can a
+viewer delete a workflow, or should we restrict it?" after testing the invitation flow with a real
+second account. Fixed by treating a workflow's own config the same as an agent's: new
+`authctx.User.CanModifyWorkflows()` (`IsOwnerOrAdmin()`, its own method rather than reusing
+`CanModifyAgents` so the check reads as being about workflows) now gates all 3, leaving `Run`
+exactly as it already was — a member can still trigger a workflow, just not reconfigure or remove
+one. `TestWorkflowsHandler_CreateBlockedForMemberAndViewer`,
+`TestWorkflowsHandler_UpdateAndDeleteBlockedForMemberAndViewer`, and
+`TestWorkflowsHandler_MemberCanRunButNotModify` cover the 3 gated endpoints and the deliberate
+run/modify split; `testOrgAndUser`'s default fixture role moved from unset (`member`) to `admin`
+for the same reason workflow 13's original ship required the same fix in `internal/api/agents`
+and `internal/api/settings` — those tests exercise workflow CRUD itself, not this new gate.
+
+**`last_login_at` had a column since migration 000001 but no write path** — added a fire-and-forget
+goroutine inside `RequireAuth` (`internal/api/middleware/auth.go`), matching the "detached, not
+awaited" pattern workflow 10's notification dispatch already established for a non-critical side
+effect. `TouchLastLogin`'s own `WHERE` clause (`last_login_at IS NULL OR < now() - interval '5
+minutes'`) is what actually bounds this to one write per user per 5 minutes, not the goroutine —
+the goroutine only keeps a slow write off the request's critical path, it doesn't throttle
+anything by itself.
+
+**Testing**: `internal/api/org/handler_integration_test.go` (13 tests) covers list/cross-org
+isolation, role-update permission derivation and Clerk-sync-failure resilience, and both of
+Remove's failure modes (self-removal blocked before any Clerk call; a Clerk removal failure
+leaving the local record untouched). Existing fixtures in `internal/api/agents`,
+`internal/api/settings`, and `internal/api/workflows` needed a one-line role fix each (`role =
+'admin'` on their default test user) since those files test the underlying feature, not this
+workflow's new permission gate — a plain default-role (`member`) fixture user would otherwise get
+403'd by the new guards.
+
+**A real bug found live 2026-09-07, after this workflow shipped: a removed-then-re-invited member
+kept their old membership's permission flags.** Workflow 10's `UpsertUserForMembership` (see that
+section) deliberately never touched `can_approve_workflows`/`can_manage_api_keys`/
+`can_manage_integrations` on `ON CONFLICT`, so an already-active member's flags — possibly
+hand-adjusted since via this workflow's own `PATCH .../role` — couldn't be silently clobbered by a
+routine Clerk re-sync. That protection had an unintended side effect: it also protected a
+*previous, already-terminated* membership's flags from ever being reset. Concretely — verified
+directly against Clerk's own API, not just this app's DB — an account that had been an org
+admin/owner, was removed (`DELETE /org/members/{id}`, `is_active` → `false`), and was later
+re-invited as a plain `member` kept `can_manage_api_keys`/`can_manage_integrations`/
+`can_approve_workflows` all `true`: the `ON CONFLICT` branch still never touched those 3 columns,
+so the brand-new membership silently inherited an unrelated, already-ended membership's elevated
+permissions. Fixed by conditioning the reset on the *existing* row's `is_active`: `ON CONFLICT DO
+UPDATE SET can_approve_workflows = CASE WHEN users.is_active THEN users.can_approve_workflows ELSE
+EXCLUDED.can_approve_workflows END` (same shape for the other two) — an already-active member's
+flags are still preserved across a re-sync (the original protection, intact), but a reactivation
+of a previously-removed member now gets the freshly computed role-derived default instead of
+whatever the prior, terminated membership happened to leave behind.
+`TestClerkWebhook_FullLifecycle`'s `organizationMembership.created after removal resets stale
+permission flags` subtest is the regression test; the existing `organizationMembership.updated
+changes the role` subtest was extended to assert the still-active case is genuinely untouched.
 
 ### No ORM — `pgx` + `sqlc`, not GORM
 
@@ -1536,9 +1664,12 @@ machine — CI runs the authoritative version of the same check regardless.
 | `POST/DELETE /api/v1/settings/push-subscription` | `internal/api/settings/pushsubscription.go` | `middleware.RequireAuth` | Register/remove a browser's Web Push subscription (workflow 10) |
 | `GET /api/v1/runs/{id}/steps`, `GET /runs/{id}/cost` | `internal/api/runs/handler.go` | `middleware.RequireAuth` | Persisted run trace / itemized cost breakdown (workflow 11) |
 | `GET /api/v1/analytics/hours-saved` | `internal/api/analytics/handler.go` | `middleware.RequireAuth` | Org-wide + this-month/this-week hours-saved figures (workflow 11) |
+| `GET /api/v1/org/members` | `internal/api/org/handler.go` | `middleware.RequireAuth` | List the org's team members and their roles/permissions (workflow 13) |
+| `PATCH /api/v1/org/members/{user_id}/role` | `internal/api/org/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | Change a member's role, derives permission flags, best-effort Clerk sync (workflow 13) |
+| `DELETE /api/v1/org/members/{user_id}` | `internal/api/org/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | Remove a member — real Clerk removal, then local soft-delete (workflow 13) |
 
-(Everything else in `WORKFLOW_PLAN_GO.md` — team/role management (workflow 13) onward — is
-unbuilt. Add rows here as routers land.)
+(Everything else in `WORKFLOW_PLAN_GO.md` — workflow 14 onward — is unbuilt. Add rows here as
+routers land.)
 
 ### Dependency policy
 

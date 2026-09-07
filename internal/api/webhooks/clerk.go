@@ -173,14 +173,19 @@ func (h *ClerkHandler) upsertMembership(ctx context.Context, raw json.RawMessage
 
 	fullName := nilIfEmpty(strings.TrimSpace(data.PublicUserData.FirstName + " " + data.PublicUserData.LastName))
 	role := normalizeRole(data.Role)
-	canApprove := canApproveByDefault(role)
+	// One flag drives all 3 defaults — an admin/owner gets full self-service
+	// access from the moment their membership syncs; workflow 13's PATCH
+	// .../role endpoint is the only other place that ever changes these.
+	isOrgAdmin := canApproveByDefault(role)
 	if err := h.db.UpsertUserForMembership(ctx, dbgen.UpsertUserForMembershipParams{
-		OrgID:               orgID,
-		ClerkUserID:         data.PublicUserData.UserID,
-		Email:               data.PublicUserData.Identifier,
-		FullName:            fullName,
-		Role:                role,
-		CanApproveWorkflows: &canApprove,
+		OrgID:                 orgID,
+		ClerkUserID:           data.PublicUserData.UserID,
+		Email:                 data.PublicUserData.Identifier,
+		FullName:              fullName,
+		Role:                  role,
+		CanApproveWorkflows:   &isOrgAdmin,
+		CanManageApiKeys:      &isOrgAdmin,
+		CanManageIntegrations: &isOrgAdmin,
 	}); err != nil {
 		return fmt.Errorf("upsert user: %w", err)
 	}
@@ -188,7 +193,8 @@ func (h *ClerkHandler) upsertMembership(ctx context.Context, raw json.RawMessage
 }
 
 // Clerk's default role for whoever creates an org is "admin" — pre-authorizing admin/owner
-// to approve is what makes workflow 10 usable before workflow 13 (team management) exists.
+// for approvals/API-keys/integrations is what makes those features self-service before
+// workflow 13 (team management) exists to grant permissions any other way.
 func canApproveByDefault(role string) bool {
 	return role == "admin" || role == "owner"
 }

@@ -92,31 +92,42 @@ func (q *Queries) UpsertOrganization(ctx context.Context, arg UpsertOrganization
 }
 
 const upsertUserForMembership = `-- name: UpsertUserForMembership :exec
-INSERT INTO users (org_id, clerk_user_id, email, full_name, role, can_approve_workflows, is_active)
-VALUES ($1, $2, $3, $4, $5, $6, true)
+INSERT INTO users (org_id, clerk_user_id, email, full_name, role, can_approve_workflows, can_manage_api_keys, can_manage_integrations, is_active)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
 ON CONFLICT (clerk_user_id) DO UPDATE SET
     org_id = EXCLUDED.org_id,
     role = EXCLUDED.role,
-    is_active = true
+    is_active = true,
+    can_approve_workflows = CASE WHEN users.is_active THEN users.can_approve_workflows ELSE EXCLUDED.can_approve_workflows END,
+    can_manage_api_keys = CASE WHEN users.is_active THEN users.can_manage_api_keys ELSE EXCLUDED.can_manage_api_keys END,
+    can_manage_integrations = CASE WHEN users.is_active THEN users.can_manage_integrations ELSE EXCLUDED.can_manage_integrations END
 `
 
 type UpsertUserForMembershipParams struct {
-	OrgID               pgtype.UUID `json:"org_id"`
-	ClerkUserID         string      `json:"clerk_user_id"`
-	Email               string      `json:"email"`
-	FullName            *string     `json:"full_name"`
-	Role                string      `json:"role"`
-	CanApproveWorkflows *bool       `json:"can_approve_workflows"`
+	OrgID                 pgtype.UUID `json:"org_id"`
+	ClerkUserID           string      `json:"clerk_user_id"`
+	Email                 string      `json:"email"`
+	FullName              *string     `json:"full_name"`
+	Role                  string      `json:"role"`
+	CanApproveWorkflows   *bool       `json:"can_approve_workflows"`
+	CanManageApiKeys      *bool       `json:"can_manage_api_keys"`
+	CanManageIntegrations *bool       `json:"can_manage_integrations"`
 }
 
-// can_approve_workflows is set only on first INSERT, never touched by the
-// ON CONFLICT branch (not listed in its SET clause) — a membership re-sync
-// (role change, reactivation) must never silently reset a flag that could
-// since have been granted or revoked by hand. Workflow 13 (team management)
-// doesn't exist yet, so there's no in-app way for an org's own
-// admin/owner to grant themselves this — defaulting it true for whoever
-// created/administers the org is what lets Workflow 10's approval gate be
-// usable at all before that UI exists.
+// can_approve_workflows/can_manage_api_keys/can_manage_integrations are
+// reset to the freshly computed role-derived default (EXCLUDED) only when
+// the existing row is currently inactive — a genuine new membership after
+// having been removed. An already-active member's flags are left
+// untouched on conflict, since those may since have been hand-adjusted via
+// workflow 13's PATCH .../role, which a routine Clerk membership re-sync
+// (role unchanged, just metadata) must never silently clobber.
+//
+// Real bug this fixes, found live 2026-09-07: without the is_active
+// branch, a former admin/owner who was removed and later re-invited as a
+// plain member kept their old admin-era flags forever — the ON CONFLICT
+// branch never touched these 3 columns at all, so ANY re-sync (including
+// a brand-new membership) silently carried forward whatever a completely
+// unrelated, already-terminated membership had left behind.
 func (q *Queries) UpsertUserForMembership(ctx context.Context, arg UpsertUserForMembershipParams) error {
 	_, err := q.db.Exec(ctx, upsertUserForMembership,
 		arg.OrgID,
@@ -125,6 +136,8 @@ func (q *Queries) UpsertUserForMembership(ctx context.Context, arg UpsertUserFor
 		arg.FullName,
 		arg.Role,
 		arg.CanApproveWorkflows,
+		arg.CanManageApiKeys,
+		arg.CanManageIntegrations,
 	)
 	return err
 }

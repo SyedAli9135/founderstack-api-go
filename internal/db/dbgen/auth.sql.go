@@ -12,31 +12,40 @@ import (
 )
 
 const getActiveOrganizationByID = `-- name: GetActiveOrganizationByID :one
-SELECT id, name, slug FROM organizations WHERE id = $1 AND is_active = true
+SELECT id, name, slug, clerk_org_id FROM organizations WHERE id = $1 AND is_active = true
 `
 
 type GetActiveOrganizationByIDRow struct {
-	ID   pgtype.UUID `json:"id"`
-	Name string      `json:"name"`
-	Slug string      `json:"slug"`
+	ID         pgtype.UUID `json:"id"`
+	Name       string      `json:"name"`
+	Slug       string      `json:"slug"`
+	ClerkOrgID string      `json:"clerk_org_id"`
 }
 
 func (q *Queries) GetActiveOrganizationByID(ctx context.Context, id pgtype.UUID) (GetActiveOrganizationByIDRow, error) {
 	row := q.db.QueryRow(ctx, getActiveOrganizationByID, id)
 	var i GetActiveOrganizationByIDRow
-	err := row.Scan(&i.ID, &i.Name, &i.Slug)
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Slug,
+		&i.ClerkOrgID,
+	)
 	return i, err
 }
 
 const getActiveUserByClerkUserID = `-- name: GetActiveUserByClerkUserID :one
 
-SELECT id, org_id, role FROM users WHERE clerk_user_id = $1 AND is_active = true
+SELECT id, org_id, role, can_manage_api_keys, can_manage_integrations
+FROM users WHERE clerk_user_id = $1 AND is_active = true
 `
 
 type GetActiveUserByClerkUserIDRow struct {
-	ID    pgtype.UUID `json:"id"`
-	OrgID pgtype.UUID `json:"org_id"`
-	Role  string      `json:"role"`
+	ID                    pgtype.UUID `json:"id"`
+	OrgID                 pgtype.UUID `json:"org_id"`
+	Role                  string      `json:"role"`
+	CanManageApiKeys      *bool       `json:"can_manage_api_keys"`
+	CanManageIntegrations *bool       `json:"can_manage_integrations"`
 }
 
 // Queries backing request authentication (internal/api/middleware/auth.go).
@@ -47,6 +56,24 @@ type GetActiveUserByClerkUserIDRow struct {
 func (q *Queries) GetActiveUserByClerkUserID(ctx context.Context, clerkUserID string) (GetActiveUserByClerkUserIDRow, error) {
 	row := q.db.QueryRow(ctx, getActiveUserByClerkUserID, clerkUserID)
 	var i GetActiveUserByClerkUserIDRow
-	err := row.Scan(&i.ID, &i.OrgID, &i.Role)
+	err := row.Scan(
+		&i.ID,
+		&i.OrgID,
+		&i.Role,
+		&i.CanManageApiKeys,
+		&i.CanManageIntegrations,
+	)
 	return i, err
+}
+
+const touchLastLogin = `-- name: TouchLastLogin :exec
+UPDATE users SET last_login_at = now()
+WHERE id = $1 AND (last_login_at IS NULL OR last_login_at < now() - interval '5 minutes')
+`
+
+// Best-effort, fire-and-forget from RequireAuth — the WHERE guard keeps
+// this to one write per user per 5 minutes, not one per request.
+func (q *Queries) TouchLastLogin(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, touchLastLogin, id)
+	return err
 }

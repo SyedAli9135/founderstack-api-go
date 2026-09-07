@@ -22,6 +22,9 @@ type Querier interface {
 	// "no such agent in this org" (0 rows) and return a real 404.
 	DeactivateAgent(ctx context.Context, arg DeactivateAgentParams) (int64, error)
 	DeactivateKeyByProvider(ctx context.Context, arg DeactivateKeyByProviderParams) (int64, error)
+	// Only ever called after the real Clerk-side removal already succeeded —
+	// see Handler.Remove's doc comment for why the ordering matters.
+	DeactivateMember(ctx context.Context, arg DeactivateMemberParams) error
 	// Semantically identical to PATCH {is_active: false} (pause) — kept as its
 	// own endpoint only for symmetry with every other resource's DELETE verb
 	// in this codebase, not because it does anything a pause doesn't already
@@ -74,6 +77,11 @@ type Querier interface {
 	GetHoursSavedSince(ctx context.Context, arg GetHoursSavedSinceParams) (float64, error)
 	GetKeyStatusByProvider(ctx context.Context, arg GetKeyStatusByProviderParams) (GetKeyStatusByProviderRow, error)
 	GetOrgApprovalsSlackChannel(ctx context.Context, id pgtype.UUID) (*string, error)
+	// Confirms the target member belongs to the caller's own org (cross-org
+	// access is a 404 here, same "wrong org is indistinguishable from doesn't
+	// exist" convention as every other tenant-scoped lookup in this codebase)
+	// and returns clerk_user_id, needed for the Clerk-side sync call.
+	GetOrgMemberForUpdate(ctx context.Context, arg GetOrgMemberForUpdateParams) (GetOrgMemberForUpdateRow, error)
 	// graph.Launcher's run lifecycle (POST /workflows/{id}/run's async goroutine
 	// — see internal/core/graph/launch.go) and the read-only HTTP endpoints
 	// (GET /runs, GET /runs/{id}).
@@ -196,6 +204,12 @@ type Querier interface {
 	// false (not SQL NULL) when llm_provider is unset, so the generated Go
 	// field is a plain bool, not a nullable pointer.
 	ListKeyStatuses(ctx context.Context, orgID pgtype.UUID) ([]ListKeyStatusesRow, error)
+	// Workflow 13 (team members & roles). Postgres — kept in sync by the Clerk
+	// webhook (clerk_sync.sql) — is this app's own source of truth for role
+	// display; internal/api/org/handler.go doesn't call out to Clerk's API on
+	// every list, only on a role change or removal (see that package's own
+	// doc comment for why).
+	ListOrgMembers(ctx context.Context, orgID pgtype.UUID) ([]ListOrgMembersRow, error)
 	ListPushSubscriptionsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListPushSubscriptionsForOrgRow, error)
 	ListRunsForOrg(ctx context.Context, arg ListRunsForOrgParams) ([]ListRunsForOrgRow, error)
 	// Workflow 12 (RAG search). ListSearchableDocumentIDs is the ACL + category
@@ -242,6 +256,9 @@ type Querier interface {
 	// per-request user/org session to run InsertWorkflowRun's tenant.WithTx
 	// variant under.
 	SystemInsertWorkflowRun(ctx context.Context, arg SystemInsertWorkflowRunParams) error
+	// Best-effort, fire-and-forget from RequireAuth — the WHERE guard keeps
+	// this to one write per user per 5 minutes, not one per request.
+	TouchLastLogin(ctx context.Context, id pgtype.UUID) error
 	// Partial update via COALESCE against sqlc.narg — every field is optional
 	// on the PATCH wire contract; only the ones actually present in the
 	// request are non-nil here. A rename that collides with another active
@@ -256,6 +273,13 @@ type Querier interface {
 	// having come from ListExpiringConnectionsSystem's own row.
 	UpdateConnectionTokensByIDSystem(ctx context.Context, arg UpdateConnectionTokensByIDSystemParams) (int64, error)
 	UpdateDocumentProcessing(ctx context.Context, arg UpdateDocumentProcessingParams) error
+	// Permission flags are recomputed from the new role (see
+	// internal/api/org/handler.go's defaultPermissionsForRole), not passed
+	// through as independent client input — the schema's can_manage_* columns
+	// exist for other code (can_approve_workflows is already read directly by
+	// internal/api/approvals) to check without needing to know this app's role
+	// hierarchy, but they're derived, not separately settable.
+	UpdateMemberRoleAndPermissions(ctx context.Context, arg UpdateMemberRoleAndPermissionsParams) error
 	UpdateOrgApprovalsSlackChannel(ctx context.Context, arg UpdateOrgApprovalsSlackChannelParams) error
 	// internal/core/graph's checkpoint read/write — the engine.Run/Resume/checkpoint
 	// calls added workflow9_engine_guardrails.up.sql for. Always run through
@@ -292,14 +316,20 @@ type Querier interface {
 	// internal/api/webhooks/clerk.go.
 	UpsertOrganization(ctx context.Context, arg UpsertOrganizationParams) (pgtype.UUID, error)
 	UpsertPushSubscription(ctx context.Context, arg UpsertPushSubscriptionParams) error
-	// can_approve_workflows is set only on first INSERT, never touched by the
-	// ON CONFLICT branch (not listed in its SET clause) — a membership re-sync
-	// (role change, reactivation) must never silently reset a flag that could
-	// since have been granted or revoked by hand. Workflow 13 (team management)
-	// doesn't exist yet, so there's no in-app way for an org's own
-	// admin/owner to grant themselves this — defaulting it true for whoever
-	// created/administers the org is what lets Workflow 10's approval gate be
-	// usable at all before that UI exists.
+	// can_approve_workflows/can_manage_api_keys/can_manage_integrations are
+	// reset to the freshly computed role-derived default (EXCLUDED) only when
+	// the existing row is currently inactive — a genuine new membership after
+	// having been removed. An already-active member's flags are left
+	// untouched on conflict, since those may since have been hand-adjusted via
+	// workflow 13's PATCH .../role, which a routine Clerk membership re-sync
+	// (role unchanged, just metadata) must never silently clobber.
+	//
+	// Real bug this fixes, found live 2026-09-07: without the is_active
+	// branch, a former admin/owner who was removed and later re-invited as a
+	// plain member kept their old admin-era flags forever — the ON CONFLICT
+	// branch never touched these 3 columns at all, so ANY re-sync (including
+	// a brand-new membership) silently carried forward whatever a completely
+	// unrelated, already-terminated membership had left behind.
 	UpsertUserForMembership(ctx context.Context, arg UpsertUserForMembershipParams) error
 	// Queries backing workflow 8 (workflow config CRUD + scheduling). Most are
 	// tenant-scoped through app_user via tenant.WithTx, like every other

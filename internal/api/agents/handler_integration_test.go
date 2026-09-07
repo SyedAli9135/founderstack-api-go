@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -106,8 +107,11 @@ func testOrgAndUser(t *testing.T, systemPool *pgxpool.Pool) (orgID pgtype.UUID, 
 	if err != nil {
 		t.Fatalf("insert test org: %v", err)
 	}
+	// role='admin': this file tests agent CRUD itself, not workflow 13's
+	// permission gate — a plain default-role fixture user would now get
+	// 403'd by Handler.Create/Update/Delete's CanModifyAgents check.
 	_, err = systemPool.Exec(ctx,
-		`insert into users (org_id, clerk_user_id, email) values ($1, $2, 'agents-test@example.com')`,
+		`insert into users (org_id, clerk_user_id, email, role) values ($1, $2, 'agents-test@example.com', 'admin')`,
 		orgID, clerkUserID,
 	)
 	if err != nil {
@@ -501,4 +505,81 @@ func TestAgentsHandler_FullLifecycle(t *testing.T) {
 			t.Fatalf("status = %d, want 404", rec.Code)
 		}
 	})
+}
+
+// testOrgAndUserWithRole is testOrgAndUser plus an explicit role — workflow
+// 13's CanModifyAgents guard needs a non-admin role to exercise the
+// "member/viewer cannot create/modify agents" restriction.
+func testOrgAndUserWithRole(t *testing.T, systemPool *pgxpool.Pool, role string) (orgID pgtype.UUID, clerkUserID string) {
+	t.Helper()
+	orgID, clerkUserID = testOrgAndUser(t, systemPool)
+	if _, err := systemPool.Exec(context.Background(), "update users set role = $1 where clerk_user_id = $2", role, clerkUserID); err != nil {
+		t.Fatalf("set user role: %v", err)
+	}
+	return orgID, clerkUserID
+}
+
+func TestAgentsHandler_MemberAndViewerCannotCreate(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	registry := fakeToolRegistry(t)
+
+	for _, role := range []string{"member", "viewer"} {
+		t.Run(role, func(t *testing.T) {
+			_, clerkUserID := testOrgAndUserWithRole(t, systemPool, role)
+			router := testRouter(t, systemPool, appPool, cfg, registry)
+
+			req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/agents", map[string]any{
+				"name": "Blocked Agent", "system_prompt": strings.Repeat("x", 60),
+				"policy_scope": map[string]any{"allowed_tools": []string{"stripe.get_mrr"}},
+			})
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("%s: status = %d, want 403; body = %s", role, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestAgentsHandler_MemberAndViewerCannotDelete(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	registry := fakeToolRegistry(t)
+
+	// Create the agent as an admin first, then confirm a demoted member/
+	// viewer can't delete it — the guard is on the acting user's role, not
+	// the agent's own owner.
+	adminOrgID, adminClerkID := testOrgAndUser(t, systemPool)
+	adminRouter := testRouter(t, systemPool, appPool, cfg, registry)
+	createReq := authedRequest(t, cfg, adminClerkID, http.MethodPost, "/api/v1/agents", map[string]any{
+		"name": "Real Agent", "system_prompt": strings.Repeat("x", 60),
+		"policy_scope": map[string]any{"allowed_tools": []string{"stripe.get_mrr"}},
+	})
+	createRec := httptest.NewRecorder()
+	adminRouter.ServeHTTP(createRec, createReq)
+	var env apiEnvelope
+	if err := json.Unmarshal(createRec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(env.Data, &created); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := systemPool.Exec(context.Background(), "update users set role = 'viewer' where clerk_user_id = $1", adminClerkID); err != nil {
+		t.Fatal(err)
+	}
+	_ = adminOrgID
+
+	req := authedRequest(t, cfg, adminClerkID, http.MethodDelete, "/api/v1/agents/"+created.ID, nil)
+	rec := httptest.NewRecorder()
+	adminRouter.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+	}
 }
