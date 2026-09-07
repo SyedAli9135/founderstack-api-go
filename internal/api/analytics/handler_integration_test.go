@@ -132,6 +132,35 @@ func insertCompletedRun(t *testing.T, systemPool *pgxpool.Pool, orgID, workflowI
 	}
 }
 
+// insertRun is the general form insertCompletedRun wraps — status/
+// duration/cost are all workflow 14's own agent-performance inputs, none
+// of which the hours-saved-only helper above sets.
+func insertRun(t *testing.T, systemPool *pgxpool.Pool, orgID, workflowID pgtype.UUID, status string, durationMs int32, costUSD float64) {
+	t.Helper()
+	if _, err := systemPool.Exec(context.Background(),
+		`insert into workflow_runs (workflow_id, org_id, status, duration_ms, cost_so_far_usd) values ($1, $2, $3, $4, $5)`,
+		workflowID, orgID, status, durationMs, costUSD,
+	); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+}
+
+func insertRagSearchAuditLog(t *testing.T, systemPool *pgxpool.Pool, orgID pgtype.UUID, resultCount int, avgRerankScore float64, fromCache bool, createdAt time.Time) {
+	t.Helper()
+	metadata, err := json.Marshal(map[string]any{
+		"result_count": resultCount, "avg_rerank_score": avgRerankScore, "from_cache": fromCache,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := systemPool.Exec(context.Background(),
+		`insert into audit_logs (org_id, actor_type, action, metadata_info, created_at) values ($1, 'user', 'rag.search', $2, $3)`,
+		orgID, metadata, createdAt,
+	); err != nil {
+		t.Fatalf("insert rag.search audit log: %v", err)
+	}
+}
+
 func TestAnalyticsHandler_HoursSaved(t *testing.T) {
 	appPool := testAppPool(t)
 	systemPool := testSystemPool(t)
@@ -226,5 +255,110 @@ func TestAnalyticsHandler_HoursSaved_CrossOrgIsolation(t *testing.T) {
 	}
 	if got.TotalHoursSaved != 0 {
 		t.Fatalf("TotalHoursSaved = %v, want 0 (another org's hours must not leak in)", got.TotalHoursSaved)
+	}
+}
+
+func getJSON[T any](t *testing.T, router *gin.Engine, cfg *config.Config, clerkUserID, path string) T {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	token, err := devtoken.Sign(cfg.DevTokenSecret.Expose(), clerkUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s: status = %d, want 200; body = %s", path, rec.Code, rec.Body.String())
+	}
+	var env apiEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	var out T
+	if err := json.Unmarshal(env.Data, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestAnalyticsHandler_AgentPerformance(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg)
+
+	orgID, clerkUserID, workflowID := testOrgAndUser(t, systemPool)
+	insertRun(t, systemPool, orgID, workflowID, "completed", 1000, 0.10)
+	insertRun(t, systemPool, orgID, workflowID, "completed", 3000, 0.30)
+	insertRun(t, systemPool, orgID, workflowID, "failed", 500, 0.05)
+
+	got := getJSON[[]agentPerformanceItem](t, router, cfg, clerkUserID, "/api/v1/analytics/agent-performance")
+	if len(got) != 1 {
+		t.Fatalf("len(got) = %d, want 1", len(got))
+	}
+	item := got[0]
+	if item.TotalRuns != 3 {
+		t.Errorf("TotalRuns = %d, want 3", item.TotalRuns)
+	}
+	if item.FailureCount != 1 {
+		t.Errorf("FailureCount = %d, want 1", item.FailureCount)
+	}
+	// 2 of 3 runs completed.
+	wantSuccessRate := 2.0 / 3.0
+	if diff := item.SuccessRate - wantSuccessRate; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("SuccessRate = %v, want %v", item.SuccessRate, wantSuccessRate)
+	}
+	if item.AvgDurationMs != (1000.0+3000.0+500.0)/3.0 {
+		t.Errorf("AvgDurationMs = %v, want %v", item.AvgDurationMs, (1000.0+3000.0+500.0)/3.0)
+	}
+}
+
+func TestAnalyticsHandler_AgentPerformance_CrossOrgIsolation(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg)
+
+	otherOrgID, _, otherWorkflowID := testOrgAndUser(t, systemPool)
+	insertRun(t, systemPool, otherOrgID, otherWorkflowID, "completed", 1000, 1.0)
+
+	_, clerkUserID, _ := testOrgAndUser(t, systemPool)
+
+	got := getJSON[[]agentPerformanceItem](t, router, cfg, clerkUserID, "/api/v1/analytics/agent-performance")
+	if len(got) != 0 {
+		t.Fatalf("len(got) = %d, want 0 (another org's runs must not leak in)", len(got))
+	}
+}
+
+func TestAnalyticsHandler_RagQuality(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg)
+
+	orgID, clerkUserID, _ := testOrgAndUser(t, systemPool)
+	now := time.Now().UTC()
+	insertRagSearchAuditLog(t, systemPool, orgID, 5, 0.8, false, now)
+	insertRagSearchAuditLog(t, systemPool, orgID, 5, 0.9, true, now)
+	insertRagSearchAuditLog(t, systemPool, orgID, 0, 0.0, false, now)
+	// Outside the 30-day window — must not affect the aggregate.
+	insertRagSearchAuditLog(t, systemPool, orgID, 10, 1.0, true, now.AddDate(0, 0, -45))
+
+	got := getJSON[ragQualityResponse](t, router, cfg, clerkUserID, "/api/v1/analytics/rag-quality")
+	if got.TotalSearches != 3 {
+		t.Fatalf("TotalSearches = %d, want 3 (the 45-day-old row must be excluded)", got.TotalSearches)
+	}
+	wantAvgRerank := (0.8 + 0.9 + 0.0) / 3.0
+	if diff := got.AvgRerankScore - wantAvgRerank; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("AvgRerankScore = %v, want %v", got.AvgRerankScore, wantAvgRerank)
+	}
+	wantCacheHitRate := 1.0 / 3.0
+	if diff := got.CacheHitRate - wantCacheHitRate; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("CacheHitRate = %v, want %v", got.CacheHitRate, wantCacheHitRate)
+	}
+	wantAvgChunks := (5.0 + 5.0 + 0.0) / 3.0
+	if diff := got.AvgChunksRetrieved - wantAvgChunks; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("AvgChunksRetrieved = %v, want %v", got.AvgChunksRetrieved, wantAvgChunks)
 	}
 }

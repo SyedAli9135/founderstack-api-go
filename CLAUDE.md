@@ -22,16 +22,16 @@ BYOK is **not** Claude-only: `internal/core/llm` validates and stores keys for 5
 Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 from an
 Anthropic-only original). See "BYOK API Keys" below.
 
-**Workflows 1 (bootstrap) through 13 (team members & roles) are implemented.** Workflow 11 (run
-trace/cost, 2026-09-04), workflow 12 (RAG search, 2026-09-05/06), and workflow 13 (team/roles,
-2026-09-07) are the 3 most recent — see "View Run Trace & Cost (workflow 11)", "Search Knowledge
-Base / RAG Query (workflow 12)", and "Manage Team Members & Roles (workflow 13)" below. Don't
-assume routes, tables, or packages from workflow 14+ in `WORKFLOW_PLAN_GO.md` exist —
+**Workflows 1 (bootstrap) through 14 (token usage & analytics) are implemented.** Workflow 12 (RAG
+search, 2026-09-05/06), workflow 13 (team/roles, 2026-09-07), and workflow 14 (usage & analytics,
+2026-09-07) are the 3 most recent — see "Search Knowledge Base / RAG Query (workflow 12)",
+"Manage Team Members & Roles (workflow 13)", and "View Token Usage & Analytics (workflow 14)"
+below. Don't assume routes, tables, or packages from workflow 15+ in `WORKFLOW_PLAN_GO.md` exist —
 check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
-`internal/api/workflows/`, `internal/api/runs/`, and `internal/api/approvals/` for what's actually
-registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
+`internal/api/workflows/`, `internal/api/runs/`, `internal/api/approvals/`, `internal/api/org/`,
+and `internal/api/billing/` for what's actually registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
 third party until real OAuth app credentials
 are registered on each provider's dashboard and put in `.env` — see "Third-Party Integrations
 (workflow 4)" below and its "Status" note in `WORKFLOW_PLAN_GO.md`.
@@ -1420,6 +1420,71 @@ whatever the prior, terminated membership happened to leave behind.
 permission flags` subtest is the regression test; the existing `organizationMembership.updated
 changes the role` subtest was extended to assert the still-active case is genuinely untouched.
 
+### View Token Usage & Analytics (workflow 14) — `internal/api/billing`, extends `internal/api/analytics`, `internal/api/settings`, `internal/api/documents`
+
+5 read-only endpoints over data every prior workflow already wrote but nothing had ever
+aggregated: `cost_ledger` (workflow 9), `workflow_runs`' completion columns (workflow 9),
+`audit_logs`' `rag.search` rows (workflow 12). Built 2026-09-07. No new migration — every column
+these queries read already existed; the one schema-shaped addition
+(`audit_logs.metadata_info`'s `avg_rerank_score`/`from_cache` keys) is a same-table JSONB
+extension, not a new column, so old rows written before this workflow simply lack those keys and
+`AVG()` correctly ignores the `NULL`s rather than erroring — confirmed live against the dev org's
+own pre-existing `rag.search` rows from workflow 12's own verification pass.
+
+**`internal/api/billing` is a new package, not `internal/api/analytics`, even though workflow 14
+requested both under one workflow** — deliberately split to match `WORKFLOW_PLAN_GO.md`'s own
+route paths (`/billing/usage`, `/billing/ledger` vs. `/analytics/agent-performance`,
+`/analytics/rag-quality`), and because workflow 15 (Manage Billing & Subscription, not built yet)
+will extend this same package with real plan-limit/subscription logic later — `billing` today is
+read-only reporting, not a placeholder for something unrelated.
+
+**`GET /settings/api-key/usage` and `GET /billing/usage` deliberately return the same headline
+aggregate over two different windows** (calendar-month vs. rolling-30-day) from the same
+`GetCostUsageSince` query, not two different queries — the settings page's "this month" framing
+and the billing page's "last 30 days" trend chart are different UI needs, not different data
+sources. `cache_hit_rate` (both endpoints) is `cached_tokens / (input_tokens + cached_tokens)` —
+the share of prompt-side tokens actually served from the provider's prompt cache; `output_tokens`
+is never cacheable on any provider, so it's excluded from the denominator on purpose, not an
+oversight.
+
+**`GetAgentCostShare`/`GetAgentPerformance` both `JOIN`/`LEFT JOIN` rather than reading
+`cost_ledger`/`workflow_runs` alone**, for the plan's own "which agent drove the most cost" and
+"which agent to optimize" questions — `cost_ledger.agent_id` and `workflow_runs` alone don't carry
+a human-readable name. `GetAgentCostShare` specifically `LEFT JOIN`s (not `JOIN`) and folds a null
+`agent_id` into a synthetic `"Unattributed"` bucket rather than silently dropping that spend from
+the total — `cost_ledger.agent_id` is nullable in the schema (only tool-call/LLM cost rows ever
+set it; nothing else does yet), so excluding null-agent rows would have quietly under-reported
+real spend. `GetAgentPerformance` uses `agents JOIN workflows JOIN workflow_runs` (inner joins) —
+an agent with zero runs correctly doesn't appear at all, since there's nothing yet to rate it on.
+
+**`avg_rerank_score`/`from_cache` didn't exist anywhere before this workflow — the RAG search
+HTTP response was the only place a rerank score or cache-hit flag ever appeared, and neither was
+ever persisted.** `internal/api/documents/handler.go`'s `auditSearch` (workflow 12) already wrote
+one `audit_logs` row per search attempt (`result_count`, `category`) from all 3 return paths
+(cache-hit, ACL-empty, full-search) — extended in this pass to also compute and write
+`avg_rerank_score` (mean of the returned results' `relevance_score`) and `from_cache`, since
+that's the only place in the whole request lifecycle either value is ever computed.
+`GetRagQualityStats` reads a rolling 30-day window (matching `billing.Usage`'s window, not
+all-time) — a founder cares whether search quality is good *now*, not historically.
+
+**Verified live against the dev org's own real data (not just the test suite)**: all 5 endpoints
+hit directly via `curl` with a real dev token — `settings/api-key/usage` and `billing/usage`
+correctly excluded a cost_ledger row seeded outside their respective windows; `billing/ledger`
+paginated correctly (`total: 135` real rows from this project's own mock-scenario testing
+history); `agent-performance` showed real success/failure splits across the 23 `[TEST] *` mock
+agents from workflow 9's own scenario catalog (a still-`pending`/non-terminal run correctly showed
+`success_rate: 0`, not an error — a completed-vs-total ratio, not a proxy for "did it break");
+`rag-quality` correctly averaged in `NULL` for 2 pre-existing rows from before this workflow's
+`auditSearch` extension, rather than erroring on the missing keys.
+
+**Testing**: `internal/api/analytics/handler_integration_test.go` gained
+`TestAnalyticsHandler_AgentPerformance`(`_CrossOrgIsolation`) and `TestAnalyticsHandler_RagQuality`
+(window-exclusion, cache-hit-rate, and avg-rerank-score math all asserted against real Postgres).
+`internal/api/settings` gained `apikey_usage_integration_test.go` (calendar-month window exclusion,
+cross-org isolation). New `internal/api/billing/handler_integration_test.go` (3 tests: usage
+aggregate + cross-org isolation, ledger pagination/ordering). All against real Postgres, no fakes
+needed — nothing here calls a third-party API.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -1667,8 +1732,15 @@ machine — CI runs the authoritative version of the same check regardless.
 | `GET /api/v1/org/members` | `internal/api/org/handler.go` | `middleware.RequireAuth` | List the org's team members and their roles/permissions (workflow 13) |
 | `PATCH /api/v1/org/members/{user_id}/role` | `internal/api/org/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | Change a member's role, derives permission flags, best-effort Clerk sync (workflow 13) |
 | `DELETE /api/v1/org/members/{user_id}` | `internal/api/org/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | Remove a member — real Clerk removal, then local soft-delete (workflow 13) |
+| `GET /api/v1/org/invitations` | `internal/api/org/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | List the org's pending Clerk invitations, read live (workflow 13) |
+| `DELETE /api/v1/org/invitations/{invitation_id}` | `internal/api/org/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | Revoke a pending invitation via Clerk (workflow 13) |
+| `GET /api/v1/settings/api-key/usage` | `internal/api/settings/apikey.go` | `middleware.RequireAuth` | Calendar-month token/cost aggregate (workflow 14) |
+| `GET /api/v1/billing/usage` | `internal/api/billing/handler.go` | `middleware.RequireAuth` | Rolling-30-day token/cost aggregate + daily trend + per-agent cost share (workflow 14) |
+| `GET /api/v1/billing/ledger` | `internal/api/billing/handler.go` | `middleware.RequireAuth` | Paginated itemized `cost_ledger` feed (workflow 14) |
+| `GET /api/v1/analytics/agent-performance` | `internal/api/analytics/handler.go` | `middleware.RequireAuth` | Per-agent success rate/avg duration/avg cost (workflow 14) |
+| `GET /api/v1/analytics/rag-quality` | `internal/api/analytics/handler.go` | `middleware.RequireAuth` | Rolling-30-day RAG search quality (avg rerank score, cache hit rate, avg chunks retrieved) (workflow 14) |
 
-(Everything else in `WORKFLOW_PLAN_GO.md` — workflow 14 onward — is unbuilt. Add rows here as
+(Everything else in `WORKFLOW_PLAN_GO.md` — workflow 15 onward — is unbuilt. Add rows here as
 routers land.)
 
 ### Dependency policy

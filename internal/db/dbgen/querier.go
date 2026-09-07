@@ -17,6 +17,7 @@ type Querier interface {
 	// different, still-active provider's pointer.
 	ClearOrganizationActiveApiKeyForProvider(ctx context.Context, arg ClearOrganizationActiveApiKeyForProviderParams) error
 	CountActiveAgents(ctx context.Context, orgID pgtype.UUID) (int64, error)
+	CountCostLedger(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	// Soft delete — is_active=false, row stays for run history (Workflow 9+).
 	// :execrows (not :exec) so the handler can distinguish "deactivated" from
 	// "no such agent in this org" (0 rows) and return a real 404.
@@ -57,6 +58,16 @@ type Querier interface {
 	// chicken-and-egg reasoning as the Clerk webhook's org creation.
 	GetActiveUserByClerkUserID(ctx context.Context, clerkUserID string) (GetActiveUserByClerkUserIDRow, error)
 	GetAgent(ctx context.Context, arg GetAgentParams) (GetAgentRow, error)
+	// Per-agent cost share (last 30 days) for GET /billing/usage's bar chart.
+	// agent_id is nullable on cost_ledger (a run's tool-call/llm cost rows
+	// always set it, but nothing else does yet) — LEFT JOIN keeps those rows
+	// visible under a synthetic "Unattributed" bucket rather than silently
+	// dropping real spend from the total.
+	GetAgentCostShare(ctx context.Context, arg GetAgentCostShareParams) ([]GetAgentCostShareRow, error)
+	// GET /analytics/agent-performance. success_count/failure_count are
+	// separate columns (not one status column) so the handler never has to
+	// special-case pending/running/awaiting_approval rows to compute a rate.
+	GetAgentPerformance(ctx context.Context, orgID pgtype.UUID) ([]GetAgentPerformanceRow, error)
 	GetApproval(ctx context.Context, arg GetApprovalParams) (GetApprovalRow, error)
 	// GetApprovalSystemScoped runs on app_system (BYPASSRLS) — the
 	// action-token approve/reject path (internal/api/approvals/handler.go)
@@ -69,6 +80,19 @@ type Querier interface {
 	// known from this row.
 	GetApprovalSystemScoped(ctx context.Context, id pgtype.UUID) (GetApprovalSystemScopedRow, error)
 	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
+	// Workflow 14 (token usage & analytics). All read-only, all against
+	// app_user/tenant.WithTx like every other tenant-scoped query in this
+	// codebase — RLS already scopes these by org, the explicit org_id
+	// parameter matches this codebase's existing belt-and-suspenders
+	// convention (see e.g. workflows.sql's ListWorkflows).
+	// Monthly aggregate for GET /settings/api-key/usage and the headline
+	// figures on GET /billing/usage.
+	GetCostUsageSince(ctx context.Context, arg GetCostUsageSinceParams) (GetCostUsageSinceRow, error)
+	// Daily breakdown (last 30 days) for GET /billing/usage's trend chart —
+	// one row per day that actually had activity, not a zero-filled series
+	// for every calendar day (the handler fills gaps itself, since a query
+	// can't easily manufacture rows for days with zero cost_ledger activity).
+	GetDailyCostUsage(ctx context.Context, arg GetDailyCostUsageParams) ([]GetDailyCostUsageRow, error)
 	GetDocument(ctx context.Context, arg GetDocumentParams) (GetDocumentRow, error)
 	// Batch-hydrates a page of search results' filename/category — Pinecone's
 	// own vector metadata only carries doc_id/chunk_index/text (see
@@ -90,6 +114,13 @@ type Querier interface {
 	GetOrgTotalHoursSaved(ctx context.Context, id pgtype.UUID) (float64, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
 	GetOrganizationMaxAgents(ctx context.Context, id pgtype.UUID) (*int32, error)
+	// GET /analytics/rag-quality. Sourced from audit_logs' rag.search rows —
+	// the only place avg_rerank_score/from_cache/result_count are recorded at
+	// all (see internal/api/documents/handler.go's auditSearch); a search
+	// with 0 results (the ACL-empty short-circuit) contributes a 0 to
+	// avg_rerank_score/avg_chunks_retrieved, which is the correct average,
+	// not a value worth excluding.
+	GetRagQualityStats(ctx context.Context, arg GetRagQualityStatsParams) (GetRagQualityStatsRow, error)
 	// Resolves a run's agent_id via its workflow — Launcher.Resume needs this
 	// before it can rebuild the RunDeps/Nodes a suspended run's checkpoint
 	// alone doesn't carry (agent_id isn't part of RunState's own JSON).
@@ -179,6 +210,8 @@ type Querier interface {
 	ListApprovalsForOrg(ctx context.Context, arg ListApprovalsForOrgParams) ([]ListApprovalsForOrgRow, error)
 	ListApproverEmailsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListApproverEmailsForOrgRow, error)
 	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
+	// Paginated GET /billing/ledger.
+	ListCostLedgerPage(ctx context.Context, arg ListCostLedgerPageParams) ([]ListCostLedgerPageRow, error)
 	ListDocumentChunkPineconeIDs(ctx context.Context, docID pgtype.UUID) ([]string, error)
 	// Excludes 'deleting': once DELETE .../{id} has been called, the
 	// document shouldn't reappear in a normal list view while

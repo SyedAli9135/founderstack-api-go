@@ -26,6 +26,7 @@ import (
 	"github.com/founderstack/api/internal/api/agents"
 	"github.com/founderstack/api/internal/api/analytics"
 	approvalsapi "github.com/founderstack/api/internal/api/approvals"
+	"github.com/founderstack/api/internal/api/billing"
 	"github.com/founderstack/api/internal/api/documents"
 	"github.com/founderstack/api/internal/api/identity"
 	integrationsapi "github.com/founderstack/api/internal/api/integrations"
@@ -331,6 +332,10 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiOrg := router.Group("/api/v1")
 	apiOrg.Use(middleware.RequireAuth(systemDB, cfg))
 	org.NewHandler(db, membershipSyncer, invitationLister).Register(apiOrg)
+
+	apiBilling := router.Group("/api/v1")
+	apiBilling.Use(middleware.RequireAuth(systemDB, cfg))
+	billing.NewHandler(db).Register(apiBilling)
 
 	return router
 }

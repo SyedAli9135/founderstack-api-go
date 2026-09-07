@@ -504,7 +504,7 @@ func (h *Handler) Search(c *gin.Context) {
 		if cached, err := h.redis.Get(ctx, cacheKey).Bytes(); err == nil {
 			var results []searchResult
 			if err := json.Unmarshal(cached, &results); err == nil {
-				h.auditSearch(ctx, user, req.Category, len(results))
+				h.auditSearch(ctx, user, req.Category, results, true)
 				response.OK(c, http.StatusOK, "", gin.H{"results": results, "from_cache": true})
 				return
 			}
@@ -530,7 +530,7 @@ func (h *Handler) Search(c *gin.Context) {
 		// Still audited: a search that matched nothing because of ACL is
 		// exactly the kind of attempt a compliance-minded founder cares
 		// about seeing, not less interesting than a successful one.
-		h.auditSearch(ctx, user, req.Category, 0)
+		h.auditSearch(ctx, user, req.Category, nil, false)
 		response.OK(c, http.StatusOK, "", gin.H{"results": []searchResult{}, "from_cache": false})
 		return
 	}
@@ -586,7 +586,7 @@ func (h *Handler) Search(c *gin.Context) {
 		}
 	}
 
-	h.auditSearch(ctx, user, req.Category, len(results))
+	h.auditSearch(ctx, user, req.Category, results, false)
 	response.OK(c, http.StatusOK, "", gin.H{"results": results, "from_cache": false})
 }
 
@@ -596,14 +596,33 @@ func (h *Handler) Search(c *gin.Context) {
 // searches. No content stored: the query text itself isn't audit-log
 // material, per WORKFLOW_PLAN_GO.md's own instruction. Best-effort: an
 // audit-log write failure shouldn't fail a search that already succeeded.
-func (h *Handler) auditSearch(ctx context.Context, user authctx.User, category *string, resultCount int) {
-	metadata, _ := json.Marshal(map[string]any{"result_count": resultCount, "category": category})
+//
+// avg_rerank_score/from_cache were added for workflow 14's rag-quality
+// analytics endpoint, which has no other source for this data — the HTTP
+// response itself is the only other place a rerank score ever appears,
+// and it's never persisted anywhere else.
+func (h *Handler) auditSearch(ctx context.Context, user authctx.User, category *string, results []searchResult, fromCache bool) {
+	metadata, _ := json.Marshal(map[string]any{
+		"result_count": len(results), "category": category,
+		"avg_rerank_score": avgRelevanceScore(results), "from_cache": fromCache,
+	})
 	_ = tenant.WithTx(ctx, h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		return q.InsertAuditLog(ctx, dbgen.InsertAuditLogParams{
 			OrgID: user.OrgID, ActorID: user.ID, ActorType: "user",
 			Action: "rag.search", MetadataInfo: metadata,
 		})
 	})
+}
+
+func avgRelevanceScore(results []searchResult) float64 {
+	if len(results) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, r := range results {
+		sum += r.RelevanceScore
+	}
+	return sum / float64(len(results))
 }
 
 func uniqueDocIDs(chunks []coredocs.SearchChunk) []pgtype.UUID {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/founderstack/api/internal/api/authctx"
@@ -42,6 +43,7 @@ func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/api-key/status", h.APIKeyStatus)
 	rg.DELETE("/api-key", h.DeleteAPIKey)
 	rg.GET("/api-key/providers", h.ListProviders)
+	rg.GET("/api-key/usage", h.APIKeyUsage)
 
 	// Approval-gate notification config — see approvals.go and pushsubscription.go.
 	rg.GET("/approvals", h.GetApprovalsSettings)
@@ -324,4 +326,54 @@ func (h *Handler) ListProviders(c *gin.Context) {
 	sort.Slice(views, func(i, j int) bool { return views[i].Provider < views[j].Provider })
 
 	response.OK(c, http.StatusOK, "", views)
+}
+
+type apiKeyUsageResponse struct {
+	InputTokens       int64   `json:"input_tokens"`
+	OutputTokens      int64   `json:"output_tokens"`
+	CachedTokens      int64   `json:"cached_tokens"`
+	ThinkingTokens    int64   `json:"thinking_tokens"`
+	TotalEstimatedUsd float64 `json:"total_estimated_usd"`
+	CacheHitRate      float64 `json:"cache_hit_rate"`
+}
+
+// APIKeyUsage is the current-calendar-month aggregate from cost_ledger —
+// workflow 14's "how many tokens did my agents consume this month" figure.
+// cache_hit_rate is cached_tokens / (input_tokens + cached_tokens): the
+// share of prompt-side tokens Anthropic's prompt cache actually served
+// from cache rather than reprocessing — output_tokens is never cacheable
+// on any provider, so it's excluded from the denominator.
+func (h *Handler) APIKeyUsage(c *gin.Context) {
+	user, ok := authctx.FromContext(c)
+	if !ok {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
+		return
+	}
+
+	now := time.Now().UTC()
+	startOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	var usage dbgen.GetCostUsageSinceRow
+	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		var err error
+		usage, err = q.GetCostUsageSince(ctx, dbgen.GetCostUsageSinceParams{
+			OrgID: user.OrgID, CreatedAt: pgtype.Timestamptz{Time: startOfMonth, Valid: true},
+		})
+		return err
+	})
+	if err != nil {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not fetch usage")
+		return
+	}
+
+	var cacheHitRate float64
+	if promptTokens := usage.InputTokens + usage.CachedTokens; promptTokens > 0 {
+		cacheHitRate = float64(usage.CachedTokens) / float64(promptTokens)
+	}
+
+	response.OK(c, http.StatusOK, "", apiKeyUsageResponse{
+		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens,
+		CachedTokens: usage.CachedTokens, ThinkingTokens: usage.ThinkingTokens,
+		TotalEstimatedUsd: usage.TotalEstimatedUsd, CacheHitRate: cacheHitRate,
+	})
 }
