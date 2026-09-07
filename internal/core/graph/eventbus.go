@@ -22,6 +22,7 @@ const (
 	EventError            EventType = "error"
 	EventToken            EventType = "token"
 	EventComplete         EventType = "complete"
+	EventIntegrationError EventType = "integration_error"
 )
 
 // Event is one message published on a run's channel.
@@ -51,6 +52,16 @@ type ApprovalRequiredData struct {
 	ApprovalID string         `json:"approval_id"`
 	RiskLevel  string         `json:"risk_level"`
 	ToolCalls  []llm.ToolCall `json:"tool_calls"`
+}
+
+// IntegrationErrorData is EventIntegrationError's Data — published
+// alongside (not instead of) the normal EventToolResult for a tool call
+// that failed because the org's connection to Service is missing/expired/
+// revoked. A distinct event so the live feed can render an actionable
+// "reconnect" banner instead of a generic tool-error line.
+type IntegrationErrorData struct {
+	Service      string `json:"service"`
+	ReconnectURL string `json:"reconnect_url"`
 }
 
 // EventBus is a small pub/sub keyed by run_id: node functions (and the

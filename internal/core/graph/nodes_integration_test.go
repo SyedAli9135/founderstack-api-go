@@ -109,6 +109,80 @@ func nodesTestDeps(t *testing.T, mockClient *llm.MockChatClient, allowed []strin
 	return deps, orgUUID, agentUUID, runUUID
 }
 
+// TestBuildNodes_IntegrationErrorOnRevokedConnection covers workflow 16: a
+// tool call against a service whose connection is missing/expired/revoked
+// must publish EventIntegrationError (for the live feed's reconnect
+// banner) and self-heal the connection's own oauth_status to 'expired' —
+// not just fail like any other tool error.
+func TestBuildNodes_IntegrationErrorOnRevokedConnection(t *testing.T) {
+	mock := llm.NewMockChatClient(
+		llm.ChatResponse{
+			ToolCalls:  []llm.ToolCall{{ID: "call_0", Name: "fake.get_data", Args: json.RawMessage(`{"query":"invoices"}`)}},
+			StopReason: llm.StopReasonToolUse,
+		},
+		llm.ChatResponse{Content: "Could not complete the request.", StopReason: llm.StopReasonEndTurn},
+	)
+	deps, orgID, agentID, runID := nodesTestDeps(t, mock, []string{"fake.get_data"})
+	orgPg := pgtype.UUID{Bytes: orgID, Valid: true}
+
+	// Simulate the org's connection having been revoked (e.g. via
+	// DELETE /integrations/fake) after nodesTestDeps saved it as
+	// 'connected' — the run's own tool call is what should discover this.
+	if err := integrations.RevokeConnection(context.Background(), testAppPool(t), orgPg, "fake"); err != nil {
+		t.Fatalf("revoke connection: %v", err)
+	}
+
+	events, unsubscribe := deps.Engine.Bus.Subscribe(runID)
+	defer unsubscribe()
+
+	nodes := BuildNodes(deps)
+	state := &RunState{OrgID: orgID, AgentID: agentID, WorkflowRunID: runID, Input: "look something up"}
+	if err := deps.Engine.Run(context.Background(), nodes, state, "planner"); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(state.ToolResults) != 1 || state.ToolResults[0].Error == "" {
+		t.Fatalf("ToolResults = %+v, want exactly 1 errored result", state.ToolResults)
+	}
+
+	var found *IntegrationErrorData
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type == EventIntegrationError {
+				data := ev.Data.(IntegrationErrorData)
+				found = &data
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if found == nil {
+		t.Fatal("no EventIntegrationError published")
+	}
+	if found.Service != "fake" {
+		t.Errorf("Service = %q, want %q", found.Service, "fake")
+	}
+	if found.ReconnectURL != "/integrations?reconnect=fake" {
+		t.Errorf("ReconnectURL = %q, want %q", found.ReconnectURL, "/integrations?reconnect=fake")
+	}
+
+	// Queried directly (not via integrations.GetConnection, which decrypts
+	// the stored token with the encryption key nodesTestDeps generated
+	// internally and never returns) — oauth_status alone is all this test
+	// needs to confirm.
+	var oauthStatus *string
+	if err := testSystemPool(t).QueryRow(context.Background(),
+		"select oauth_status from mcp_connections where org_id = $1 and service_name = $2", orgPg, "fake",
+	).Scan(&oauthStatus); err != nil {
+		t.Fatalf("query oauth_status: %v", err)
+	}
+	if oauthStatus == nil || *oauthStatus != "expired" {
+		t.Errorf("oauth_status = %v, want \"expired\"", oauthStatus)
+	}
+}
+
 func TestBuildNodes_ReadOnlyToolRoundTrip(t *testing.T) {
 	mock := llm.NewMockChatClient(
 		llm.ChatResponse{

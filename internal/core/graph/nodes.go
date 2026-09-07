@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/founderstack/api/internal/core/integrations"
 	"github.com/founderstack/api/internal/core/llm"
 	coremcp "github.com/founderstack/api/internal/core/mcp"
 	"github.com/founderstack/api/internal/core/notify"
@@ -273,6 +274,7 @@ func executeOneToolCall(ctx context.Context, deps RunDeps, state *RunState, tc l
 		isError = true
 		errString = execErr.Error()
 		resultText = errString
+		publishIntegrationErrorIfAuthFailure(ctx, deps, state, service, execErr)
 	} else {
 		resultText, isError = toolResultText(result)
 	}
@@ -307,6 +309,31 @@ func executeOneToolCall(ctx context.Context, deps RunDeps, state *RunState, tc l
 		return fmt.Errorf("graph: checkpoint after tool call: %w", err)
 	}
 	return nil
+}
+
+// publishIntegrationErrorIfAuthFailure distinguishes "this tool call
+// failed because the org's connection to service is missing/expired/
+// revoked" from every other tool-call failure — the only case where the
+// fix is "go reconnect something," not "the model should try a different
+// argument." Fires EventIntegrationError alongside (not instead of) the
+// normal EventToolResult the caller already publishes, so the live feed
+// can render an actionable banner. Also flips the connection's own
+// oauth_status to 'expired' — best-effort and self-healing: a connection
+// that looked "connected" on the last status poll but actually fails here
+// (a real revocation the org made outside this app, a race) shouldn't
+// wait for the next poll to show the truth on the integrations page.
+func publishIntegrationErrorIfAuthFailure(ctx context.Context, deps RunDeps, state *RunState, service string, execErr error) {
+	if !errors.Is(execErr, integrations.ErrNotConnected) && !errors.Is(execErr, integrations.ErrTokenUnavailable) {
+		return
+	}
+	if err := integrations.MarkExpired(ctx, deps.AppPool, deps.OrgID, service); err != nil {
+		slog.Error("graph: mark connection expired failed", "run_id", state.WorkflowRunID, "service", service, "err", err)
+	}
+	deps.Engine.Bus.Publish(Event{
+		Type:  EventIntegrationError,
+		RunID: state.WorkflowRunID,
+		Data:  IntegrationErrorData{Service: service, ReconnectURL: "/integrations?reconnect=" + service},
+	})
 }
 
 // gatewayMaxAttempts bounds retry for a Gateway-level (not tool-handler-level)

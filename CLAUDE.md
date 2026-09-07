@@ -22,12 +22,16 @@ BYOK is **not** Claude-only: `internal/core/llm` validates and stores keys for 5
 Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 from an
 Anthropic-only original). See "BYOK API Keys" below.
 
-**Workflows 1 (bootstrap) through 14 (token usage & analytics) are implemented.** Workflow 12 (RAG
-search, 2026-09-05/06), workflow 13 (team/roles, 2026-09-07), and workflow 14 (usage & analytics,
-2026-09-07) are the 3 most recent — see "Search Knowledge Base / RAG Query (workflow 12)",
-"Manage Team Members & Roles (workflow 13)", and "View Token Usage & Analytics (workflow 14)"
-below. Don't assume routes, tables, or packages from workflow 15+ in `WORKFLOW_PLAN_GO.md` exist —
-check
+**Workflows 1 (bootstrap) through 14 (token usage & analytics), plus workflow 16 (disconnect/
+reconnect integration), are implemented. Workflow 15 (Manage Billing & Subscription) is
+deliberately skipped for now** — it needs a real (or test-mode) Stripe account for FounderStack's
+own platform billing plus real pricing/trial decisions, neither of which exists yet; unlike every
+other workflow so far, this isn't something to build against fabricated inputs. Workflow 13
+(team/roles, 2026-09-07), workflow 14 (usage & analytics, 2026-09-07), and workflow 16 (integration
+reconnection, 2026-09-07) are the 3 most recent — see "Manage Team Members & Roles (workflow 13)",
+"View Token Usage & Analytics (workflow 14)", and "Disconnect / Reconnect Integration (workflow
+16)" below. Don't assume routes, tables, or packages from workflow 15/17+ in
+`WORKFLOW_PLAN_GO.md` exist — check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
 `internal/api/workflows/`, `internal/api/runs/`, `internal/api/approvals/`, `internal/api/org/`,
@@ -1484,6 +1488,52 @@ agents from workflow 9's own scenario catalog (a still-`pending`/non-terminal ru
 cross-org isolation). New `internal/api/billing/handler_integration_test.go` (3 tests: usage
 aggregate + cross-org isolation, ledger pagination/ordering). All against real Postgres, no fakes
 needed — nothing here calls a third-party API.
+
+### Disconnect / Reconnect Integration (workflow 16) — extends `internal/core/graph`
+
+Built 2026-09-07. Closes a real gap: `oauth_status` (`connected`/`expired`/`revoked`/`pending`),
+`DELETE /api/v1/integrations/{service}` (best-effort `RevokeToken` then local revoke), and the
+frontend's own "⚠️ Reconnect" card state had all existed since workflow 4 — but nothing ever
+called `MarkExpired` from the one place that actually discovers an auth failure in practice: a
+live tool call. A connection's `oauth_status` only ever flipped to `expired` via `GET
+.../status`'s own re-validation poll, so a real mid-run failure looked like an ordinary tool
+error to both the harness and the human watching it, with no distinct signal and no fix-it link —
+exactly the two acceptance criteria this workflow closes.
+
+**`internal/core/graph/nodes.go`'s `executeOneToolCall` is the one call site that needed to
+change** — confirmed before writing anything that a `Gateway.ExecuteTool` error can only
+realistically be `coremcp.ErrToolRetryable` (a tripped rate limit, already handled) or
+`integrations.ErrNotConnected`/`ErrTokenUnavailable` (from `GetIntegrationToken`, wrapped with
+`%w` so `errors.Is` still sees through it): a tool *handler's own* internal error is already
+flattened into `CallToolResult.IsError` by `mcp.ToolHandlerFor` before `ExecuteTool` ever returns
+a Go `error` at all (the same MCP-protocol-boundary fact workflow 9's own terminal-vs-retryable
+classification note already established). New `publishIntegrationErrorIfAuthFailure` checks for
+exactly those two sentinels and, only then: best-effort `integrations.MarkExpired` (self-healing —
+a connection that looked `connected` on the last status poll but actually fails here, e.g. a real
+revocation made outside this app, shouldn't wait for the next poll to show the truth) and
+publishes the new `EventIntegrationError` (`internal/core/graph/eventbus.go`) with
+`{service, reconnect_url: "/integrations?reconnect=" + service}` — **alongside**, not instead of,
+the existing `EventToolResult` the caller already publishes; the model still sees a normal tool
+error in its own conversation and reasons about it exactly as before. This event exists purely
+for the human-facing live feed, not the run's own control flow — deliberately, so this workflow's
+fix carries zero risk of changing how any existing run behaves.
+
+**Verified via a real integration test, not a live disconnect/reconnect of a real third-party
+account** — deliberately: actually disconnecting a real dev-org integration (Notion, Slack, ...)
+to reproduce this live would need re-authorizing it afterward through that provider's real OAuth
+consent screen, which only the founder can complete, not this session. Also
+live-verified the ordinary, safe half instead: navigated the real dev org's `/integrations` page
+with `?reconnect=google_calendar` against 2 already-expired real connections
+(`google_calendar`/`google_drive`, from earlier sessions' testing) and confirmed the correct card
+scrolled into view and highlighted, distinct from the other expired card beside it.
+
+**Testing**: `internal/core/graph/nodes_integration_test.go`'s
+`TestBuildNodes_IntegrationErrorOnRevokedConnection` revokes a real fake-service connection mid
+test (`integrations.RevokeConnection`, same call `DELETE /integrations/{service}` makes), runs a
+full engine pass through a real Postgres-checkpointed run, and asserts both effects: the exact
+`EventIntegrationError` published on the run's own event bus, and `mcp_connections.oauth_status`
+flipped to `expired` afterward — the same regression-test discipline every other workflow-9-era
+guardrail in this file already gets.
 
 ### No ORM — `pgx` + `sqlc`, not GORM
 
