@@ -209,6 +209,25 @@ type Querier interface {
 	ListAgents(ctx context.Context, orgID pgtype.UUID) ([]ListAgentsRow, error)
 	ListApprovalsForOrg(ctx context.Context, arg ListApprovalsForOrgParams) ([]ListApprovalsForOrgRow, error)
 	ListApproverEmailsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListApproverEmailsForOrgRow, error)
+	// Workflow 17 (view audit logs). audit_logs itself has existed since
+	// migration 000001 and has been written to since workflows 9/10/12 - this
+	// is the first query that ever reads it back.
+	// Cursor-based (created_at, id) pagination, newest first - a plain
+	// LIMIT/OFFSET would skip/repeat rows if new entries land between page
+	// fetches (a real, ongoing concern here: agents write audit_logs
+	// continuously). Every filter is optional (sqlc.narg + "IS NULL OR ..."),
+	// matching this codebase's existing pattern (see documents.sql's
+	// ListSearchableDocumentIDs).
+	//
+	// actor_name resolves against whichever of users/agents actually owns
+	// actor_id for that row's actor_type, falling back to the literal
+	// 'System' when neither join matches (no current writer sets
+	// actor_type='system', but it's a valid value per the plan). The fallback
+	// is baked into SQL, not left to the Go handler: sqlc infers COALESCE's
+	// result nullability from its *last* argument's column, which would make
+	// actor_name a non-nullable Go string even though it's genuinely
+	// NULL-able here - the first real 'system' row would crash pgx's scan.
+	ListAuditLogsPage(ctx context.Context, arg ListAuditLogsPageParams) ([]ListAuditLogsPageRow, error)
 	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
 	// Paginated GET /billing/ledger.
 	ListCostLedgerPage(ctx context.Context, arg ListCostLedgerPageParams) ([]ListCostLedgerPageRow, error)

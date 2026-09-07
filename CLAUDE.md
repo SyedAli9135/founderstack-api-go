@@ -22,20 +22,20 @@ BYOK is **not** Claude-only: `internal/core/llm` validates and stores keys for 5
 Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 from an
 Anthropic-only original). See "BYOK API Keys" below.
 
-**Workflows 1 (bootstrap) through 14 (token usage & analytics), plus workflow 16 (disconnect/
-reconnect integration), are implemented. Workflow 15 (Manage Billing & Subscription) is
-deliberately skipped for now** — it needs a real (or test-mode) Stripe account for FounderStack's
-own platform billing plus real pricing/trial decisions, neither of which exists yet; unlike every
-other workflow so far, this isn't something to build against fabricated inputs. Workflow 13
-(team/roles, 2026-09-07), workflow 14 (usage & analytics, 2026-09-07), and workflow 16 (integration
-reconnection, 2026-09-07) are the 3 most recent — see "Manage Team Members & Roles (workflow 13)",
-"View Token Usage & Analytics (workflow 14)", and "Disconnect / Reconnect Integration (workflow
-16)" below. Don't assume routes, tables, or packages from workflow 15/17+ in
+**Workflows 1 (bootstrap) through 14 (token usage & analytics), plus workflows 16 (disconnect/
+reconnect integration) and 17 (view audit logs), are implemented. Workflow 15 (Manage Billing &
+Subscription) is deliberately skipped for now** — it needs a real (or test-mode) Stripe account
+for FounderStack's own platform billing plus real pricing/trial decisions, neither of which
+exists yet; unlike every other workflow so far, this isn't something to build against fabricated
+inputs. Workflow 14 (usage & analytics), workflow 16 (integration reconnection), and workflow 17
+(audit logs) — all 2026-09-07 — are the 3 most recent — see "View Token Usage & Analytics
+(workflow 14)", "Disconnect / Reconnect Integration (workflow 16)", and "View Audit Logs (workflow
+17)" below. Don't assume routes, tables, or packages from workflow 15/18+ in
 `WORKFLOW_PLAN_GO.md` exist — check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
 `internal/api/workflows/`, `internal/api/runs/`, `internal/api/approvals/`, `internal/api/org/`,
-and `internal/api/billing/` for what's actually registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
+`internal/api/billing/`, and `internal/api/auditlogs/` for what's actually registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
 third party until real OAuth app credentials
 are registered on each provider's dashboard and put in `.env` — see "Third-Party Integrations
 (workflow 4)" below and its "Status" note in `WORKFLOW_PLAN_GO.md`.
@@ -1535,6 +1535,58 @@ full engine pass through a real Postgres-checkpointed run, and asserts both effe
 flipped to `expired` afterward — the same regression-test discipline every other workflow-9-era
 guardrail in this file already gets.
 
+### View Audit Logs (workflow 17) — `internal/api/auditlogs`
+
+Built 2026-09-07. `audit_logs` has existed since migration `000001` and has been written to since
+workflows 9 (`tool.executed`), 10 (`workflow.approval.approved`/`.rejected`), and 12
+(`rag.search`) — this is the first endpoint that ever reads it back. No new migration: every
+column this needed already existed.
+
+**`ListAuditLogsPage` resolves a human-readable `actor_name` via two `LEFT JOIN`s gated by
+`actor_type`** (`... ON al.actor_type = 'user' AND u.id = al.actor_id ...`), not a single join on
+`actor_id` alone — `actor_id` is a bare UUID with no foreign key (it can point into either
+`users` or `agents` depending on `actor_type`, and workflow 16's own scope note already
+established `'system'` as a valid-but-currently-unwritten third value with no table to join at
+all). **A real, caught-before-shipping bug**: the natural `COALESCE(u.full_name, u.email,
+a.name) AS actor_name` leaves a genuine `NULL` for a `'system'` row (neither join matches), but
+sqlc infers a `COALESCE` expression's nullability from its *last* argument's own column — `agents.
+name` is `NOT NULL` in the schema — and generated a non-nullable Go `string` for `actor_name`
+anyway. `pgx` scanning a real `NULL` into a non-pointer `string` errors, meaning the very first
+`'system'`-actor audit row ever written would have broken this whole endpoint. Fixed by adding a
+literal `'System'` as `COALESCE`'s actual last argument, guaranteeing non-`NULL` at the SQL level
+instead of trusting sqlc's inference — the correct fix is making the value truly never-null, not
+switching the Go field to a `*string` and pushing the empty-fallback into the handler.
+
+**Cursor-based `(created_at, id)` pagination, not `LIMIT`/`OFFSET`** — matching this codebase's
+existing `sqlc.narg(...)` optional-filter idiom (see `documents.sql`'s
+`ListSearchableDocumentIDs`) for every filter (`actor_type`, an `action` prefix match, `status`,
+`date_from`/`date_to`), plus the same pattern extended to the composite cursor:
+`(sqlc.narg(cursor_created_at) IS NULL OR (created_at, id) < (cursor_created_at, cursor_id))`.
+Cursor-based over offset-based specifically because `audit_logs` is written to continuously by
+every running agent — an offset page taken a few seconds apart from the previous one would skip
+or repeat real rows as new entries land in between, which a stable `(created_at, id)` cursor
+doesn't.
+
+**A real bug caught by the test suite, not hypothetical**: the handler test originally built its
+own pagination-cursor query string by direct concatenation
+(`"...&cursor_created_at="+cursor.CreatedAt`), which failed — `page2` came back empty. Root cause:
+`time.RFC3339`'s timezone offset contains a literal `+` (e.g. `+05:00`), and Go's own query-string
+parser decodes an unescaped `+` as a space (the `application/x-www-form-urlencoded` convention),
+silently corrupting the timestamp into something `time.Parse` then rejects. Fixed in the test via
+`url.Values.Encode()` (proper percent-encoding) — worth knowing before touching this endpoint from
+any client, Go or otherwise: never hand-build this query string by string concatenation.
+
+**Guarded to owner/admin only** (`user.IsOwnerOrAdmin()`) — the plan's own acceptance criterion,
+and a real information-disclosure boundary this app doesn't otherwise draw anywhere else at this
+granularity (every agent's entire tool-call history, org-wide, is more sensitive than any single
+resource type workflow 12's document ACL scopes to).
+
+**Testing**: `internal/api/auditlogs/handler_integration_test.go` (7 tests) covers actor-name
+resolution for both real join types plus the `'system'`-with-no-match fallback, every filter,
+3-page cursor pagination over 5 real rows (asserting no duplicate/skipped row across page
+boundaries), the owner/admin guard for member and viewer, and cross-org isolation — all against
+real Postgres.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -1789,9 +1841,10 @@ machine — CI runs the authoritative version of the same check regardless.
 | `GET /api/v1/billing/ledger` | `internal/api/billing/handler.go` | `middleware.RequireAuth` | Paginated itemized `cost_ledger` feed (workflow 14) |
 | `GET /api/v1/analytics/agent-performance` | `internal/api/analytics/handler.go` | `middleware.RequireAuth` | Per-agent success rate/avg duration/avg cost (workflow 14) |
 | `GET /api/v1/analytics/rag-quality` | `internal/api/analytics/handler.go` | `middleware.RequireAuth` | Rolling-30-day RAG search quality (avg rerank score, cache hit rate, avg chunks retrieved) (workflow 14) |
+| `GET /api/v1/audit-logs` | `internal/api/auditlogs/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | Cursor-paginated, filterable audit log of every action an agent or user took (workflow 17) |
 
-(Everything else in `WORKFLOW_PLAN_GO.md` — workflow 15 onward — is unbuilt. Add rows here as
-routers land.)
+(Workflow 15 is deliberately deferred — see that section's own scope note. Everything else in
+`WORKFLOW_PLAN_GO.md` — workflow 18 onward — is unbuilt. Add rows here as routers land.)
 
 ### Dependency policy
 
