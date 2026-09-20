@@ -23,24 +23,25 @@ Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 fro
 Anthropic-only original). See "BYOK API Keys" below.
 
 **Workflows 1 (bootstrap) through 14 (token usage & analytics), plus workflows 16 (disconnect/
-reconnect integration), 17 (view audit logs), and 18 (multi-agent team run / A2A), are
-implemented — workflow 18's frontend (team list/create pages, multi-agent pipeline UI, live
-delegation events, trace sub-timelines) lives in `../founderstack-web`, its own repo, per this
-codebase's usual backend/frontend split; see that repo's `AGENTS.md` for its own detail.
+reconnect integration), 17 (view audit logs), 18 (multi-agent team run / A2A), and 19 (agent
+templates marketplace), are implemented — workflows 18/19's own frontends (team pages, the
+templates gallery) live in `../founderstack-web`, its own repo, per this codebase's usual
+backend/frontend split; see that repo's `AGENTS.md` for its own detail.
 Workflow 15 (Manage Billing & Subscription) is deliberately skipped for now** — it needs a real
 (or test-mode) Stripe account for FounderStack's own platform billing plus real pricing/trial
 decisions, neither of which exists yet; unlike every other workflow so far, this isn't something
 to build against fabricated inputs. Workflow 14
 (usage & analytics), workflow 16 (integration reconnection), workflow 17 (audit logs) — all
-2026-09-07 — and workflow 18 (2026-09-20) are the most recent — see "View Token Usage & Analytics
-(workflow 14)", "Disconnect / Reconnect Integration (workflow 16)", "View Audit Logs (workflow
-17)", and "Multi-Agent Team Run / A2A (workflow 18)" below. Don't assume routes, tables, or
-packages from workflow 15 or 19+ in `WORKFLOW_PLAN_GO.md` exist — check
+2026-09-07 — and workflows 18/19 (2026-09-20) are the most recent — see "View Token Usage &
+Analytics (workflow 14)", "Disconnect / Reconnect Integration (workflow 16)", "View Audit Logs
+(workflow 17)", "Multi-Agent Team Run / A2A (workflow 18)", and "Agent Templates Marketplace
+(workflow 19)" below. Don't assume routes, tables, or packages from workflow 15 or 20+ in
+`WORKFLOW_PLAN_GO.md` exist — check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
 `internal/api/workflows/`, `internal/api/runs/`, `internal/api/approvals/`, `internal/api/org/`,
-`internal/api/billing/`, `internal/api/auditlogs/`, `internal/api/teams/`, and `internal/api/a2a/`
-for what's actually registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
+`internal/api/billing/`, `internal/api/auditlogs/`, `internal/api/teams/`, `internal/api/a2a/`,
+and `internal/api/templates/` for what's actually registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
 third party until real OAuth app credentials
 are registered on each provider's dashboard and put in `.env` — see "Third-Party Integrations
 (workflow 4)" below and its "Status" note in `WORKFLOW_PLAN_GO.md`.
@@ -1763,6 +1764,71 @@ badge + correct link target on `/runs`, and a redirect on `/runs/{id}` itself (t
 fallback for anyone who still lands there directly — an old bookmark, a shared link) to the real
 multi-agent page. `TestTeamsHandler_RunEndToEnd` gained assertions for both new/changed endpoints.
 
+### Agent Templates Marketplace (workflow 19) — `internal/api/templates`
+
+Built 2026-09-20. A founder browses a shared, global gallery of pre-built agents and installs one
+with a single click — `POST /templates/{id}/install` copies the template's name/system_prompt/
+model/policy_scope into a brand-new, completely ordinary `agents` row for their org. From that
+point on the installed agent has no memory of which template it came from — `PATCH /agents/{id}`
+works on it exactly like any hand-created agent, matching the plan's own "template is just a
+starting point" acceptance criterion literally.
+
+**`agent_templates` is deliberately global, not org-scoped** — no `org_id` column, no RLS policy
+(migration `000015`). Every org sees the identical seeded catalog. `app_user` gets `SELECT` on it
+for free via `000002_enable_rls.up.sql`'s own `ALTER DEFAULT PRIVILEGES ... ON TABLES` grant,
+which covers every future table, not just the ones that existed when that migration ran — no new
+grant needed. This is the first table in the schema with that shape; every other table so far has
+either had `org_id` directly or reached it transitively through a parent.
+
+**10 templates seeded, not the plan's original 5** — one per real, already-connectable integration
+(`internal/core/mcp/servers/*.go`: Discord, GitHub, Google Calendar, Google Drive, LinkedIn,
+Notion, Slack, Stripe), replacing 2 things the plan's own sketch named that don't actually exist
+in this backend: a "Twitter" tool server (never built — no template for a provider nobody can
+connect), and "RAG search" as an agent-callable tool (workflow 12's document search is a
+founder-facing endpoint, `POST /documents/search` — nothing an agent's own tool-calling loop can
+invoke; `graph.ResolveTools` only ever offers real MCP tool schemas). **Migration `000016`, same
+day**: the founder asked "have we added all possible templates?" — a real, useful question. The
+original 8 covered every real *integration* but not every real *tool*: Stripe and GitHub each had
+a write-side tool (`create_invoice`/`refund_payment`, `create_issue`) no template exercised.
+`000016` adds Invoice & Billing Assistant and Issue Triager, bringing coverage to all 18 real MCP
+tools across all 8 servers, confirmed by diffing the seeded catalog's tool set against the
+registry's own — not just eyeballed. See `WORKFLOW_PLAN_GO.md`'s own workflow 19 section for the
+full 10-template list with their real tool IDs.
+
+**Seeded via the migration itself, not a separate `cmd/seedtemplates` binary** — the plan
+suggested either; this data is 100% static (no Cohere embedding calls the way `cmd/seedtools`
+needs for MCP tool descriptions), so a plain `INSERT` alongside the `CREATE TABLE` is simpler and
+needs no new command at all.
+
+**`POST /templates` (admin-only, PSK-guarded) deliberately not built** — no PSK/internal-auth
+mechanism exists anywhere else in this codebase, and standing one up for a rare, low-frequency
+operation (curating a new template) ahead of any real need is exactly what this codebase's own
+Dependency policy already argues against doing speculatively. Add a new template the same way
+every `[TEST] *` fixture agent already gets created — a direct `INSERT` against `agent_templates`
+— until real demand says otherwise.
+
+**Install reuses `agents.Handler.Create`'s own machinery** (the plan-limit check via
+`GetOrganizationMaxAgents`/`CountActiveAgents`, `InsertAgent`'s `ON CONFLICT ... DO NOTHING`
+duplicate-name handling) rather than a parallel implementation — `serversFromTools`/`slugify` are
+small, duplicated pure-function copies (this codebase's own established per-package convention,
+e.g. `formatTimestamptz`), not a cross-package export for two tiny helpers. **A second install of
+the same template disambiguates the name** (`"GitHub PR Reviewer (2)"`) instead of rejecting
+outright the way a founder's own accidental rename collision does in `agents.Handler.Create` —
+wanting one specialist agent per repo/channel/workspace from the same starting template is a real,
+reasonable case, not a mistake to reject. **A real bug caught by this workflow's own integration
+test, not hypothetical**: the first draft of that retry loop treated `pgx.ErrNoRows` (what
+`InsertAgent`'s `:one` query actually returns on the `ON CONFLICT DO NOTHING` path — no row to
+scan, not a Postgres error) as a hard failure and aborted the whole install with a generic 500
+instead of trying the disambiguated name — `errors.Is(err, pgx.ErrNoRows)` needed the same explicit
+check `agents.Handler.Create`'s own duplicate-name branch already makes.
+
+**Testing**: `internal/api/templates/handler_integration_test.go` (6 tests) covers the full seeded
+catalog count/shape, the `?category=` filter, a template's full detail (system prompt + flat
+`allowed_tools` list), 404 on an unknown id, a real install (asserts the installed agent's actual
+`agents` row matches the template, including `policy_scope`), the same-template-twice
+disambiguation path (and that it's the exact bug above, caught live by this test before it ever
+shipped), and the owner/admin permission gate.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -2021,9 +2087,11 @@ machine — CI runs the authoritative version of the same check regardless.
 | `GET/POST /api/v1/teams`, `GET/DELETE /teams/{id}`, `POST /teams/{id}/run`, `GET /teams/{id}/runs/{run_id}` | `internal/api/teams/handler.go` | `middleware.RequireAuth` (+owner/admin guard on POST/DELETE) | Agent team CRUD, trigger a team run, aggregated multi-agent trace (workflow 18) |
 | `GET /api/v1/a2a/agents/{agent_id}/.well-known/agent.json` | `internal/api/a2a/handler.go` (`Register`) | `middleware.RequireAuth` | A2A agent card for one specialist agent (workflow 18) |
 | `POST /api/v1/a2a/agents/{agent_id}/tasks/send` | `internal/api/a2a/handler.go` (`RegisterTasksSend`) | none — bearer `internal/core/a2a.TaskTokenSigner` token instead (see workflow 18's own section) | Real A2A dispatch target: runs one specialist's delegated sub-run to completion (workflow 18) |
+| `GET /api/v1/templates`, `GET /templates/{id}` | `internal/api/templates/handler.go` | `middleware.RequireAuth` | Browse the global agent-template gallery (workflow 19) |
+| `POST /api/v1/templates/{id}/install` | `internal/api/templates/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | Install a template as a new, fully-editable agent for this org (workflow 19) |
 
 (Workflow 15 is deliberately deferred — see that section's own scope note. Everything else in
-`WORKFLOW_PLAN_GO.md` — workflow 19 onward — is unbuilt. Add rows here as routers land.)
+`WORKFLOW_PLAN_GO.md` — workflow 20 onward — is unbuilt. Add rows here as routers land.)
 
 ### Dependency policy
 

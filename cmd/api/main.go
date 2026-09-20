@@ -37,6 +37,7 @@ import (
 	runsapi "github.com/founderstack/api/internal/api/runs"
 	"github.com/founderstack/api/internal/api/settings"
 	teamsapi "github.com/founderstack/api/internal/api/teams"
+	templatesapi "github.com/founderstack/api/internal/api/templates"
 	v1 "github.com/founderstack/api/internal/api/v1"
 	"github.com/founderstack/api/internal/api/webhooks"
 	workflowsapi "github.com/founderstack/api/internal/api/workflows"
@@ -363,6 +364,10 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 
 	apiA2ATasksSend := router.Group("/api/v1")
 	a2aHandler.RegisterTasksSend(apiA2ATasksSend)
+
+	apiTemplates := router.Group("/api/v1")
+	apiTemplates.Use(middleware.RequireAuth(systemDB, cfg))
+	templatesapi.NewHandler(db).Register(apiTemplates)
 
 	return router
 }

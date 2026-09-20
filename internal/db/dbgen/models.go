@@ -61,6 +61,21 @@ type AgentTeamMember struct {
 	Priority  *int32             `json:"priority"`
 }
 
+type AgentTemplate struct {
+	ID           pgtype.UUID        `json:"id"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	Name         string             `json:"name"`
+	Description  string             `json:"description"`
+	Category     string             `json:"category"`
+	SystemPrompt string             `json:"system_prompt"`
+	Model        string             `json:"model"`
+	PolicyScope  []byte             `json:"policy_scope"`
+	Icon         string             `json:"icon"`
+	IsFeatured   bool               `json:"is_featured"`
+	IsActive     bool               `json:"is_active"`
+}
+
 type ApiKeyRegistry struct {
 	ID           pgtype.UUID        `json:"id"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`

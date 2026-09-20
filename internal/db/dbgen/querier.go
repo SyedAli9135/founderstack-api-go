@@ -95,6 +95,7 @@ type Querier interface {
 	// a member of *that* team (pgx.ErrNoRows if not, treated as 403) — never
 	// trusts a client-supplied role or team id.
 	GetAgentTeamMemberRole(ctx context.Context, arg GetAgentTeamMemberRoleParams) (string, error)
+	GetAgentTemplate(ctx context.Context, id pgtype.UUID) (GetAgentTemplateRow, error)
 	GetApproval(ctx context.Context, arg GetApprovalParams) (GetApprovalRow, error)
 	// GetApprovalSystemScoped runs on app_system (BYPASSRLS) — the
 	// action-token approve/reject path (internal/api/approvals/handler.go)
@@ -287,6 +288,13 @@ type Querier interface {
 	// workflow_count — a team with 0 members (mid-setup, or every member
 	// since removed) must still appear exactly once.
 	ListAgentTeamsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListAgentTeamsForOrgRow, error)
+	// Queries backing workflow 19 (Agent Templates Marketplace). Deliberately
+	// run through app_user like everything else in this file set — not
+	// app_system — even though agent_templates has no org_id/RLS of its own:
+	// a request handler already runs inside tenant.WithTx for its other work
+	// (the install path also touches agents, which IS RLS-scoped), and there
+	// is no cross-tenant write here that would need app_system's bypass.
+	ListAgentTemplates(ctx context.Context, category *string) ([]ListAgentTemplatesRow, error)
 	// Queries backing workflow 7 (agent configuration CRUD). All tenant-scoped,
 	// run through app_user via tenant.WithTx like every other feature area in
 	// this file set — nothing here is cross-tenant, unlike the recovery-sweep
