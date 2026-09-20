@@ -295,6 +295,9 @@ type WorkflowRun struct {
 	CachedTokens    int32              `json:"cached_tokens"`
 	DurationMs      *int32             `json:"duration_ms"`
 	HoursSaved      *float64           `json:"hours_saved"`
+	ParentRunID     pgtype.UUID        `json:"parent_run_id"`
+	AgentID         pgtype.UUID        `json:"agent_id"`
+	DelegatedRole   *string            `json:"delegated_role"`
 }
 
 type WorkflowStep struct {

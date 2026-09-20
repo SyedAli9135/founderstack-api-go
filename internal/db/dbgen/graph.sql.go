@@ -45,10 +45,13 @@ func (q *Queries) FinalizeRun(ctx context.Context, arg FinalizeRunParams) error 
 
 const finalizeRunHoursSaved = `-- name: FinalizeRunHoursSaved :one
 UPDATE workflow_runs
-SET hours_saved = COALESCE(
-    (SELECT w.estimated_manual_minutes FROM workflows w WHERE w.id = workflow_runs.workflow_id),
-    15
-)::double precision / 60.0
+SET hours_saved = CASE
+    WHEN workflow_runs.parent_run_id IS NOT NULL THEN NULL
+    ELSE COALESCE(
+        (SELECT w.estimated_manual_minutes FROM workflows w WHERE w.id = workflow_runs.workflow_id),
+        15
+    )::double precision / 60.0
+END
 WHERE workflow_runs.org_id = $1 AND workflow_runs.id = $2
 RETURNING hours_saved
 `
@@ -61,7 +64,14 @@ type FinalizeRunHoursSavedParams struct {
 // Only ever called once, right after FinalizeRun, guarded on the run
 // having just reached status='completed' -- see finalizeIfTerminal.
 // estimated_manual_minutes defaults to 15 (a conservative baseline) when
-// the workflow never had one set.
+// the workflow never had one set. parent_run_id IS NOT NULL (workflow 18's
+// specialist sub-runs) instead sets an explicit NULL, not a computed
+// estimate -- only the orchestrator's own run represents the end-to-end
+// task a founder would otherwise have done by hand; accruing hours_saved
+// per specialist too would double- (or N-times-) count the same task.
+// accrueHoursSaved's existing "hoursSaved == nil -> nothing to accrue"
+// check already handles that NULL correctly, so no Go-side change is
+// needed for this guard.
 func (q *Queries) FinalizeRunHoursSaved(ctx context.Context, arg FinalizeRunHoursSavedParams) (*float64, error) {
 	row := q.db.QueryRow(ctx, finalizeRunHoursSaved, arg.OrgID, arg.ID)
 	var hours_saved *float64
@@ -120,7 +130,7 @@ func (q *Queries) GetOrgTotalHoursSaved(ctx context.Context, id pgtype.UUID) (fl
 }
 
 const getRunAgentID = `-- name: GetRunAgentID :one
-SELECT w.agent_id
+SELECT COALESCE(wr.agent_id, w.agent_id) AS agent_id
 FROM workflow_runs wr
 JOIN workflows w ON w.id = wr.workflow_id
 WHERE wr.org_id = $1 AND wr.id = $2
@@ -134,6 +144,12 @@ type GetRunAgentIDParams struct {
 // Resolves a run's agent_id via its workflow — Launcher.Resume needs this
 // before it can rebuild the RunDeps/Nodes a suspended run's checkpoint
 // alone doesn't carry (agent_id isn't part of RunState's own JSON).
+// COALESCE(wr.agent_id, ...) is workflow 18's addition: a team's specialist
+// sub-runs all share the team's one `workflows` row (whose agent_id is the
+// orchestrator's, not theirs), so their real agent is stored directly on
+// workflow_runs.agent_id instead — NULL there for every ordinary run
+// (and the orchestrator's own run), which falls through to the original
+// workflow-derived lookup unchanged.
 func (q *Queries) GetRunAgentID(ctx context.Context, arg GetRunAgentIDParams) (pgtype.UUID, error) {
 	row := q.db.QueryRow(ctx, getRunAgentID, arg.OrgID, arg.ID)
 	var agent_id pgtype.UUID
@@ -297,6 +313,36 @@ func (q *Queries) GetRunStatus(ctx context.Context, arg GetRunStatusParams) (str
 	return status, err
 }
 
+const getRunTeamAndWorkflow = `-- name: GetRunTeamAndWorkflow :one
+SELECT w.team_id, wr.workflow_id
+FROM workflow_runs wr
+JOIN workflows w ON w.id = wr.workflow_id
+WHERE wr.org_id = $1 AND wr.id = $2
+`
+
+type GetRunTeamAndWorkflowParams struct {
+	OrgID pgtype.UUID `json:"org_id"`
+	ID    pgtype.UUID `json:"id"`
+}
+
+type GetRunTeamAndWorkflowRow struct {
+	TeamID     pgtype.UUID `json:"team_id"`
+	WorkflowID pgtype.UUID `json:"workflow_id"`
+}
+
+// Resolves a run's team (and the one workflow row every run in that team
+// shares — see InsertTeamWorkflow) via its own workflow_id — the a2a
+// tasks/send handler uses this (via the request's sessionId, the
+// dispatching orchestrator's own run) to find which team the target agent
+// must belong to, rather than trusting a client-supplied team id, and
+// which workflow_id to insert the specialist's own sub-run row against.
+func (q *Queries) GetRunTeamAndWorkflow(ctx context.Context, arg GetRunTeamAndWorkflowParams) (GetRunTeamAndWorkflowRow, error) {
+	row := q.db.QueryRow(ctx, getRunTeamAndWorkflow, arg.OrgID, arg.ID)
+	var i GetRunTeamAndWorkflowRow
+	err := row.Scan(&i.TeamID, &i.WorkflowID)
+	return i, err
+}
+
 const incrementOrgTotalHoursSaved = `-- name: IncrementOrgTotalHoursSaved :exec
 UPDATE organizations SET total_hours_saved = total_hours_saved + $2 WHERE id = $1
 `
@@ -309,6 +355,55 @@ type IncrementOrgTotalHoursSavedParams struct {
 func (q *Queries) IncrementOrgTotalHoursSaved(ctx context.Context, arg IncrementOrgTotalHoursSavedParams) error {
 	_, err := q.db.Exec(ctx, incrementOrgTotalHoursSaved, arg.ID, arg.TotalHoursSaved)
 	return err
+}
+
+const insertTeamWorkflowRun = `-- name: InsertTeamWorkflowRun :one
+INSERT INTO workflow_runs (id, workflow_id, org_id, triggered_by, agent_id, parent_run_id, delegated_role, status)
+VALUES (COALESCE($7::uuid, gen_random_uuid()), $1, $2, $3, $4, $5, $6, 'pending')
+RETURNING id, status, created_at
+`
+
+type InsertTeamWorkflowRunParams struct {
+	WorkflowID    pgtype.UUID `json:"workflow_id"`
+	OrgID         pgtype.UUID `json:"org_id"`
+	TriggeredBy   pgtype.UUID `json:"triggered_by"`
+	AgentID       pgtype.UUID `json:"agent_id"`
+	ParentRunID   pgtype.UUID `json:"parent_run_id"`
+	DelegatedRole *string     `json:"delegated_role"`
+	ID            pgtype.UUID `json:"id"`
+}
+
+type InsertTeamWorkflowRunRow struct {
+	ID        pgtype.UUID        `json:"id"`
+	Status    string             `json:"status"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// Workflow 18's variant of InsertWorkflowRun — used for both the
+// orchestrator's own run (id server-generated, parent_run_id NULL) and
+// each specialist's delegated sub-run (id explicit — see below),
+// always with an explicit agent_id rather than InsertWorkflowRun's
+// workflow-derived one. See GetRunAgentID's and
+// workflow_runs.parent_run_id's doc comments above. id is
+// sqlc.narg(id): NULL lets Postgres's own gen_random_uuid() default fill
+// it (the orchestrator's own run); a specialist's sub-run instead reuses
+// the exact id its delegate node already minted client-side (see
+// graph.RunDeps.A2AClient.Dispatch's doc comment) before dispatch, so the
+// id EventBus.LinkChild registered for matches the id the specialist's
+// own engine run actually publishes events under.
+func (q *Queries) InsertTeamWorkflowRun(ctx context.Context, arg InsertTeamWorkflowRunParams) (InsertTeamWorkflowRunRow, error) {
+	row := q.db.QueryRow(ctx, insertTeamWorkflowRun,
+		arg.WorkflowID,
+		arg.OrgID,
+		arg.TriggeredBy,
+		arg.AgentID,
+		arg.ParentRunID,
+		arg.DelegatedRole,
+		arg.ID,
+	)
+	var i InsertTeamWorkflowRunRow
+	err := row.Scan(&i.ID, &i.Status, &i.CreatedAt)
+	return i, err
 }
 
 const insertWorkflowStep = `-- name: InsertWorkflowStep :exec
@@ -351,11 +446,84 @@ func (q *Queries) InsertWorkflowStep(ctx context.Context, arg InsertWorkflowStep
 	return err
 }
 
+const listChildRuns = `-- name: ListChildRuns :many
+SELECT wr.id, wr.agent_id, a.name AS agent_name, wr.delegated_role, wr.status,
+       wr.current_node, wr.output, wr.cost_so_far_usd, wr.input_tokens, wr.output_tokens,
+       wr.started_at, wr.completed_at, wr.duration_ms, wr.created_at
+FROM workflow_runs wr
+JOIN agents a ON a.id = wr.agent_id
+WHERE wr.org_id = $1 AND wr.parent_run_id = $2
+ORDER BY wr.created_at ASC
+`
+
+type ListChildRunsParams struct {
+	OrgID       pgtype.UUID `json:"org_id"`
+	ParentRunID pgtype.UUID `json:"parent_run_id"`
+}
+
+type ListChildRunsRow struct {
+	ID            pgtype.UUID        `json:"id"`
+	AgentID       pgtype.UUID        `json:"agent_id"`
+	AgentName     string             `json:"agent_name"`
+	DelegatedRole *string            `json:"delegated_role"`
+	Status        string             `json:"status"`
+	CurrentNode   *string            `json:"current_node"`
+	Output        *string            `json:"output"`
+	CostSoFarUsd  float64            `json:"cost_so_far_usd"`
+	InputTokens   int32              `json:"input_tokens"`
+	OutputTokens  int32              `json:"output_tokens"`
+	StartedAt     pgtype.Timestamptz `json:"started_at"`
+	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
+	DurationMs    *int32             `json:"duration_ms"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+// The specialist sub-runs a team's orchestrator run dispatched — how
+// GET /teams/{id}/runs/{run_id} builds its aggregated, per-specialist
+// trace. delegated_role/agent_id are always set on these rows (see
+// InsertTeamWorkflowRun), so no join back to agent_team_members is needed
+// (and wouldn't survive a member later being removed from the team).
+func (q *Queries) ListChildRuns(ctx context.Context, arg ListChildRunsParams) ([]ListChildRunsRow, error) {
+	rows, err := q.db.Query(ctx, listChildRuns, arg.OrgID, arg.ParentRunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListChildRunsRow
+	for rows.Next() {
+		var i ListChildRunsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.AgentName,
+			&i.DelegatedRole,
+			&i.Status,
+			&i.CurrentNode,
+			&i.Output,
+			&i.CostSoFarUsd,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.DurationMs,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunsForOrg = `-- name: ListRunsForOrg :many
 SELECT id, workflow_id, status, output, cost_so_far_usd, started_at, completed_at,
        duration_ms, created_at
 FROM workflow_runs
 WHERE org_id = $1
+  AND parent_run_id IS NULL
   AND ($4::varchar IS NULL OR status = $4)
   AND ($5::uuid IS NULL OR workflow_id = $5)
 ORDER BY created_at DESC
@@ -382,6 +550,10 @@ type ListRunsForOrgRow struct {
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 }
 
+// parent_run_id IS NULL excludes a team's specialist sub-runs from the
+// flat run list — a founder browsing "my runs" sees the team run as one
+// row; its specialists only surface via GET /teams/{id}/runs/{run_id}'s
+// aggregated trace (workflow 18).
 func (q *Queries) ListRunsForOrg(ctx context.Context, arg ListRunsForOrgParams) ([]ListRunsForOrgRow, error) {
 	rows, err := q.db.Query(ctx, listRunsForOrg,
 		arg.OrgID,

@@ -21,14 +21,19 @@ SELECT id, name FROM agents WHERE org_id = $1 AND id = $2 AND is_active = true;
 -- pause/resume toggle and "Paused" badge client-side. agent_name comes via
 -- a plain JOIN, not a nullable LEFT JOIN: agent_id is NOT NULL and agents
 -- are only ever soft-deleted (never actually removed), so the referenced
--- row always exists.
+-- row always exists. team_id IS NULL excludes the one companion `workflows`
+-- row workflow 18's POST /teams auto-creates per team (see teams.sql's
+-- InsertTeamWorkflow) — that row exists only to satisfy workflow_runs.
+-- workflow_id's NOT NULL constraint for team runs, it's not something a
+-- founder configured here and shouldn't show up as an orphan single-agent
+-- workflow.
 SELECT w.id, w.agent_id, a.name AS agent_name, w.name, w.description,
        w.trigger_type, w.cron_expression, w.timezone, w.next_run_at,
        w.requires_approval, w.task_input_template, w.estimated_manual_minutes,
        w.is_active, w.version, w.created_at, w.updated_at
 FROM workflows w
 JOIN agents a ON a.id = w.agent_id
-WHERE w.org_id = $1
+WHERE w.org_id = $1 AND w.team_id IS NULL
 ORDER BY w.created_at DESC;
 
 -- name: GetWorkflow :one
@@ -55,6 +60,18 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING id, agent_id, name, description, trigger_type, cron_expression,
     timezone, next_run_at, requires_approval, task_input_template,
     estimated_manual_minutes, is_active, version, created_at, updated_at;
+
+-- name: InsertTeamWorkflow :one
+-- Workflow 18's own auto-created companion row, one per agent_teams row —
+-- see the note on ListWorkflows above. graph_definition mirrors
+-- InsertWorkflow's own fixed marker; trigger_type is always 'manual' since
+-- nothing schedules a team run yet.
+INSERT INTO workflows (org_id, agent_id, team_id, name, description, trigger_type, graph_definition, a2a_enabled, created_by)
+VALUES ($1, $2, $3, $4, $5, 'manual', '{"type":"team"}'::jsonb, true, $6)
+RETURNING id;
+
+-- name: GetTeamWorkflow :one
+SELECT id FROM workflows WHERE org_id = $1 AND team_id = $2;
 
 -- name: UpdateWorkflow :one
 -- Partial update via COALESCE, same convention as UpdateAgent — but

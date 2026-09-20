@@ -416,6 +416,33 @@ var mockScenarios = map[string]mockScenario{
 			mockReadPageCall(4, "call_5", "And the fourth reference page, to be thorough."),
 		},
 	},
+
+	// Workflow 18 (multi-agent team run / A2A) — 3 scenarios, one per role
+	// in the demo team MOCK_LLM_TESTING.md's own workflow 18 section has
+	// you create (an orchestrator + "finance"/"ops" specialists). Unlike
+	// every scenario above, these are meant to be assigned to *different*
+	// agents in the *same* team, not one agent in isolation — see
+	// graph.team_nodes.go's decomposeTask/synthesizeFinalOutput for what
+	// each response is standing in for.
+	"mock:team-orchestrator": {
+		description: "2-turn orchestrator: decompose the founder's task into a finance+ops subtask each, then (after both specialists report back) synthesize one final answer. Must be paired with mock:team-finance/mock:team-ops on a team whose members are literally named with roles \"finance\"/\"ops\" — the decompose response's role strings are hardcoded to match those exactly.",
+		responses: []ChatResponse{
+			{StopReason: StopReasonEndTurn, Usage: turnUsage, Content: `{"subtasks":[{"role":"finance","task":"Summarize current burn rate and runway"},{"role":"ops","task":"Summarize hiring plan and open reqs"}]}`},
+			{StopReason: StopReasonEndTurn, Usage: turnUsage, Content: "Board summary: burn rate is $80k/month with 18 months of runway remaining, and hiring is on track with 3 open reqs closing this quarter."},
+		},
+	},
+	"mock:team-finance": {
+		description: "workflow 18's \"finance\" specialist half — single-turn answer, no tool calls, dispatched via a real A2A tasks/send HTTP call from the orchestrator's delegate node",
+		responses: []ChatResponse{
+			{StopReason: StopReasonEndTurn, Usage: turnUsage, Content: "Burn rate is $80k/month against $1.5M remaining, giving roughly 18 months of runway at the current rate."},
+		},
+	},
+	"mock:team-ops": {
+		description: "workflow 18's \"ops\" specialist half — single-turn answer, no tool calls, dispatched via a real A2A tasks/send HTTP call from the orchestrator's delegate node",
+		responses: []ChatResponse{
+			{StopReason: StopReasonEndTurn, Usage: turnUsage, Content: "3 open reqs (2 engineering, 1 sales), all with candidates in final rounds — on track to close this quarter."},
+		},
+	},
 }
 
 func mockScenarioNames() string {

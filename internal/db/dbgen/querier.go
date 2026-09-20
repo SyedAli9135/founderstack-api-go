@@ -22,6 +22,9 @@ type Querier interface {
 	// :execrows (not :exec) so the handler can distinguish "deactivated" from
 	// "no such agent in this org" (0 rows) and return a real 404.
 	DeactivateAgent(ctx context.Context, arg DeactivateAgentParams) (int64, error)
+	// One-way, unlike workflows' pause/resume DeactivateWorkflow — a team has
+	// no equivalent "reactivate" endpoint (see GetAgentTeam's own note).
+	DeactivateAgentTeam(ctx context.Context, arg DeactivateAgentTeamParams) (int64, error)
 	DeactivateKeyByProvider(ctx context.Context, arg DeactivateKeyByProviderParams) (int64, error)
 	// Only ever called after the real Clerk-side removal already succeeded —
 	// see Handler.Remove's doc comment for why the ordering matters.
@@ -41,7 +44,14 @@ type Querier interface {
 	// Only ever called once, right after FinalizeRun, guarded on the run
 	// having just reached status='completed' -- see finalizeIfTerminal.
 	// estimated_manual_minutes defaults to 15 (a conservative baseline) when
-	// the workflow never had one set.
+	// the workflow never had one set. parent_run_id IS NOT NULL (workflow 18's
+	// specialist sub-runs) instead sets an explicit NULL, not a computed
+	// estimate -- only the orchestrator's own run represents the end-to-end
+	// task a founder would otherwise have done by hand; accruing hours_saved
+	// per specialist too would double- (or N-times-) count the same task.
+	// accrueHoursSaved's existing "hoursSaved == nil -> nothing to accrue"
+	// check already handles that NULL correctly, so no Go-side change is
+	// needed for this guard.
 	FinalizeRunHoursSaved(ctx context.Context, arg FinalizeRunHoursSavedParams) (*float64, error)
 	// Queries backing BYOK API key management (workflow 3). Run through
 	// app_user via tenant.WithTx — this is genuinely tenant-scoped data, not a
@@ -64,10 +74,27 @@ type Querier interface {
 	// visible under a synthetic "Unattributed" bucket rather than silently
 	// dropping real spend from the total.
 	GetAgentCostShare(ctx context.Context, arg GetAgentCostShareParams) ([]GetAgentCostShareRow, error)
+	// The fields internal/core/a2a/manifest.go needs to build an A2A agent
+	// card — name/description/model for display, policy_scope's allowed_tools
+	// for the card's declared "skills" (an external caller should be able to
+	// see what a specialist can actually do before dispatching a task to it).
+	GetAgentForA2AManifest(ctx context.Context, arg GetAgentForA2AManifestParams) (GetAgentForA2AManifestRow, error)
 	// GET /analytics/agent-performance. success_count/failure_count are
 	// separate columns (not one status column) so the handler never has to
 	// special-case pending/running/awaiting_approval rows to compute a rate.
 	GetAgentPerformance(ctx context.Context, orgID pgtype.UUID) ([]GetAgentPerformanceRow, error)
+	// is_active = true, unlike GetWorkflow's deliberate "show it either way"
+	// choice — a deactivated team has no equivalent of a workflow's
+	// pause/resume toggle (DeactivateAgentTeam is a one-way soft delete, see
+	// its own doc comment), so a founder should never be able to Get or Run
+	// one again after deleting it.
+	GetAgentTeam(ctx context.Context, arg GetAgentTeamParams) (GetAgentTeamRow, error)
+	// The real authorization check behind POST .../a2a/agents/{agent_id}/tasks/send:
+	// an orchestrator's dispatching run resolves its own team via
+	// GetRunTeamID, then this confirms the requested target agent is actually
+	// a member of *that* team (pgx.ErrNoRows if not, treated as 403) — never
+	// trusts a client-supplied role or team id.
+	GetAgentTeamMemberRole(ctx context.Context, arg GetAgentTeamMemberRoleParams) (string, error)
 	GetApproval(ctx context.Context, arg GetApprovalParams) (GetApprovalRow, error)
 	// GetApprovalSystemScoped runs on app_system (BYPASSRLS) — the
 	// action-token approve/reject path (internal/api/approvals/handler.go)
@@ -124,6 +151,12 @@ type Querier interface {
 	// Resolves a run's agent_id via its workflow — Launcher.Resume needs this
 	// before it can rebuild the RunDeps/Nodes a suspended run's checkpoint
 	// alone doesn't carry (agent_id isn't part of RunState's own JSON).
+	// COALESCE(wr.agent_id, ...) is workflow 18's addition: a team's specialist
+	// sub-runs all share the team's one `workflows` row (whose agent_id is the
+	// orchestrator's, not theirs), so their real agent is stored directly on
+	// workflow_runs.agent_id instead — NULL there for every ordinary run
+	// (and the orchestrator's own run), which falls through to the original
+	// workflow-derived lookup unchanged.
 	GetRunAgentID(ctx context.Context, arg GetRunAgentIDParams) (pgtype.UUID, error)
 	GetRunCheckpoint(ctx context.Context, arg GetRunCheckpointParams) (GetRunCheckpointRow, error)
 	GetRunCostBreakdown(ctx context.Context, arg GetRunCostBreakdownParams) ([]GetRunCostBreakdownRow, error)
@@ -133,6 +166,14 @@ type Querier interface {
 	// infer this from Engine.Run's returned error alone, since a suspended
 	// run also returns a nil error.
 	GetRunStatus(ctx context.Context, arg GetRunStatusParams) (string, error)
+	// Resolves a run's team (and the one workflow row every run in that team
+	// shares — see InsertTeamWorkflow) via its own workflow_id — the a2a
+	// tasks/send handler uses this (via the request's sessionId, the
+	// dispatching orchestrator's own run) to find which team the target agent
+	// must belong to, rather than trusting a client-supplied team id, and
+	// which workflow_id to insert the specialist's own sub-run row against.
+	GetRunTeamAndWorkflow(ctx context.Context, arg GetRunTeamAndWorkflowParams) (GetRunTeamAndWorkflowRow, error)
+	GetTeamWorkflow(ctx context.Context, arg GetTeamWorkflowParams) (pgtype.UUID, error)
 	// GetUserApprovalPermissions backs both the authenticated and the
 	// action-token approve/reject paths (internal/api/approvals/handler.go) —
 	// neither authctx.User nor a Clerk JWT carries can_approve_workflows, so
@@ -150,6 +191,14 @@ type Querier interface {
 	// rows (pgx.ErrNoRows on the :one Scan), which the handler translates to a
 	// 400 DUPLICATE_AGENT_NAME rather than a generic 500.
 	InsertAgent(ctx context.Context, arg InsertAgentParams) (InsertAgentRow, error)
+	// Queries backing workflow 18 (Multi-Agent Team Run / A2A). agent_teams
+	// and agent_team_members have existed, RLS-covered, since 000001/000002 —
+	// these are the first queries ever written against them. All tenant-scoped
+	// through app_user via tenant.WithTx, same as every other feature area in
+	// this file set — team membership and A2A dispatch never cross an org
+	// boundary.
+	InsertAgentTeam(ctx context.Context, arg InsertAgentTeamParams) (InsertAgentTeamRow, error)
+	InsertAgentTeamMember(ctx context.Context, arg InsertAgentTeamMemberParams) (InsertAgentTeamMemberRow, error)
 	// Workflow 10: approvals/approval_decisions writes (internal/core/graph's
 	// writeApprovalGate, internal/api/approvals' handler), notification lookups
 	// (internal/core/notify), and the 24h expiry sweep
@@ -181,6 +230,24 @@ type Querier interface {
 	// after — one INSERT instead of an insert-then-update dance.
 	InsertDocument(ctx context.Context, arg InsertDocumentParams) error
 	InsertDocumentChunk(ctx context.Context, arg InsertDocumentChunkParams) error
+	// Workflow 18's own auto-created companion row, one per agent_teams row —
+	// see the note on ListWorkflows above. graph_definition mirrors
+	// InsertWorkflow's own fixed marker; trigger_type is always 'manual' since
+	// nothing schedules a team run yet.
+	InsertTeamWorkflow(ctx context.Context, arg InsertTeamWorkflowParams) (pgtype.UUID, error)
+	// Workflow 18's variant of InsertWorkflowRun — used for both the
+	// orchestrator's own run (id server-generated, parent_run_id NULL) and
+	// each specialist's delegated sub-run (id explicit — see below),
+	// always with an explicit agent_id rather than InsertWorkflowRun's
+	// workflow-derived one. See GetRunAgentID's and
+	// workflow_runs.parent_run_id's doc comments above. id is
+	// sqlc.narg(id): NULL lets Postgres's own gen_random_uuid() default fill
+	// it (the orchestrator's own run); a specialist's sub-run instead reuses
+	// the exact id its delegate node already minted client-side (see
+	// graph.RunDeps.A2AClient.Dispatch's doc comment) before dispatch, so the
+	// id EventBus.LinkChild registered for matches the id the specialist's
+	// own engine run actually publishes events under.
+	InsertTeamWorkflowRun(ctx context.Context, arg InsertTeamWorkflowRunParams) (InsertTeamWorkflowRunRow, error)
 	// graph_definition is fixed, not user-configurable — every workflow runs
 	// the same planner -> rag_retriever -> executor -> validator -> reporter
 	// pipeline (Workflow 9's node list); nothing in this workflow's spec lets
@@ -197,6 +264,22 @@ type Querier interface {
 	// fired at each of the 5 node functions plus once per LLM turn and once
 	// per tool call inside executorNode -- see BuildNodes' doc comment.
 	InsertWorkflowStep(ctx context.Context, arg InsertWorkflowStepParams) error
+	// Gates internal/core/a2a's manifest/tasks-send endpoints: only an agent
+	// that is (still) a member of at least one active team is A2A-addressable.
+	// Checked live against agent_team_members/agent_teams, not a cached flag —
+	// same "don't trust a second source of truth" reasoning as workflow 9's
+	// policy_scope decision (see CLAUDE.md's Agent Execution Engine section) —
+	// a member removed from every team loses A2A reachability immediately, not
+	// whenever some denormalized column next happens to get refreshed.
+	IsAgentOnActiveTeam(ctx context.Context, arg IsAgentOnActiveTeamParams) (bool, error)
+	// Joined against agents for display (name, description, model) — the
+	// specialist card the team page and the multi-agent pipeline UI both need,
+	// without a second round trip per member.
+	ListAgentTeamMembers(ctx context.Context, teamID pgtype.UUID) ([]ListAgentTeamMembersRow, error)
+	// member_count is a correlated subquery, same reasoning as ListAgents'
+	// workflow_count — a team with 0 members (mid-setup, or every member
+	// since removed) must still appear exactly once.
+	ListAgentTeamsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListAgentTeamsForOrgRow, error)
 	// Queries backing workflow 7 (agent configuration CRUD). All tenant-scoped,
 	// run through app_user via tenant.WithTx like every other feature area in
 	// this file set — nothing here is cross-tenant, unlike the recovery-sweep
@@ -228,6 +311,12 @@ type Querier interface {
 	// actor_name a non-nullable Go string even though it's genuinely
 	// NULL-able here - the first real 'system' row would crash pgx's scan.
 	ListAuditLogsPage(ctx context.Context, arg ListAuditLogsPageParams) ([]ListAuditLogsPageRow, error)
+	// The specialist sub-runs a team's orchestrator run dispatched — how
+	// GET /teams/{id}/runs/{run_id} builds its aggregated, per-specialist
+	// trace. delegated_role/agent_id are always set on these rows (see
+	// InsertTeamWorkflowRun), so no join back to agent_team_members is needed
+	// (and wouldn't survive a member later being removed from the team).
+	ListChildRuns(ctx context.Context, arg ListChildRunsParams) ([]ListChildRunsRow, error)
 	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
 	// Paginated GET /billing/ledger.
 	ListCostLedgerPage(ctx context.Context, arg ListCostLedgerPageParams) ([]ListCostLedgerPageRow, error)
@@ -263,6 +352,10 @@ type Querier interface {
 	// doc comment for why).
 	ListOrgMembers(ctx context.Context, orgID pgtype.UUID) ([]ListOrgMembersRow, error)
 	ListPushSubscriptionsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListPushSubscriptionsForOrgRow, error)
+	// parent_run_id IS NULL excludes a team's specialist sub-runs from the
+	// flat run list — a founder browsing "my runs" sees the team run as one
+	// row; its specialists only surface via GET /teams/{id}/runs/{run_id}'s
+	// aggregated trace (workflow 18).
 	ListRunsForOrg(ctx context.Context, arg ListRunsForOrgParams) ([]ListRunsForOrgRow, error)
 	// Workflow 12 (RAG search). ListSearchableDocumentIDs is the ACL + category
 	// filter, resolved *before* any embedding/Pinecone call so a query that
@@ -286,7 +379,12 @@ type Querier interface {
 	// pause/resume toggle and "Paused" badge client-side. agent_name comes via
 	// a plain JOIN, not a nullable LEFT JOIN: agent_id is NOT NULL and agents
 	// are only ever soft-deleted (never actually removed), so the referenced
-	// row always exists.
+	// row always exists. team_id IS NULL excludes the one companion `workflows`
+	// row workflow 18's POST /teams auto-creates per team (see teams.sql's
+	// InsertTeamWorkflow) — that row exists only to satisfy workflow_runs.
+	// workflow_id's NOT NULL constraint for team runs, it's not something a
+	// founder configured here and shouldn't show up as an orphan single-agent
+	// workflow.
 	ListWorkflows(ctx context.Context, orgID pgtype.UUID) ([]ListWorkflowsRow, error)
 	MarkConnectionExpired(ctx context.Context, arg MarkConnectionExpiredParams) (int64, error)
 	MarkConnectionExpiredByIDSystem(ctx context.Context, id pgtype.UUID) (int64, error)
@@ -396,6 +494,10 @@ type Querier interface {
 	// to assign a workflow to a deactivated agent. Also returns name so the
 	// Create response can embed agent_name without a second query.
 	ValidateAgentForOrg(ctx context.Context, arg ValidateAgentForOrgParams) (ValidateAgentForOrgRow, error)
+	// Same "must belong to this org and be active" guard InsertWorkflow's
+	// ValidateAgentForOrg already applies to workflows — a team's orchestrator
+	// and every specialist must pass it too.
+	ValidateAgentForTeamMembership(ctx context.Context, arg ValidateAgentForTeamMembershipParams) (ValidateAgentForTeamMembershipRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

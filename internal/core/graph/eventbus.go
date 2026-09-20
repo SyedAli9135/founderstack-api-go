@@ -23,14 +23,31 @@ const (
 	EventToken            EventType = "token"
 	EventComplete         EventType = "complete"
 	EventIntegrationError EventType = "integration_error"
+	EventDelegated        EventType = "delegated"
 )
 
-// Event is one message published on a run's channel.
+// Event is one message published on a run's channel. SubRunID/AgentRole
+// are only ever set on a *mirrored* copy of a specialist's event — see
+// EventBus.LinkChild — never on an event published directly for its own
+// run_id, so a plain (non-team) run's stream is byte-for-byte unchanged.
 type Event struct {
-	Type      EventType `json:"type"`
-	RunID     uuid.UUID `json:"run_id"`
-	Data      any       `json:"data,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
+	Type      EventType  `json:"type"`
+	RunID     uuid.UUID  `json:"run_id"`
+	Data      any        `json:"data,omitempty"`
+	Timestamp time.Time  `json:"timestamp"`
+	SubRunID  *uuid.UUID `json:"sub_run_id,omitempty"`
+	AgentRole string     `json:"agent_role,omitempty"`
+}
+
+// DelegatedData is EventDelegated's Data — published on the orchestrator's
+// own run the moment a subtask is dispatched, before the specialist's own
+// events start arriving (mirrored, see LinkChild) — lets the live feed
+// render "→ Delegated to Finance Agent" without waiting on the specialist
+// to actually start.
+type DelegatedData struct {
+	Role      string    `json:"role"`
+	AgentName string    `json:"agent_name"`
+	SubRunID  uuid.UUID `json:"sub_run_id"`
 }
 
 // NodeTransitionData is EventNodeStart/EventNodeEnd's Data
@@ -68,13 +85,45 @@ type IntegrationErrorData struct {
 // engine itself) publish, the SSE handler subscribes. Safe for concurrent
 // use by multiple runs and multiple subscribers.
 type EventBus struct {
-	mu   sync.RWMutex
-	subs map[uuid.UUID][]chan Event
+	mu      sync.RWMutex
+	subs    map[uuid.UUID][]chan Event
+	mirrors map[uuid.UUID]mirrorTarget
+}
+
+// mirrorTarget is where (and how) a specialist's own events get echoed —
+// see LinkChild.
+type mirrorTarget struct {
+	ParentRunID uuid.UUID
+	Role        string
+}
+
+// LinkChild makes every event subsequently published for childRunID also
+// get delivered — as a second, tagged copy (SubRunID/AgentRole set,
+// RunID rewritten to parentRunID) — to parentRunID's own subscribers.
+// Lets a workflow 18 team run's frontend follow every specialist's live
+// events through the one SSE connection it already holds on the
+// orchestrator's run, instead of opening one stream per specialist.
+// Call before dispatching the specialist (graph.RunDeps.A2AClient.Dispatch)
+// so no early event is missed; UnlinkChild once dispatch returns.
+func (b *EventBus) LinkChild(childRunID, parentRunID uuid.UUID, role string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.mirrors[childRunID] = mirrorTarget{ParentRunID: parentRunID, Role: role}
+}
+
+// UnlinkChild removes a mirror registered by LinkChild — always call this
+// once a specialist's dispatch has returned (success or failure), even
+// though a finished run stops publishing on its own; otherwise the map
+// entry (and its subscriber lookups) would leak for the process lifetime.
+func (b *EventBus) UnlinkChild(childRunID uuid.UUID) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.mirrors, childRunID)
 }
 
 // NewEventBus builds an empty EventBus.
 func NewEventBus() *EventBus {
-	return &EventBus{subs: make(map[uuid.UUID][]chan Event)}
+	return &EventBus{subs: make(map[uuid.UUID][]chan Event), mirrors: make(map[uuid.UUID]mirrorTarget)}
 }
 
 // Subscribe returns a channel that receives every event published for
@@ -123,6 +172,25 @@ func (b *EventBus) Publish(ev Event) {
 		select {
 		case ch <- ev:
 		default:
+		}
+	}
+
+	// Mirror a linked specialist's event onto its orchestrator's own
+	// subscribers too — see LinkChild. ev.SubRunID is deliberately not
+	// already set here (a plain run never sets it), so this only ever
+	// fires one level deep: a mirrored copy's own RunID becomes the
+	// parent's, which has no mirror entry of its own.
+	if target, ok := b.mirrors[ev.RunID]; ok {
+		mirrored := ev
+		mirrored.RunID = target.ParentRunID
+		childRunID := ev.RunID
+		mirrored.SubRunID = &childRunID
+		mirrored.AgentRole = target.Role
+		for _, ch := range b.subs[target.ParentRunID] {
+			select {
+			case ch <- mirrored:
+			default:
+			}
 		}
 	}
 }

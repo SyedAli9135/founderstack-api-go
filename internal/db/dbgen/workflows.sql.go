@@ -33,6 +33,22 @@ func (q *Queries) DeactivateWorkflow(ctx context.Context, arg DeactivateWorkflow
 	return result.RowsAffected(), nil
 }
 
+const getTeamWorkflow = `-- name: GetTeamWorkflow :one
+SELECT id FROM workflows WHERE org_id = $1 AND team_id = $2
+`
+
+type GetTeamWorkflowParams struct {
+	OrgID  pgtype.UUID `json:"org_id"`
+	TeamID pgtype.UUID `json:"team_id"`
+}
+
+func (q *Queries) GetTeamWorkflow(ctx context.Context, arg GetTeamWorkflowParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getTeamWorkflow, arg.OrgID, arg.TeamID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const getWorkflow = `-- name: GetWorkflow :one
 SELECT w.id, w.agent_id, a.name AS agent_name, w.name, w.description,
        w.trigger_type, w.cron_expression, w.timezone, w.next_run_at,
@@ -117,6 +133,39 @@ func (q *Queries) GetWorkflowRun(ctx context.Context, arg GetWorkflowRunParams) 
 		&i.TriggeredBy,
 	)
 	return i, err
+}
+
+const insertTeamWorkflow = `-- name: InsertTeamWorkflow :one
+INSERT INTO workflows (org_id, agent_id, team_id, name, description, trigger_type, graph_definition, a2a_enabled, created_by)
+VALUES ($1, $2, $3, $4, $5, 'manual', '{"type":"team"}'::jsonb, true, $6)
+RETURNING id
+`
+
+type InsertTeamWorkflowParams struct {
+	OrgID       pgtype.UUID `json:"org_id"`
+	AgentID     pgtype.UUID `json:"agent_id"`
+	TeamID      pgtype.UUID `json:"team_id"`
+	Name        string      `json:"name"`
+	Description *string     `json:"description"`
+	CreatedBy   pgtype.UUID `json:"created_by"`
+}
+
+// Workflow 18's own auto-created companion row, one per agent_teams row —
+// see the note on ListWorkflows above. graph_definition mirrors
+// InsertWorkflow's own fixed marker; trigger_type is always 'manual' since
+// nothing schedules a team run yet.
+func (q *Queries) InsertTeamWorkflow(ctx context.Context, arg InsertTeamWorkflowParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, insertTeamWorkflow,
+		arg.OrgID,
+		arg.AgentID,
+		arg.TeamID,
+		arg.Name,
+		arg.Description,
+		arg.CreatedBy,
+	)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const insertWorkflow = `-- name: InsertWorkflow :one
@@ -275,7 +324,7 @@ SELECT w.id, w.agent_id, a.name AS agent_name, w.name, w.description,
        w.is_active, w.version, w.created_at, w.updated_at
 FROM workflows w
 JOIN agents a ON a.id = w.agent_id
-WHERE w.org_id = $1
+WHERE w.org_id = $1 AND w.team_id IS NULL
 ORDER BY w.created_at DESC
 `
 
@@ -304,7 +353,12 @@ type ListWorkflowsRow struct {
 // pause/resume toggle and "Paused" badge client-side. agent_name comes via
 // a plain JOIN, not a nullable LEFT JOIN: agent_id is NOT NULL and agents
 // are only ever soft-deleted (never actually removed), so the referenced
-// row always exists.
+// row always exists. team_id IS NULL excludes the one companion `workflows`
+// row workflow 18's POST /teams auto-creates per team (see teams.sql's
+// InsertTeamWorkflow) — that row exists only to satisfy workflow_runs.
+// workflow_id's NOT NULL constraint for team runs, it's not something a
+// founder configured here and shouldn't show up as an orphan single-agent
+// workflow.
 func (q *Queries) ListWorkflows(ctx context.Context, orgID pgtype.UUID) ([]ListWorkflowsRow, error) {
 	rows, err := q.db.Query(ctx, listWorkflows, orgID)
 	if err != nil {

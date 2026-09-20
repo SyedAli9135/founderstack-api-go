@@ -277,6 +277,74 @@ curl -s localhost:8000/api/v1/runs/$RUN_ID -H "Authorization: Bearer $TOKEN"
 # -> status: "cancelled"
 ```
 
+### `mock:team-orchestrator` / `mock:team-finance` / `mock:team-ops` — workflow 18 (multi-agent team run / A2A)
+
+**Proves**: the whole multi-agent flow at once — decompose, real A2A
+`tasks/send` dispatch to 2 specialists **in parallel** over a genuine HTTP
+loopback (not an in-process shortcut), SSE event mirroring onto the
+orchestrator's own stream, and final synthesis. Unlike every scenario above,
+this is 3 scenarios assigned to 3 *different* agents on the *same team*, not
+one agent tested in isolation.
+
+Live-verified 2026-09-20 against the founder's real dev org (`[TEST] Team
+Orchestrator`/`[TEST] Team Finance`/`[TEST] Team Ops`, team `[TEST] Board Prep
+Team` — left in place as a reusable fixture, same convention as every other
+`[TEST] *` agent in that org) — real browser, real click-through, not just
+`curl`. Full multi-agent pipeline (orchestrator lane + 2 parallel specialist
+lanes), live delegation events with role badges, collapsible per-specialist
+sub-timelines, and orchestrator trace (`Planning` → `Decompose` → 2×`A2A
+dispatch` → `Validation` → `Report`) all rendered correctly.
+
+**Setup is workflow 18's own `POST /teams`, not `POST /workflows`**:
+```bash
+ORCH_ID=$(curl -s -X POST localhost:8000/api/v1/agents \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"[TEST] Team Orchestrator","system_prompt":"test","model":"mock:team-orchestrator","policy_scope":{"allowed_tools":["notion.read_page"]}}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['id'])")
+FINANCE_ID=$(curl -s -X POST localhost:8000/api/v1/agents \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"[TEST] Team Finance","system_prompt":"test","model":"mock:team-finance","policy_scope":{"allowed_tools":["notion.read_page"]}}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['id'])")
+OPS_ID=$(curl -s -X POST localhost:8000/api/v1/agents \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"[TEST] Team Ops","system_prompt":"test","model":"mock:team-ops","policy_scope":{"allowed_tools":["notion.read_page"]}}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['id'])")
+
+TEAM_ID=$(curl -s -X POST localhost:8000/api/v1/teams \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"name\":\"[TEST] Board Prep Team\",\"orchestrator_agent_id\":\"$ORCH_ID\",\"members\":[{\"agent_id\":\"$FINANCE_ID\",\"role\":\"finance\"},{\"agent_id\":\"$OPS_ID\",\"role\":\"ops\"}]}" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['id'])")
+```
+**The member roles must be exactly `finance` and `ops`** — `mock:team-
+orchestrator`'s canned decompose response hardcodes those role strings (a
+real model would read them from the roster in its own prompt instead; a
+scripted mock has no prompt to read).
+
+```bash
+RUN_ID=$(curl -s -X POST localhost:8000/api/v1/teams/$TEAM_ID/run \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"input":"Prepare a Q2 board meeting summary covering burn rate and hiring plan"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['run_id'])")
+sleep 3
+curl -s localhost:8000/api/v1/teams/$TEAM_ID/runs/$RUN_ID -H "Authorization: Bearer $TOKEN"
+```
+**Expected**: orchestrator `status: "completed"`, `output` is the synthesized
+board summary, `specialists` has 2 entries (`role: "finance"`/`"ops"`) each
+`status: "completed"` with its own scripted output. Click through it in the
+browser at `/agents/teams/$TEAM_ID/runs/$RUN_ID` for the full multi-agent
+pipeline UI — that's the more useful way to verify this one, not just `curl`.
+
+**A cosmetic-only timing nuance, not a bug**: navigating to the run page
+*immediately* after `POST /teams/{id}/run` returns can show `$0.0000`
+orchestrator cost / an incomplete total for a second or two — the page's own
+REST query fetched before `LaunchTeam`'s detached goroutine had written
+anything yet, and on a run this fast (~3s total, all 3 mock responses
+resolving well under a second each) the SSE-driven refetch can lag slightly
+behind what's already true in Postgres. A real BYOK-backed run takes
+meaningfully longer per call, so this gap won't be visible in practice; even
+here, a manual page reload immediately shows the correct final numbers — the
+underlying data was never wrong, only a transient client-side cache read.
+
 ## Watching the SSE stream live
 
 Every scenario except `mock:cancel` uses an 800ms delay per mock "model call"

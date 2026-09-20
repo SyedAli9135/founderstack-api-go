@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/founderstack/api/internal/core/a2a"
 	"github.com/founderstack/api/internal/core/llm"
 	coremcp "github.com/founderstack/api/internal/core/mcp"
 	"github.com/founderstack/api/internal/core/notify"
@@ -45,6 +46,14 @@ type Launcher struct {
 	gateway           *coremcp.Gateway
 	resolveChatClient ChatClientResolver
 	notifier          *notify.Notifier
+	a2aClient         *a2a.Client
+}
+
+// SetA2AClient wires the Launcher for workflow 18 team runs — LaunchTeam
+// panics if called before this (see its own doc comment); every other
+// Launcher method is unaffected by whether it's been called.
+func (l *Launcher) SetA2AClient(c *a2a.Client) {
+	l.a2aClient = c
 }
 
 // NewLauncher builds a Launcher against llm.ResolveChatClient. appPool
@@ -192,6 +201,19 @@ func (l *Launcher) resume(ctx context.Context, orgID, runID uuid.UUID, approved 
 // catalog shared by run() and resume() — kept in lockstep so a resumed
 // run sees the exact same tool/policy/model config it started with.
 func (l *Launcher) buildNodesForRun(ctx context.Context, orgPg, agentPg pgtype.UUID) (dbgen.GetAgentRow, Nodes, error) {
+	agentRow, deps, err := l.buildRunDeps(ctx, orgPg, agentPg)
+	if err != nil {
+		return dbgen.GetAgentRow{}, nil, err
+	}
+	return agentRow, BuildNodes(deps), nil
+}
+
+// buildRunDeps is buildNodesForRun's dependency-resolution half, split out
+// so runTeam/RunSpecialist (workflow 18) can wire the *same* resolved
+// RunDeps into BuildTeamNodes/BuildNodes respectively instead of
+// duplicating this resolution logic — chat client, tool catalog, and
+// policy_scope parsing must stay identical across every run shape.
+func (l *Launcher) buildRunDeps(ctx context.Context, orgPg, agentPg pgtype.UUID) (dbgen.GetAgentRow, RunDeps, error) {
 	var agentRow dbgen.GetAgentRow
 	var settings dbgen.GetOrgRunSettingsRow
 	err := tenant.WithTx(ctx, l.appPool, orgPg, func(ctx context.Context, q *dbgen.Queries) error {
@@ -207,28 +229,28 @@ func (l *Launcher) buildNodesForRun(ctx context.Context, orgPg, agentPg pgtype.U
 		return nil
 	})
 	if err != nil {
-		return dbgen.GetAgentRow{}, nil, fmt.Errorf("graph: %w", err)
+		return dbgen.GetAgentRow{}, RunDeps{}, fmt.Errorf("graph: %w", err)
 	}
 	if settings.LlmProvider == nil || *settings.LlmProvider == "" {
-		return dbgen.GetAgentRow{}, nil, fmt.Errorf("graph: %w", llm.ErrNoActiveKey)
+		return dbgen.GetAgentRow{}, RunDeps{}, fmt.Errorf("graph: %w", llm.ErrNoActiveKey)
 	}
 	if agentRow.Model == nil || *agentRow.Model == "" {
-		return dbgen.GetAgentRow{}, nil, errors.New("graph: agent has no model configured")
+		return dbgen.GetAgentRow{}, RunDeps{}, errors.New("graph: agent has no model configured")
 	}
 
 	var policy PolicyScope
 	if err := json.Unmarshal(agentRow.PolicyScope, &policy); err != nil {
-		return dbgen.GetAgentRow{}, nil, fmt.Errorf("graph: unmarshal policy_scope: %w", err)
+		return dbgen.GetAgentRow{}, RunDeps{}, fmt.Errorf("graph: unmarshal policy_scope: %w", err)
 	}
 
 	chatClient, err := l.resolveChatClient(ctx, l.appPool, l.encryptionKey, orgPg, llm.ProviderID(*settings.LlmProvider), *agentRow.Model)
 	if err != nil {
-		return dbgen.GetAgentRow{}, nil, fmt.Errorf("graph: resolve chat client: %w", err)
+		return dbgen.GetAgentRow{}, RunDeps{}, fmt.Errorf("graph: resolve chat client: %w", err)
 	}
 
 	tools, err := ResolveTools(ctx, l.registry, policy)
 	if err != nil {
-		return dbgen.GetAgentRow{}, nil, fmt.Errorf("graph: resolve tools: %w", err)
+		return dbgen.GetAgentRow{}, RunDeps{}, fmt.Errorf("graph: resolve tools: %w", err)
 	}
 
 	deps := RunDeps{
@@ -236,7 +258,7 @@ func (l *Launcher) buildNodesForRun(ctx context.Context, orgPg, agentPg pgtype.U
 		Tools: tools, Policy: policy, SystemPrompt: agentRow.SystemPrompt, OrgID: orgPg,
 		AppPool: l.appPool, Model: *agentRow.Model, Notifier: l.notifier,
 	}
-	return agentRow, BuildNodes(deps), nil
+	return agentRow, deps, nil
 }
 
 // markRunFailedNoCheckpoint handles the pre-Engine.Run failure path: no
@@ -246,4 +268,89 @@ func markRunFailedNoCheckpoint(ctx context.Context, pool *pgxpool.Pool, orgID, r
 	return tenant.WithTx(ctx, pool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
 		return q.MarkRunFailedPreflight(ctx, dbgen.MarkRunFailedPreflightParams{OrgID: orgID, ID: runID})
 	})
+}
+
+// --- Multi-Agent Team Run (A2A) ---
+
+// LaunchTeam is Launch's team-orchestrator counterpart: same
+// resolve-then-detached-goroutine shape, but wires BuildTeamNodes instead
+// of BuildNodes and requires SetA2AClient to have been called first
+// (panics otherwise — a misconfigured deployment should fail loudly at
+// the one call site that needs A2A_TASK_TOKEN_SECRET, not silently run a
+// team with every specialist dispatch failing).
+func (l *Launcher) LaunchTeam(orgID, orchestratorAgentID, runID uuid.UUID, members []TeamMember, input string) {
+	if l.a2aClient == nil {
+		panic("graph: LaunchTeam called before SetA2AClient — see cmd/api/main.go wiring")
+	}
+	go func() {
+		ctx := context.Background()
+		orgPg := pgtype.UUID{Bytes: orgID, Valid: true}
+		runPg := pgtype.UUID{Bytes: runID, Valid: true}
+
+		if err := l.runTeam(ctx, orgID, orchestratorAgentID, runID, members, input); err != nil {
+			if status, statusErr := getRunStatus(ctx, l.appPool, orgPg, runPg); statusErr == nil && status == "pending" {
+				_ = markRunFailedNoCheckpoint(ctx, l.appPool, orgPg, runPg)
+			}
+		}
+	}()
+}
+
+func (l *Launcher) runTeam(ctx context.Context, orgID, agentID, runID uuid.UUID, members []TeamMember, input string) error {
+	orgPg := pgtype.UUID{Bytes: orgID, Valid: true}
+	agentPg := pgtype.UUID{Bytes: agentID, Valid: true}
+	runPg := pgtype.UUID{Bytes: runID, Valid: true}
+
+	agentRow, deps, err := l.buildRunDeps(ctx, orgPg, agentPg)
+	if err != nil {
+		return err
+	}
+	deps.A2AClient = l.a2aClient
+	nodes := BuildTeamNodes(deps, members)
+	state := &RunState{OrgID: orgID, AgentID: agentID, AgentName: agentRow.Name, WorkflowRunID: runID, Input: input}
+
+	if err := markRunStarted(ctx, l.appPool, orgPg, runPg); err != nil {
+		return fmt.Errorf("graph: mark team run started: %w", err)
+	}
+
+	runErr := l.engine.Run(ctx, nodes, state, "planner")
+
+	if err := finalizeIfTerminal(ctx, l.appPool, orgPg, runPg, state); err != nil {
+		slog.Error("graph: finalize team run failed", "run_id", runID, "engine_err", runErr, "finalize_err", err)
+	}
+	return runErr
+}
+
+// RunSpecialist executes one specialist's delegated sub-run and returns
+// its final output — called synchronously by internal/api/a2a's real
+// tasks/send HTTP handler (itself invoked by the orchestrator's own
+// delegate node — see internal/core/graph/team_nodes.go and
+// internal/core/a2a/client.go), unlike Launch/LaunchTeam/Resume, which all
+// background themselves for a caller that must return immediately (a
+// 202-accepted HTTP response). ctx is deliberately the caller's own
+// context here, not context.Background(): the a2a HTTP handler blocks on
+// this call for its entire duration, so canceling the orchestrator's run
+// (which cancels its in-flight HTTP calls to specialists) correctly
+// propagates all the way down to this specialist's own engine.Run too.
+func (l *Launcher) RunSpecialist(ctx context.Context, orgID, agentID, runID uuid.UUID, input string) (output string, err error) {
+	orgPg := pgtype.UUID{Bytes: orgID, Valid: true}
+	agentPg := pgtype.UUID{Bytes: agentID, Valid: true}
+	runPg := pgtype.UUID{Bytes: runID, Valid: true}
+
+	agentRow, deps, err := l.buildRunDeps(ctx, orgPg, agentPg)
+	if err != nil {
+		return "", err
+	}
+	nodes := BuildNodes(deps)
+	state := &RunState{OrgID: orgID, AgentID: agentID, AgentName: agentRow.Name, WorkflowRunID: runID, Input: input}
+
+	if err := markRunStarted(ctx, l.appPool, orgPg, runPg); err != nil {
+		return "", fmt.Errorf("graph: mark specialist run started: %w", err)
+	}
+
+	runErr := l.engine.Run(ctx, nodes, state, "planner")
+
+	if err := finalizeIfTerminal(context.WithoutCancel(ctx), l.appPool, orgPg, runPg, state); err != nil {
+		slog.Error("graph: finalize specialist run failed", "run_id", runID, "engine_err", runErr, "finalize_err", err)
+	}
+	return state.Output, runErr
 }

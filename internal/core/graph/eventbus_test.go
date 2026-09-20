@@ -69,6 +69,64 @@ func TestEventBus_UnsubscribeStopsDelivery(t *testing.T) {
 	}
 }
 
+func TestEventBus_LinkChildMirrorsEventsOntoParent(t *testing.T) {
+	bus := NewEventBus()
+	parentRunID, childRunID := uuid.New(), uuid.New()
+
+	parentCh, unsubParent := bus.Subscribe(parentRunID)
+	defer unsubParent()
+	childCh, unsubChild := bus.Subscribe(childRunID)
+	defer unsubChild()
+
+	bus.LinkChild(childRunID, parentRunID, "finance")
+	bus.Publish(Event{Type: EventReasoning, RunID: childRunID, Data: "thinking"})
+
+	// The specialist's own subscriber sees the event unmodified — mirroring
+	// is additive, never a redirect.
+	select {
+	case ev := <-childCh:
+		if ev.RunID != childRunID || ev.SubRunID != nil {
+			t.Fatalf("child subscriber got mutated event: %+v", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("child subscriber never received its own event")
+	}
+
+	// The orchestrator's subscriber sees a tagged copy under its own run_id.
+	select {
+	case ev := <-parentCh:
+		if ev.RunID != parentRunID {
+			t.Fatalf("mirrored event RunID = %v, want parentRunID", ev.RunID)
+		}
+		if ev.SubRunID == nil || *ev.SubRunID != childRunID {
+			t.Fatalf("mirrored event SubRunID = %v, want %v", ev.SubRunID, childRunID)
+		}
+		if ev.AgentRole != "finance" {
+			t.Fatalf("mirrored event AgentRole = %q, want %q", ev.AgentRole, "finance")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("parent subscriber never received the mirrored event")
+	}
+}
+
+func TestEventBus_UnlinkChildStopsMirroring(t *testing.T) {
+	bus := NewEventBus()
+	parentRunID, childRunID := uuid.New(), uuid.New()
+
+	parentCh, unsubParent := bus.Subscribe(parentRunID)
+	defer unsubParent()
+
+	bus.LinkChild(childRunID, parentRunID, "ops")
+	bus.UnlinkChild(childRunID)
+	bus.Publish(Event{Type: EventReasoning, RunID: childRunID, Data: "thinking"})
+
+	select {
+	case ev := <-parentCh:
+		t.Fatalf("parent subscriber should not receive events after UnlinkChild, got %+v", ev)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestEventBus_PublishNeverBlocksOnFullSubscriber(t *testing.T) {
 	bus := NewEventBus()
 	runID := uuid.New()

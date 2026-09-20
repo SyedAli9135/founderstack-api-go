@@ -23,19 +23,24 @@ Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 fro
 Anthropic-only original). See "BYOK API Keys" below.
 
 **Workflows 1 (bootstrap) through 14 (token usage & analytics), plus workflows 16 (disconnect/
-reconnect integration) and 17 (view audit logs), are implemented. Workflow 15 (Manage Billing &
-Subscription) is deliberately skipped for now** — it needs a real (or test-mode) Stripe account
-for FounderStack's own platform billing plus real pricing/trial decisions, neither of which
-exists yet; unlike every other workflow so far, this isn't something to build against fabricated
-inputs. Workflow 14 (usage & analytics), workflow 16 (integration reconnection), and workflow 17
-(audit logs) — all 2026-09-07 — are the 3 most recent — see "View Token Usage & Analytics
-(workflow 14)", "Disconnect / Reconnect Integration (workflow 16)", and "View Audit Logs (workflow
-17)" below. Don't assume routes, tables, or packages from workflow 15/18+ in
-`WORKFLOW_PLAN_GO.md` exist — check
+reconnect integration), 17 (view audit logs), and 18 (multi-agent team run / A2A), are
+implemented — workflow 18's frontend (team list/create pages, multi-agent pipeline UI, live
+delegation events, trace sub-timelines) lives in `../founderstack-web`, its own repo, per this
+codebase's usual backend/frontend split; see that repo's `AGENTS.md` for its own detail.
+Workflow 15 (Manage Billing & Subscription) is deliberately skipped for now** — it needs a real
+(or test-mode) Stripe account for FounderStack's own platform billing plus real pricing/trial
+decisions, neither of which exists yet; unlike every other workflow so far, this isn't something
+to build against fabricated inputs. Workflow 14
+(usage & analytics), workflow 16 (integration reconnection), workflow 17 (audit logs) — all
+2026-09-07 — and workflow 18 (2026-09-20) are the most recent — see "View Token Usage & Analytics
+(workflow 14)", "Disconnect / Reconnect Integration (workflow 16)", "View Audit Logs (workflow
+17)", and "Multi-Agent Team Run / A2A (workflow 18)" below. Don't assume routes, tables, or
+packages from workflow 15 or 19+ in `WORKFLOW_PLAN_GO.md` exist — check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
 `internal/api/workflows/`, `internal/api/runs/`, `internal/api/approvals/`, `internal/api/org/`,
-`internal/api/billing/`, and `internal/api/auditlogs/` for what's actually registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
+`internal/api/billing/`, `internal/api/auditlogs/`, `internal/api/teams/`, and `internal/api/a2a/`
+for what's actually registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
 third party until real OAuth app credentials
 are registered on each provider's dashboard and put in `.env` — see "Third-Party Integrations
 (workflow 4)" below and its "Status" note in `WORKFLOW_PLAN_GO.md`.
@@ -1587,6 +1592,163 @@ resolution for both real join types plus the `'system'`-with-no-match fallback, 
 boundaries), the owner/admin guard for member and viewer, and cross-org isolation — all against
 real Postgres.
 
+### Multi-Agent Team Run / A2A (workflow 18) — `internal/core/a2a`, `internal/api/a2a`, `internal/api/teams`, extends `internal/core/graph`
+
+Built 2026-09-20. Full backend, real A2A wire protocol — the founder explicitly asked for full
+compliance (a real HTTP loopback round trip for dispatch, not an in-process shortcut), so that's
+what got built. Frontend lives in `../founderstack-web` (its own repo's `AGENTS.md` has the
+detail) and was built and live-verified the same day. See `WORKFLOW_PLAN_GO.md`'s own workflow 18
+section for the full acceptance-criteria checklist.
+
+**Schema surprise, confirmed before writing anything**: `agent_teams`, `agent_team_members`,
+`workflows.team_id`, and `agents.{a2a_endpoint, team_role, a2a_manifest}` have all existed, fully
+RLS-covered, since migration `000001`/`000002` — day one — with zero code ever reading or writing
+them. This workflow's only schema change (migration `000014`) is 3 new `workflow_runs` columns:
+`parent_run_id` (links a specialist's sub-run back to its dispatching orchestrator run),
+`agent_id` (the run's *actual* agent — see below), and `delegated_role` (for trace-UI labeling,
+since a member removed from a team later leaves no other way to recover its role for a past run).
+
+**Design choice made explicit up front and held to throughout**: a team run is not a new parallel-
+execution primitive — it's just N+1 *ordinary* single-agent runs (the same `planner`/`executor`/
+`validator`/`reporter` graph, `Engine.Run`, checkpointing, SSE), linked. Every specialist dispatch
+reuses `graph.Launcher`'s existing dependency-resolution path (`buildRunDeps`, extracted from
+`buildNodesForRun` specifically for this reuse) unchanged. The only genuinely new pieces are: (1)
+the orchestrator's own 2-node graph variant, (2) the real A2A wire hop, (3) mirroring a specialist's
+SSE events onto its orchestrator's stream.
+
+**Why `workflow_runs.agent_id` is new, and `GetRunAgentID` now `COALESCE`s**: every *existing*
+run resolves its agent transitively through `workflow_id -> workflows.agent_id` — but a team's
+specialist sub-runs all share *the team's one `workflows` row* (see below), whose `agent_id` is
+the orchestrator's, not theirs. Storing the real agent directly on `workflow_runs.agent_id`
+(`NULL` for every ordinary run, which falls through to the original workflow-derived lookup
+unchanged) was far less invasive than either making `workflow_id` nullable or minting a phantom
+`workflows` row per specialist.
+
+**One companion `workflows` row per team, not per member** (`InsertTeamWorkflow`, called once
+inside `teams.Handler.Create`'s transaction): exists purely to satisfy `workflow_runs.workflow_id`
+NOT NULL for both the orchestrator's own run and every specialist's sub-run (`team_id` set,
+`agent_id` = orchestrator's) — a founder never sees or configures it. `ListWorkflows` gained a
+`team_id IS NULL` filter so it doesn't show up as an orphan single-agent workflow.
+
+**`internal/core/graph/team_nodes.go`'s 4-node graph**: `teamPlannerNode -> delegateNode ->
+validatorNode -> reporterNode` — the last two are the *exact same functions* the single-agent
+graph uses, unmodified. `delegateNode` does 3 things in order: (1) `decomposeTask` — one model
+call, plain JSON-mode prompting (no tool schema; this is a one-shot structured request, not a
+back-and-forth), asking the orchestrator's own model to split the input into one subtask per
+specialist role from the team's roster; (2) fans every subtask out in parallel via
+`errgroup.Group` (`dispatchSubtask`, one goroutine per specialist) — **this is what makes "no
+slower than the slowest specialist" true structurally**, not something enforced by a runtime
+check; (3) folds every specialist's result into `state.Conversation` as an ordinary
+`llm.RoleTool` message, then calls the model *again* (`synthesizeFinalOutput`) to produce one
+cohesive answer — this is why reusing `validatorNode` unchanged actually works: a specialist's
+output is untrusted, LLM-produced content the same way any tool result is, so the existing
+prompt-injection scan already covers it with zero team-specific logic.
+
+**The real A2A wire hop** (`internal/core/a2a/`, `internal/api/a2a/`): `dispatchSubtask` calls
+`a2a.Client.Dispatch`, which is a genuine `net/http` `POST` to
+`{APP_BASE_URL}/api/v1/a2a/agents/{agent_id}/tasks/send` — a real loopback network round trip,
+not an in-process function call, per the founder's explicit ask for full compliance. JSON-RPC 2.0
+envelope (`envelope.go`): `TaskSendRequest{method: "tasks/send", params: {id, sessionId,
+message}}` in, `TaskSendResponse{result: {id, status, artifacts}}` out — `tasks/send` only, not
+the spec's streaming `tasks/sendSubscribe` variant (`Capabilities.Streaming: false` — a
+deliberate, documented scope cut, not an oversight). The receiving handler
+(`internal/api/a2a/handler.go`'s `TasksSend`) lives in `internal/api`, not alongside the wire
+types in `internal/core/a2a` — it needs `graph.Launcher` to actually run the specialist
+(`Launcher.RunSpecialist`, a new synchronous sibling of `Launch`/`Resume` — synchronous because
+`tasks/send` itself is a blocking call the orchestrator waits on, unlike `Launch`'s
+202-Accepted-then-detached-goroutine shape), and `internal/core/a2a` can never import
+`internal/core/graph` without creating an import cycle (`graph`'s own `delegate` node needs the
+wire client too).
+
+**Manifest is path-scoped per agent, not host-root** (`GET /api/v1/a2a/agents/{agent_id}/
+.well-known/agent.json`) — a deliberate, documented deviation from the spec's implicit
+single-agent-per-host assumption, since this one server hosts every org's every agent. Only an
+agent that's a member of at least one *active* team is addressable — checked live via
+`IsAgentOnActiveTeam` against `agent_team_members`/`agent_teams`, never a cached flag, same
+"don't trust a second source of truth" discipline workflow 9's `policy_scope` decision already
+established. The card's `skills` are derived live from the agent's own `policy_scope.
+allowed_tools`, not a hand-maintained list.
+
+**`tasks/send` authentication has no Clerk session behind it at all** — it's a server-to-server
+call the orchestrator's own delegate node makes. `internal/core/a2a.TaskTokenSigner`
+(`tasktoken.go`) is a dedicated HMAC-signed bearer token, deliberately modeled on
+`notify.ActionTokenSigner` (workflow 10's push-notification action buttons) rather than reusing
+it or `OAUTH_STATE_SECRET` — same "contain blast radius between signing use cases" reasoning,
+new `A2A_TASK_TOKEN_SECRET` env var. **Authorization is 2 layers, not 1**: the token alone proves
+"this exact org, this exact agent" (`Verify(token, agentID) -> orgID` — note `orgID` is an
+*output*, not an input to check against, since there's no other way for the handler to learn it);
+separately, `GetRunTeamAndWorkflow` (via the request's `sessionId`, the dispatching orchestrator's
+own run) + `GetAgentTeamMemberRole` confirm the target agent is actually a member of *that specific
+dispatching run's team* — not just "some team the org owns". A validly-signed token for an agent
+that exists but isn't on the right team is still rejected (403), which
+`internal/api/a2a/handler_integration_test.go`'s `TestHandler_TasksSend_NonMemberAgentForbidden`
+exists specifically to pin down — the token alone is deliberately not sufficient authorization on
+its own.
+
+**SSE fan-in, so the frontend only ever needs one stream**: `EventBus.LinkChild(childRunID,
+parentRunID, role)` (`eventbus.go`), called by `dispatchSubtask` *before* issuing the HTTP
+dispatch (so no early event is missed) — every subsequent event published for `childRunID` is
+also delivered, as a second, tagged copy (`Event.SubRunID`/`AgentRole` set, `RunID` rewritten to
+the parent's), to the orchestrator's own subscribers. `UnlinkChild` (deferred) removes the
+mapping once dispatch returns. New `EventDelegated` fires the instant a subtask is dispatched
+(before the specialist's own first event arrives), for the live feed's "→ Delegated to Finance
+Agent" line. A plain (non-team) run's stream is byte-for-byte unaffected — nothing is mirrored
+unless `LinkChild` was called for that run.
+
+**Hours-saved double-counting, caught and guarded before it could ship**: `FinalizeRunHoursSaved`
+now sets an explicit `NULL` (not a computed estimate) whenever `parent_run_id IS NOT NULL` — only
+the orchestrator's own run represents the end-to-end task a founder would otherwise have done by
+hand; accruing it per specialist too would have double- (or N-times-) counted the same task. The
+existing `accrueHoursSaved`'s `hoursSaved == nil -> nothing to accrue` check already handled the
+`NULL` correctly, so this needed zero Go-side change, only the SQL `CASE`.
+`TestTeamsHandler_RunEndToEnd` asserts both halves: the parent accrues a positive value, no child
+does.
+
+**Testing**: `internal/core/a2a/tasktoken_test.go` (sign/verify round trip, tampered signature,
+expired, wrong-agent rejection — mirrors `notify.ActionTokenSigner`'s own test shape almost
+exactly). `internal/core/graph/eventbus_test.go` gained 2 tests for `LinkChild`/`UnlinkChild`
+mirroring. `internal/api/a2a/handler_integration_test.go` (5 tests) covers the manifest's
+team-membership gate and `tasks/send`'s full auth chain (missing token, wrong-agent token,
+non-member-of-this-team token). `internal/api/teams/handler_integration_test.go`'s
+`TestTeamsHandler_RunEndToEnd` is the flagship: a real orchestrator run that decomposes a task,
+dispatches 2 specialists in parallel over a genuine HTTP round trip against the test's own
+`httptest.Server` (not an in-process shortcut — the same topology `cmd/api/main.go` wires in
+production, just served from a test listener), and asserts the synthesized final output, both
+specialists' individual outputs via the aggregated trace endpoint, and the hours-saved guard
+above — all through `llm.MockChatClient`, no live provider call. **Not yet verified against a
+real BYOK provider** — no real Anthropic/OpenAI/etc. key was available this session, only
+`API_KEY_MOCK_PREFIX`/`MOCK_LLM_MODE`. **Live-verified in a real browser, later the same day**
+(Claude-in-Chrome reconnected after being down earlier in the session): 3 new catalog entries,
+`mock:team-orchestrator`/`mock:team-finance`/`mock:team-ops` (`internal/core/llm/
+mockscenarios.go`), let the whole flow — decompose, real parallel A2A `tasks/send` dispatch,
+synthesis — run with zero live provider calls, same convention as every other `mock:*` scenario.
+Clicked all the way through against the founder's real dev org: team list → team detail → "Run
+team" → the live multi-agent pipeline (orchestrator lane + 2 parallel specialist lanes) →
+delegation events with role badges in the unified feed → collapsible per-specialist
+sub-timelines → final synthesized output and cost stats. See `MOCK_LLM_TESTING.md`'s own new
+section for the exact scenario and the one cosmetic (non-bug) timing nuance found while doing
+this — a fast mock run's cost stat can look momentarily incomplete on first page load, self-
+corrects on refresh, real BYOK calls are slow enough this never shows up in practice. The
+`[TEST] Team Orchestrator`/`[TEST] Team Finance`/`[TEST] Team Ops` agents and `[TEST] Board Prep
+Team` were left in the founder's real dev org afterward, same as every other `[TEST] *` fixture
+there — a reusable scenario, not throwaway data to clean up.
+
+**Real gotcha, found running these tests, not hypothetical**: `TestTeamsHandler_RunEndToEnd` and
+the `internal/api/a2a` auth-boundary tests both leave their test orgs behind in the local dev
+Postgres after `t.Cleanup` runs — `workflow_runs`/`approvals` reference `organizations.id`
+**without `ON DELETE CASCADE`** (a pre-existing, already-documented gap — see this file's Clerk
+Webhook Sync section), and every one of these tests' fixtures creates real `workflow_runs` rows,
+so `t.Cleanup`'s `DELETE FROM organizations WHERE id = $1` fails on the FK violation — silently,
+since (matching `launchFixture`'s own existing convention) the cleanup's error return is
+discarded. Workflow 9's single-agent test fixtures never hit this because they don't reliably
+leave a `workflow_runs` row behind by the time cleanup runs. Not fixed here (that constraint
+change is out of this workflow's scope, and the gap is already accepted/documented) — but if you
+run this package's tests repeatedly against the same local Postgres, expect `organizations` rows
+named "Teams Test Org"/"A2A Test Org" to accumulate, and clean them up by hand (delete
+`workflow_steps`/`cost_ledger`/`workflow_runs`/`workflows`/`agent_team_members`/`agent_teams`/
+`agents`/`api_key_registry`/`users` for those org ids first, `organizations` last) rather than
+assuming `t.Cleanup` handled it.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -1842,9 +2004,12 @@ machine — CI runs the authoritative version of the same check regardless.
 | `GET /api/v1/analytics/agent-performance` | `internal/api/analytics/handler.go` | `middleware.RequireAuth` | Per-agent success rate/avg duration/avg cost (workflow 14) |
 | `GET /api/v1/analytics/rag-quality` | `internal/api/analytics/handler.go` | `middleware.RequireAuth` | Rolling-30-day RAG search quality (avg rerank score, cache hit rate, avg chunks retrieved) (workflow 14) |
 | `GET /api/v1/audit-logs` | `internal/api/auditlogs/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | Cursor-paginated, filterable audit log of every action an agent or user took (workflow 17) |
+| `GET/POST /api/v1/teams`, `GET/DELETE /teams/{id}`, `POST /teams/{id}/run`, `GET /teams/{id}/runs/{run_id}` | `internal/api/teams/handler.go` | `middleware.RequireAuth` (+owner/admin guard on POST/DELETE) | Agent team CRUD, trigger a team run, aggregated multi-agent trace (workflow 18) |
+| `GET /api/v1/a2a/agents/{agent_id}/.well-known/agent.json` | `internal/api/a2a/handler.go` (`Register`) | `middleware.RequireAuth` | A2A agent card for one specialist agent (workflow 18) |
+| `POST /api/v1/a2a/agents/{agent_id}/tasks/send` | `internal/api/a2a/handler.go` (`RegisterTasksSend`) | none — bearer `internal/core/a2a.TaskTokenSigner` token instead (see workflow 18's own section) | Real A2A dispatch target: runs one specialist's delegated sub-run to completion (workflow 18) |
 
 (Workflow 15 is deliberately deferred — see that section's own scope note. Everything else in
-`WORKFLOW_PLAN_GO.md` — workflow 18 onward — is unbuilt. Add rows here as routers land.)
+`WORKFLOW_PLAN_GO.md` — workflow 19 onward — is unbuilt. Add rows here as routers land.)
 
 ### Dependency policy
 

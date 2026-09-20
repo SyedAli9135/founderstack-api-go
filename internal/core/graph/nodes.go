@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/founderstack/api/internal/core/a2a"
 	"github.com/founderstack/api/internal/core/integrations"
 	"github.com/founderstack/api/internal/core/llm"
 	coremcp "github.com/founderstack/api/internal/core/mcp"
@@ -35,6 +36,9 @@ type RunDeps struct {
 	// Notifier is nil-safe (writeApprovalGate checks before use) so tests
 	// building RunDeps by hand don't need to construct one.
 	Notifier *notify.Notifier
+	// A2AClient is nil for every ordinary (non-team) run — only
+	// delegateNode (team_nodes.go) ever reads it.
+	A2AClient *a2a.Client
 }
 
 // BuildNodes wires the graph's 5 nodes: planner, executor (the ReAct

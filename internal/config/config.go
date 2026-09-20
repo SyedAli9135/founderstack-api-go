@@ -102,6 +102,15 @@ type Config struct {
 	// opening the app — dedicated, not reused from OAuthStateSecret, to
 	// contain blast radius between the two signing use cases.
 	PushActionTokenSecret secret.Value `mapstructure:"PUSH_ACTION_TOKEN_SECRET"`
+
+	// A2ATaskTokenSecret signs the short-lived, run-scoped bearer token an
+	// orchestrator's delegate node attaches to its real HTTP POST
+	// .../a2a/agents/{agent_id}/tasks/send call — the machine-to-machine
+	// equivalent of PushActionTokenSecret above (dedicated, not reused,
+	// same blast-radius reasoning). Deliberately optional: the app boots
+	// and every non-team workflow run works with it unset; only
+	// POST /teams/{id}/run fails, with a clear error, until it's set.
+	A2ATaskTokenSecret secret.Value `mapstructure:"A2A_TASK_TOKEN_SECRET"`
 }
 
 // requiredFields lists the mapstructure keys that must resolve to a
@@ -188,6 +197,7 @@ func Load() (*Config, error) {
 		"WEBPUSH_VAPID_PRIVATE_KEY": "",
 		"WEBPUSH_VAPID_SUBJECT":     "",
 		"PUSH_ACTION_TOKEN_SECRET":  "",
+		"A2A_TASK_TOKEN_SECRET":     "",
 	}
 	for key, def := range defaults {
 		v.SetDefault(key, def)

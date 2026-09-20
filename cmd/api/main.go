@@ -23,6 +23,7 @@ import (
 	"github.com/pinecone-io/go-pinecone/v5/pinecone"
 	"github.com/redis/go-redis/v9"
 
+	a2aapi "github.com/founderstack/api/internal/api/a2a"
 	"github.com/founderstack/api/internal/api/agents"
 	"github.com/founderstack/api/internal/api/analytics"
 	approvalsapi "github.com/founderstack/api/internal/api/approvals"
@@ -35,10 +36,12 @@ import (
 	"github.com/founderstack/api/internal/api/org"
 	runsapi "github.com/founderstack/api/internal/api/runs"
 	"github.com/founderstack/api/internal/api/settings"
+	teamsapi "github.com/founderstack/api/internal/api/teams"
 	v1 "github.com/founderstack/api/internal/api/v1"
 	"github.com/founderstack/api/internal/api/webhooks"
 	workflowsapi "github.com/founderstack/api/internal/api/workflows"
 	"github.com/founderstack/api/internal/config"
+	corea2a "github.com/founderstack/api/internal/core/a2a"
 	coredocs "github.com/founderstack/api/internal/core/documents"
 	"github.com/founderstack/api/internal/core/graph"
 	"github.com/founderstack/api/internal/core/integrations"
@@ -153,6 +156,12 @@ func run() error {
 		launcher = graph.NewLauncher(graphEngine, dbPool, encryptionKey, mcpRegistry, mcpGateway, notifier)
 	}
 
+	// Wires the orchestrator's real, loopback-HTTP A2A dispatch client.
+	// A2ATaskTokenSecret unset just means every team run
+	// fails cleanly at dispatch time (a2a.Client.Dispatch's own check)
+	taskTokens := corea2a.NewTaskTokenSigner(cfg.A2ATaskTokenSecret)
+	launcher.SetA2AClient(corea2a.NewClient(cfg.AppBaseURL, taskTokens))
+
 	// Unlike newPineconeClient's nil-if-unconfigured fallback for the
 	// health check, Pinecone is required here — a document upload with no
 	// vector store to index into is broken, not degraded, so a missing
@@ -170,7 +179,7 @@ func run() error {
 	// to a prior process restart.
 	docsProcessor.RecoverStuckJobs(ctx, systemPool)
 
-	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, docsSearcher, mcpRegistry, graphEngine, launcher, actionTokens)
+	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, docsSearcher, mcpRegistry, graphEngine, launcher, actionTokens, taskTokens)
 
 	// All 3 background jobs run on systemPool (BYPASSRLS) — each scans
 	// across every org, which is inherently cross-tenant — and stop when
@@ -249,7 +258,7 @@ func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	return client, nil
 }
 
-func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, docsSearcher *coredocs.Searcher, mcpRegistry *coremcp.Registry, graphEngine *graph.Engine, launcher *graph.Launcher, actionTokens *notify.ActionTokenSigner) *gin.Engine {
+func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, docsSearcher *coredocs.Searcher, mcpRegistry *coremcp.Registry, graphEngine *graph.Engine, launcher *graph.Launcher, actionTokens *notify.ActionTokenSigner, taskTokens *corea2a.TaskTokenSigner) *gin.Engine {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -341,6 +350,19 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiAuditLogs := router.Group("/api/v1")
 	apiAuditLogs.Use(middleware.RequireAuth(systemDB, cfg))
 	auditlogs.NewHandler(db).Register(apiAuditLogs)
+
+	apiTeams := router.Group("/api/v1")
+	apiTeams.Use(middleware.RequireAuth(systemDB, cfg))
+	teamsapi.NewHandler(db, launcher).Register(apiTeams)
+
+	a2aHandler := a2aapi.NewHandler(db, launcher, taskTokens, cfg.AppBaseURL)
+
+	apiA2A := router.Group("/api/v1")
+	apiA2A.Use(middleware.RequireAuth(systemDB, cfg))
+	a2aHandler.Register(apiA2A)
+
+	apiA2ATasksSend := router.Group("/api/v1")
+	a2aHandler.RegisterTasksSend(apiA2ATasksSend)
 
 	return router
 }
