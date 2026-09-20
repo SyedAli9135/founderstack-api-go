@@ -54,11 +54,20 @@ SET output = $3, input_tokens = $4, output_tokens = $5, cached_tokens = $6,
 WHERE org_id = $1 AND id = $2;
 
 -- name: GetRunDetail :one
-SELECT id, workflow_id, status, current_node, triggered_by, output, input_tokens,
-       output_tokens, cached_tokens, cost_so_far_usd, tool_call_count, started_at,
-       completed_at, duration_ms, created_at
-FROM workflow_runs
-WHERE org_id = $1 AND id = $2;
+-- w.team_id (workflow 18) lets the frontend tell a team's orchestrator run
+-- apart from an ordinary single-agent run when someone lands on the plain
+-- GET /runs/{id} page directly (an old bookmark, a shared link, or the
+-- founder just browsing /runs — that list has no other way to distinguish
+-- them either, see ListRunsForOrg below) — the run page redirects to the
+-- correct /agents/teams/{team_id}/runs/{id} view instead of rendering a
+-- single-agent pipeline that doesn't know what a "delegate" node is.
+SELECT wr.id, wr.workflow_id, wr.status, wr.current_node, wr.triggered_by, wr.output,
+       wr.input_tokens, wr.output_tokens, wr.cached_tokens, wr.cost_so_far_usd,
+       wr.tool_call_count, wr.started_at, wr.completed_at, wr.duration_ms, wr.created_at,
+       w.team_id
+FROM workflow_runs wr
+JOIN workflows w ON w.id = wr.workflow_id
+WHERE wr.org_id = $1 AND wr.id = $2;
 
 -- name: GetRunAgentID :one
 -- Resolves a run's agent_id via its workflow — Launcher.Resume needs this
@@ -79,16 +88,38 @@ WHERE wr.org_id = $1 AND wr.id = $2;
 -- parent_run_id IS NULL excludes a team's specialist sub-runs from the
 -- flat run list — a founder browsing "my runs" sees the team run as one
 -- row; its specialists only surface via GET /teams/{id}/runs/{run_id}'s
--- aggregated trace (workflow 18).
-SELECT id, workflow_id, status, output, cost_so_far_usd, started_at, completed_at,
-       duration_ms, created_at
-FROM workflow_runs
-WHERE org_id = $1
-  AND parent_run_id IS NULL
-  AND (sqlc.narg(status)::varchar IS NULL OR status = sqlc.narg(status))
-  AND (sqlc.narg(workflow_id)::uuid IS NULL OR workflow_id = sqlc.narg(workflow_id))
-ORDER BY created_at DESC
+-- aggregated trace (workflow 18). w.team_id (also workflow 18) is what
+-- lets that one row actually be *labeled* as a team run and link
+-- correctly — before this, a team run looked identical to any other row
+-- here, and clicking it opened the wrong page entirely (a real, reported
+-- confusion, not a hypothetical).
+SELECT wr.id, wr.workflow_id, wr.status, wr.output, wr.cost_so_far_usd, wr.started_at,
+       wr.completed_at, wr.duration_ms, wr.created_at, w.team_id
+FROM workflow_runs wr
+JOIN workflows w ON w.id = wr.workflow_id
+WHERE wr.org_id = $1
+  AND wr.parent_run_id IS NULL
+  AND (sqlc.narg(status)::varchar IS NULL OR wr.status = sqlc.narg(status))
+  AND (sqlc.narg(workflow_id)::uuid IS NULL OR wr.workflow_id = sqlc.narg(workflow_id))
+ORDER BY wr.created_at DESC
 LIMIT $2 OFFSET $3;
+
+-- name: ListTeamRuns :many
+-- One team's own run history — the "Recent runs" list workflow 18's team
+-- detail page needs (there was no way to get back to a past run's page
+-- before this; the only route in was the URL Launch's own response
+-- handed back right after triggering it, gone the moment you navigated
+-- away). team_id resolves through the team's one shared `workflows` row
+-- (see InsertTeamWorkflow) rather than a direct column on workflow_runs —
+-- consistent with how every other team-scoped run query in this file
+-- reaches team_id.
+SELECT wr.id, wr.status, wr.output, wr.cost_so_far_usd, wr.started_at, wr.completed_at,
+       wr.duration_ms, wr.created_at
+FROM workflow_runs wr
+JOIN workflows w ON w.id = wr.workflow_id
+WHERE wr.org_id = $1 AND w.team_id = $2 AND wr.parent_run_id IS NULL
+ORDER BY wr.created_at DESC
+LIMIT $3 OFFSET $4;
 
 -- name: InsertTeamWorkflowRun :one
 -- Workflow 18's variant of InsertWorkflowRun — used for both the

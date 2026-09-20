@@ -59,6 +59,11 @@ type runSummary struct {
 	CompletedAt  *string `json:"completed_at,omitempty"`
 	DurationMs   *int32  `json:"duration_ms,omitempty"`
 	CreatedAt    string  `json:"created_at"`
+	// TeamID (workflow 18) is set only for a team's own orchestrator run —
+	// lets the frontend badge/link it correctly instead of rendering it
+	// like any other single-agent row (see ListRunsForOrg's own doc
+	// comment for why that distinction matters here specifically).
+	TeamID *string `json:"team_id,omitempty"`
 }
 
 func (h *Handler) List(c *gin.Context) {
@@ -114,7 +119,7 @@ func (h *Handler) List(c *gin.Context) {
 			ID: r.ID.String(), WorkflowID: r.WorkflowID.String(), Status: r.Status,
 			Output: r.Output, CostSoFarUSD: r.CostSoFarUsd, DurationMs: r.DurationMs,
 			StartedAt: formatTimestamptz(r.StartedAt), CompletedAt: formatTimestamptz(r.CompletedAt),
-			CreatedAt: r.CreatedAt.Time.Format(rfc3339),
+			CreatedAt: r.CreatedAt.Time.Format(rfc3339), TeamID: nilableUUIDString(r.TeamID),
 		}
 	}
 	response.OK(c, http.StatusOK, "Runs listed", gin.H{"runs": out})
@@ -164,18 +169,14 @@ func (h *Handler) Get(c *gin.Context) {
 		return
 	}
 
-	var triggeredBy *string
-	if row.TriggeredBy.Valid {
-		s := row.TriggeredBy.String()
-		triggeredBy = &s
-	}
+	triggeredBy := nilableUUIDString(row.TriggeredBy)
 
 	response.OK(c, http.StatusOK, "Run fetched", runDetail{
 		runSummary: runSummary{
 			ID: row.ID.String(), WorkflowID: row.WorkflowID.String(), Status: row.Status,
 			Output: row.Output, CostSoFarUSD: row.CostSoFarUsd, DurationMs: row.DurationMs,
 			StartedAt: formatTimestamptz(row.StartedAt), CompletedAt: formatTimestamptz(row.CompletedAt),
-			CreatedAt: row.CreatedAt.Time.Format(rfc3339),
+			CreatedAt: row.CreatedAt.Time.Format(rfc3339), TeamID: nilableUUIDString(row.TeamID),
 		},
 		CurrentNode: row.CurrentNode,
 		TriggeredBy: triggeredBy, InputTokens: row.InputTokens, OutputTokens: row.OutputTokens,
@@ -385,5 +386,13 @@ func formatTimestamptz(t pgtype.Timestamptz) *string {
 		return nil
 	}
 	s := t.Time.Format(rfc3339)
+	return &s
+}
+
+func nilableUUIDString(id pgtype.UUID) *string {
+	if !id.Valid {
+		return nil
+	}
+	s := id.String()
 	return &s
 }

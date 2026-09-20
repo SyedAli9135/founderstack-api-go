@@ -44,6 +44,7 @@ func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/teams/:id", h.Get)
 	rg.DELETE("/teams/:id", h.Delete)
 	rg.POST("/teams/:id/run", h.Run)
+	rg.GET("/teams/:id/runs", h.ListRuns)
 	rg.GET("/teams/:id/runs/:run_id", h.Trace)
 }
 
@@ -450,6 +451,62 @@ type teamRunTrace struct {
 	DurationMs   *int32     `json:"duration_ms,omitempty"`
 	CreatedAt    string     `json:"created_at"`
 	Specialists  []childRun `json:"specialists"`
+}
+
+type teamRunSummary struct {
+	ID           string  `json:"id"`
+	Status       string  `json:"status"`
+	Output       *string `json:"output,omitempty"`
+	CostSoFarUSD float64 `json:"cost_so_far_usd"`
+	StartedAt    *string `json:"started_at,omitempty"`
+	CompletedAt  *string `json:"completed_at,omitempty"`
+	DurationMs   *int32  `json:"duration_ms,omitempty"`
+	CreatedAt    string  `json:"created_at"`
+}
+
+const defaultRunsLimit = 20
+
+// ListRuns is GET /teams/{id}/runs — one team's own run history. Added
+// after a real, reported gap: once a founder navigated away from a run
+// they'd just triggered, there was no way back to it short of still
+// having that exact URL — GET /teams/{id} itself never returned anything
+// about past runs. Each row here links to GET /teams/{id}/runs/{run_id}
+// for the full aggregated trace; this endpoint only returns the summary
+// fields the same list-page card layout every other resource in this app
+// already uses (see internal/api/runs.Handler.List's runSummary).
+func (h *Handler) ListRuns(c *gin.Context) {
+	user, ok := authctx.FromContext(c)
+	if !ok {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
+		return
+	}
+	id, ok := parseTeamID(c)
+	if !ok {
+		return
+	}
+
+	var rows []dbgen.ListTeamRunsRow
+	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		var err error
+		rows, err = q.ListTeamRuns(ctx, dbgen.ListTeamRunsParams{
+			OrgID: user.OrgID, TeamID: id, Limit: defaultRunsLimit, Offset: 0,
+		})
+		return err
+	})
+	if err != nil {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not list team runs")
+		return
+	}
+
+	out := make([]teamRunSummary, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, teamRunSummary{
+			ID: r.ID.String(), Status: r.Status, Output: r.Output, CostSoFarUSD: r.CostSoFarUsd,
+			StartedAt: formatTimestamptz(r.StartedAt), CompletedAt: formatTimestamptz(r.CompletedAt),
+			DurationMs: r.DurationMs, CreatedAt: r.CreatedAt.Time.Format(rfc3339),
+		})
+	}
+	response.OK(c, http.StatusOK, "Team runs listed", out)
 }
 
 // Trace is GET /teams/{id}/runs/{run_id} — the orchestrator's own run

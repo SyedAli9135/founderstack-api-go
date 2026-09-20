@@ -160,6 +160,13 @@ type Querier interface {
 	GetRunAgentID(ctx context.Context, arg GetRunAgentIDParams) (pgtype.UUID, error)
 	GetRunCheckpoint(ctx context.Context, arg GetRunCheckpointParams) (GetRunCheckpointRow, error)
 	GetRunCostBreakdown(ctx context.Context, arg GetRunCostBreakdownParams) ([]GetRunCostBreakdownRow, error)
+	// w.team_id (workflow 18) lets the frontend tell a team's orchestrator run
+	// apart from an ordinary single-agent run when someone lands on the plain
+	// GET /runs/{id} page directly (an old bookmark, a shared link, or the
+	// founder just browsing /runs — that list has no other way to distinguish
+	// them either, see ListRunsForOrg below) — the run page redirects to the
+	// correct /agents/teams/{team_id}/runs/{id} view instead of rendering a
+	// single-agent pipeline that doesn't know what a "delegate" node is.
 	GetRunDetail(ctx context.Context, arg GetRunDetailParams) (GetRunDetailRow, error)
 	// Read back the definitive status Engine's own checkpoint() already
 	// wrote (completed/failed/cancelled/awaiting_approval) — Launcher can't
@@ -355,7 +362,11 @@ type Querier interface {
 	// parent_run_id IS NULL excludes a team's specialist sub-runs from the
 	// flat run list — a founder browsing "my runs" sees the team run as one
 	// row; its specialists only surface via GET /teams/{id}/runs/{run_id}'s
-	// aggregated trace (workflow 18).
+	// aggregated trace (workflow 18). w.team_id (also workflow 18) is what
+	// lets that one row actually be *labeled* as a team run and link
+	// correctly — before this, a team run looked identical to any other row
+	// here, and clicking it opened the wrong page entirely (a real, reported
+	// confusion, not a hypothetical).
 	ListRunsForOrg(ctx context.Context, arg ListRunsForOrgParams) ([]ListRunsForOrgRow, error)
 	// Workflow 12 (RAG search). ListSearchableDocumentIDs is the ACL + category
 	// filter, resolved *before* any embedding/Pinecone call so a query that
@@ -370,6 +381,15 @@ type Querier interface {
 	// exists to cover. olderThan guards against re-kicking a job that's
 	// still genuinely in flight in *this* process, not actually stuck.
 	ListStuckDocuments(ctx context.Context, updatedAt pgtype.Timestamptz) ([]ListStuckDocumentsRow, error)
+	// One team's own run history — the "Recent runs" list workflow 18's team
+	// detail page needs (there was no way to get back to a past run's page
+	// before this; the only route in was the URL Launch's own response
+	// handed back right after triggering it, gone the moment you navigated
+	// away). team_id resolves through the team's one shared `workflows` row
+	// (see InsertTeamWorkflow) rather than a direct column on workflow_runs —
+	// consistent with how every other team-scoped run query in this file
+	// reaches team_id.
+	ListTeamRuns(ctx context.Context, arg ListTeamRunsParams) ([]ListTeamRunsRow, error)
 	// Joins workflow_runs for org-scoping (workflow_steps itself has no
 	// org_id column) -- same shape as GetRunAgentID's join above.
 	ListWorkflowSteps(ctx context.Context, arg ListWorkflowStepsParams) ([]ListWorkflowStepsRow, error)

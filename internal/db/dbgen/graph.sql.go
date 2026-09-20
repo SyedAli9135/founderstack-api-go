@@ -240,11 +240,13 @@ func (q *Queries) GetRunCostBreakdown(ctx context.Context, arg GetRunCostBreakdo
 }
 
 const getRunDetail = `-- name: GetRunDetail :one
-SELECT id, workflow_id, status, current_node, triggered_by, output, input_tokens,
-       output_tokens, cached_tokens, cost_so_far_usd, tool_call_count, started_at,
-       completed_at, duration_ms, created_at
-FROM workflow_runs
-WHERE org_id = $1 AND id = $2
+SELECT wr.id, wr.workflow_id, wr.status, wr.current_node, wr.triggered_by, wr.output,
+       wr.input_tokens, wr.output_tokens, wr.cached_tokens, wr.cost_so_far_usd,
+       wr.tool_call_count, wr.started_at, wr.completed_at, wr.duration_ms, wr.created_at,
+       w.team_id
+FROM workflow_runs wr
+JOIN workflows w ON w.id = wr.workflow_id
+WHERE wr.org_id = $1 AND wr.id = $2
 `
 
 type GetRunDetailParams struct {
@@ -268,8 +270,16 @@ type GetRunDetailRow struct {
 	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
 	DurationMs    *int32             `json:"duration_ms"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	TeamID        pgtype.UUID        `json:"team_id"`
 }
 
+// w.team_id (workflow 18) lets the frontend tell a team's orchestrator run
+// apart from an ordinary single-agent run when someone lands on the plain
+// GET /runs/{id} page directly (an old bookmark, a shared link, or the
+// founder just browsing /runs — that list has no other way to distinguish
+// them either, see ListRunsForOrg below) — the run page redirects to the
+// correct /agents/teams/{team_id}/runs/{id} view instead of rendering a
+// single-agent pipeline that doesn't know what a "delegate" node is.
 func (q *Queries) GetRunDetail(ctx context.Context, arg GetRunDetailParams) (GetRunDetailRow, error) {
 	row := q.db.QueryRow(ctx, getRunDetail, arg.OrgID, arg.ID)
 	var i GetRunDetailRow
@@ -289,6 +299,7 @@ func (q *Queries) GetRunDetail(ctx context.Context, arg GetRunDetailParams) (Get
 		&i.CompletedAt,
 		&i.DurationMs,
 		&i.CreatedAt,
+		&i.TeamID,
 	)
 	return i, err
 }
@@ -519,14 +530,15 @@ func (q *Queries) ListChildRuns(ctx context.Context, arg ListChildRunsParams) ([
 }
 
 const listRunsForOrg = `-- name: ListRunsForOrg :many
-SELECT id, workflow_id, status, output, cost_so_far_usd, started_at, completed_at,
-       duration_ms, created_at
-FROM workflow_runs
-WHERE org_id = $1
-  AND parent_run_id IS NULL
-  AND ($4::varchar IS NULL OR status = $4)
-  AND ($5::uuid IS NULL OR workflow_id = $5)
-ORDER BY created_at DESC
+SELECT wr.id, wr.workflow_id, wr.status, wr.output, wr.cost_so_far_usd, wr.started_at,
+       wr.completed_at, wr.duration_ms, wr.created_at, w.team_id
+FROM workflow_runs wr
+JOIN workflows w ON w.id = wr.workflow_id
+WHERE wr.org_id = $1
+  AND wr.parent_run_id IS NULL
+  AND ($4::varchar IS NULL OR wr.status = $4)
+  AND ($5::uuid IS NULL OR wr.workflow_id = $5)
+ORDER BY wr.created_at DESC
 LIMIT $2 OFFSET $3
 `
 
@@ -548,12 +560,17 @@ type ListRunsForOrgRow struct {
 	CompletedAt  pgtype.Timestamptz `json:"completed_at"`
 	DurationMs   *int32             `json:"duration_ms"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	TeamID       pgtype.UUID        `json:"team_id"`
 }
 
 // parent_run_id IS NULL excludes a team's specialist sub-runs from the
 // flat run list — a founder browsing "my runs" sees the team run as one
 // row; its specialists only surface via GET /teams/{id}/runs/{run_id}'s
-// aggregated trace (workflow 18).
+// aggregated trace (workflow 18). w.team_id (also workflow 18) is what
+// lets that one row actually be *labeled* as a team run and link
+// correctly — before this, a team run looked identical to any other row
+// here, and clicking it opened the wrong page entirely (a real, reported
+// confusion, not a hypothetical).
 func (q *Queries) ListRunsForOrg(ctx context.Context, arg ListRunsForOrgParams) ([]ListRunsForOrgRow, error) {
 	rows, err := q.db.Query(ctx, listRunsForOrg,
 		arg.OrgID,
@@ -572,6 +589,77 @@ func (q *Queries) ListRunsForOrg(ctx context.Context, arg ListRunsForOrgParams) 
 		if err := rows.Scan(
 			&i.ID,
 			&i.WorkflowID,
+			&i.Status,
+			&i.Output,
+			&i.CostSoFarUsd,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.DurationMs,
+			&i.CreatedAt,
+			&i.TeamID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTeamRuns = `-- name: ListTeamRuns :many
+SELECT wr.id, wr.status, wr.output, wr.cost_so_far_usd, wr.started_at, wr.completed_at,
+       wr.duration_ms, wr.created_at
+FROM workflow_runs wr
+JOIN workflows w ON w.id = wr.workflow_id
+WHERE wr.org_id = $1 AND w.team_id = $2 AND wr.parent_run_id IS NULL
+ORDER BY wr.created_at DESC
+LIMIT $3 OFFSET $4
+`
+
+type ListTeamRunsParams struct {
+	OrgID  pgtype.UUID `json:"org_id"`
+	TeamID pgtype.UUID `json:"team_id"`
+	Limit  int32       `json:"limit"`
+	Offset int32       `json:"offset"`
+}
+
+type ListTeamRunsRow struct {
+	ID           pgtype.UUID        `json:"id"`
+	Status       string             `json:"status"`
+	Output       *string            `json:"output"`
+	CostSoFarUsd float64            `json:"cost_so_far_usd"`
+	StartedAt    pgtype.Timestamptz `json:"started_at"`
+	CompletedAt  pgtype.Timestamptz `json:"completed_at"`
+	DurationMs   *int32             `json:"duration_ms"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+// One team's own run history — the "Recent runs" list workflow 18's team
+// detail page needs (there was no way to get back to a past run's page
+// before this; the only route in was the URL Launch's own response
+// handed back right after triggering it, gone the moment you navigated
+// away). team_id resolves through the team's one shared `workflows` row
+// (see InsertTeamWorkflow) rather than a direct column on workflow_runs —
+// consistent with how every other team-scoped run query in this file
+// reaches team_id.
+func (q *Queries) ListTeamRuns(ctx context.Context, arg ListTeamRunsParams) ([]ListTeamRunsRow, error) {
+	rows, err := q.db.Query(ctx, listTeamRuns,
+		arg.OrgID,
+		arg.TeamID,
+		arg.Limit,
+		arg.Offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTeamRunsRow
+	for rows.Next() {
+		var i ListTeamRunsRow
+		if err := rows.Scan(
+			&i.ID,
 			&i.Status,
 			&i.Output,
 			&i.CostSoFarUsd,

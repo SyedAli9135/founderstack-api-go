@@ -23,6 +23,7 @@ import (
 
 	a2aapi "github.com/founderstack/api/internal/api/a2a"
 	"github.com/founderstack/api/internal/api/middleware"
+	runsapi "github.com/founderstack/api/internal/api/runs"
 	"github.com/founderstack/api/internal/config"
 	corea2a "github.com/founderstack/api/internal/core/a2a"
 	"github.com/founderstack/api/internal/core/graph"
@@ -185,6 +186,7 @@ func buildTeamTestServer(t *testing.T, appPool, systemPool *pgxpool.Pool, cfg *c
 	authed := r.Group("/api/v1")
 	authed.Use(middleware.RequireAuth(systemPool, cfg))
 	NewHandler(appPool, launcher).Register(authed)
+	runsapi.NewHandler(appPool, engine).Register(authed)
 
 	taskTokens := corea2a.NewTaskTokenSigner(cfg.A2ATaskTokenSecret)
 	a2aHandler := a2aapi.NewHandler(appPool, launcher, taskTokens, "")
@@ -498,6 +500,59 @@ func TestTeamsHandler_RunEndToEnd(t *testing.T) {
 	}
 	if childHoursSaved.Valid {
 		t.Fatalf("specialist hours_saved = %v, want NULL (not double-counted)", childHoursSaved.Float64)
+	}
+
+	// GET /teams/{id}/runs — the "Recent runs" list a founder needs to get
+	// back to a past run after navigating away, added specifically because
+	// there was previously no way to do that at all (see ListRuns's own
+	// doc comment). Only the parent (orchestrator) run should appear here,
+	// same parent_run_id IS NULL scoping the flat GET /runs list uses.
+	w = httptest.NewRecorder()
+	server.Config.Handler.ServeHTTP(w, authedRequest(t, cfg, fx.userClerkID, http.MethodGet, "/api/v1/teams/"+team.ID+"/runs", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("ListRuns status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var teamRuns []teamRunSummary
+	mustUnmarshalData(t, w.Body.Bytes(), &teamRuns)
+	if len(teamRuns) != 1 {
+		t.Fatalf("ListRuns returned %d runs, want 1 (specialists must not appear here)", len(teamRuns))
+	}
+	if teamRuns[0].ID != queued.RunID || teamRuns[0].Status != "completed" {
+		t.Fatalf("ListRuns[0] = %+v, want id=%s status=completed", teamRuns[0], queued.RunID)
+	}
+
+	// GET /runs (the flat, org-wide list) must also carry team_id for this
+	// same run, so the frontend can badge/link it correctly instead of
+	// rendering it like an ordinary single-agent row — the second half of
+	// the same reported confusion ListRuns above fixes the first half of.
+	w = httptest.NewRecorder()
+	server.Config.Handler.ServeHTTP(w, authedRequest(t, cfg, fx.userClerkID, http.MethodGet, "/api/v1/runs", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /runs status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var runsEnv struct {
+		Data struct {
+			Runs []struct {
+				ID     string  `json:"id"`
+				TeamID *string `json:"team_id"`
+			} `json:"runs"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &runsEnv); err != nil {
+		t.Fatalf("unmarshal GET /runs response: %v (body=%s)", err, w.Body.String())
+	}
+	found := false
+	for _, r := range runsEnv.Data.Runs {
+		if r.ID != queued.RunID {
+			continue
+		}
+		found = true
+		if r.TeamID == nil || *r.TeamID != team.ID {
+			t.Fatalf("GET /runs team_id for the orchestrator's own run = %v, want %s", r.TeamID, team.ID)
+		}
+	}
+	if !found {
+		t.Fatalf("GET /runs did not include the team's orchestrator run %s", queued.RunID)
 	}
 }
 

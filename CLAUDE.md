@@ -1749,6 +1749,20 @@ named "Teams Test Org"/"A2A Test Org" to accumulate, and clean them up by hand (
 `agents`/`api_key_registry`/`users` for those org ids first, `organizations` last) rather than
 assuming `t.Cleanup` handled it.
 
+**Real, founder-reported UX gap fixed 2026-09-20, after the workflow was otherwise "done"**:
+there was no way to get back to a past team run once you navigated away from it — `GET
+/teams/{id}` never returned anything about run history, and the flat `GET /runs` list gave no
+indication a row was a team run at all, let alone linked it correctly (clicking it opened
+`/runs/{id}`'s single-agent pipeline, which has no idea what a "delegate" node or a specialist
+breakdown is). Fixed with 3 changes: (1) new `GET /api/v1/teams/{id}/runs` (`ListTeamRuns` query,
+`teams.Handler.ListRuns`) — a team's own run history, joined through its one shared `workflows`
+row same as every other team-scoped query in this file. (2) `ListRunsForOrg` and `GetRunDetail`
+both now also return `workflows.team_id`, so the plain `GET /runs` response can tell a team run
+apart from an ordinary one. (3) Frontend: a "Recent runs" list on the team detail page, a "Team"
+badge + correct link target on `/runs`, and a redirect on `/runs/{id}` itself (the defensive
+fallback for anyone who still lands there directly — an old bookmark, a shared link) to the real
+multi-agent page. `TestTeamsHandler_RunEndToEnd` gained assertions for both new/changed endpoints.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
