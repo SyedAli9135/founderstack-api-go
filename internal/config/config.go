@@ -111,6 +111,15 @@ type Config struct {
 	// and every non-team workflow run works with it unset; only
 	// POST /teams/{id}/run fails, with a clear error, until it's set.
 	A2ATaskTokenSecret secret.Value `mapstructure:"A2A_TASK_TOKEN_SECRET"`
+
+	// DigestUnsubscribeSecret signs the one-click unsubscribe link in a
+	// workflow 20 daily digest email's footer -- dedicated, not reused,
+	// same blast-radius reasoning as PushActionTokenSecret/
+	// A2ATaskTokenSecret above. Deliberately optional: the app boots and
+	// the digest scheduler still sends fine with it unset, just with
+	// every digest email's unsubscribe link degrading to empty (see
+	// notify.DigestTokenSigner.Sign's own empty-secret guard).
+	DigestUnsubscribeSecret secret.Value `mapstructure:"DIGEST_UNSUBSCRIBE_SECRET"`
 }
 
 // requiredFields lists the mapstructure keys that must resolve to a

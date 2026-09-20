@@ -110,7 +110,7 @@ func testRouter(t *testing.T, systemPool, appPool *pgxpool.Pool, cfg *config.Con
 	r.Use(middleware.RequestID())
 	rg := r.Group("/api/v1/settings")
 	rg.Use(middleware.RequireAuth(systemPool, cfg))
-	NewHandler(appPool, encryptionKey, cfg.APIKeyMockPrefix).Register(rg)
+	NewHandler(appPool, encryptionKey, cfg.APIKeyMockPrefix, nil, nil, "").Register(rg)
 	return r
 }
 

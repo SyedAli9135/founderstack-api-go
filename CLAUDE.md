@@ -23,19 +23,21 @@ Anthropic, OpenAI, Google Gemini, Qwen, and DeepSeek (generalized 2026-08-21 fro
 Anthropic-only original). See "BYOK API Keys" below.
 
 **Workflows 1 (bootstrap) through 14 (token usage & analytics), plus workflows 16 (disconnect/
-reconnect integration), 17 (view audit logs), 18 (multi-agent team run / A2A), and 19 (agent
-templates marketplace), are implemented — workflows 18/19's own frontends (team pages, the
-templates gallery) live in `../founderstack-web`, its own repo, per this codebase's usual
-backend/frontend split; see that repo's `AGENTS.md` for its own detail.
+reconnect integration), 17 (view audit logs), 18 (multi-agent team run / A2A), 19 (agent
+templates marketplace), and 20 (daily email digest), are implemented — workflows 18/19/20's own
+frontends (team pages, the templates gallery, the digest settings card) live in
+`../founderstack-web`, its own repo, per this codebase's usual backend/frontend split; see that
+repo's `AGENTS.md` for its own detail.
 Workflow 15 (Manage Billing & Subscription) is deliberately skipped for now** — it needs a real
 (or test-mode) Stripe account for FounderStack's own platform billing plus real pricing/trial
 decisions, neither of which exists yet; unlike every other workflow so far, this isn't something
 to build against fabricated inputs. Workflow 14
 (usage & analytics), workflow 16 (integration reconnection), workflow 17 (audit logs) — all
-2026-09-07 — and workflows 18/19 (2026-09-20) are the most recent — see "View Token Usage &
+2026-09-07 — and workflows 18/19/20 (2026-09-20) are the most recent — see "View Token Usage &
 Analytics (workflow 14)", "Disconnect / Reconnect Integration (workflow 16)", "View Audit Logs
-(workflow 17)", "Multi-Agent Team Run / A2A (workflow 18)", and "Agent Templates Marketplace
-(workflow 19)" below. Don't assume routes, tables, or packages from workflow 15 or 20+ in
+(workflow 17)", "Multi-Agent Team Run / A2A (workflow 18)", "Agent Templates Marketplace
+(workflow 19)", and "Daily Email Digest (workflow 20)" below. Don't assume routes, tables, or
+packages from workflow 21+ in
 `WORKFLOW_PLAN_GO.md` exist — check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
@@ -1829,6 +1831,90 @@ catalog count/shape, the `?category=` filter, a template's full detail (system p
 disambiguation path (and that it's the exact bug above, caught live by this test before it ever
 shipped), and the owner/admin permission gate.
 
+### Daily Email Digest (workflow 20) — `internal/core/digest`, `internal/api/settings/digest.go`
+
+Built 2026-09-20. A morning email per org (runs completed, hours saved, cost, pending approvals)
+sent to `role IN ('owner', 'admin')` members, on a per-org configurable schedule
+(`digest_enabled`/`digest_send_hour`/`digest_timezone`, migration `000017`), with a no-login
+unsubscribe link.
+
+**Reuses the Brevo `notify.EmailSender` built for workflow 10's approval-gate notifications —
+no new email provider, no new credential.** `EmailSender.Send`'s signature grew a 4th
+`htmlBody string` param (empty string for every existing plain-text caller); `brevoSender` now
+sets Brevo's optional `htmlContent` field alongside `textContent` when it's non-empty.
+
+**`internal/core/digest` is a new package, separate from `internal/core/notify`**, mirroring the
+existing `internal/core/workflows` (scheduling) vs `internal/core/notify` (channels) split:
+`notify` stays a low-level "how do I send one email/push/Slack message" package with no DB
+queries of its own beyond what a caller hands it; `digest` owns the actual orchestration —
+`BuildPayload` (queries + aggregation), `RenderEmail` (the `go:embed`bed
+`templates/digest_email.html`, via stdlib `html/template`, plus a parallel plain-text render),
+and `RunScheduler` (the background job).
+
+**"Yesterday" is the previous calendar day in the org's own `digest_timezone`, computed via SQL
+`AT TIME ZONE`, not a naive UTC-minus-24h window** — the load-bearing correctness property of the
+whole feature, since a founder in `America/New_York` who set an 8am local send time would
+otherwise get numbers that don't match "yesterday" from their own point of view. `GetDigestRunStats`/
+`GetDigestCostUSD`/`GetDigestTopAgent` (`internal/db/queries/digest.sql`) all take `org_id` +
+`timezone` and compare `(created_at AT TIME ZONE $tz)::date = (now() AT TIME ZONE $tz)::date - 1`.
+`TestBuildPayload_AggregatesYesterdayInOrgTimezone` seeds a run at 11pm `America/New_York` —
+3-4am UTC the *next* calendar day — specifically to prove a naive UTC-day query would have
+missed it.
+
+**Run counts exclude workflow 18 specialist sub-runs (`parent_run_id IS NOT NULL`)**, same
+reasoning as `FinalizeRunHoursSaved`: only an orchestrator's own top-level run represents one
+end-to-end task a founder would otherwise have done by hand — counting every specialist
+dispatch too would inflate "runs completed" by however many team members a run happened to have.
+
+**The scheduler (`digest.RunScheduler`) fires aligned to the top of every hour**, not a plain
+`time.NewTicker(time.Hour)` — an initial one-off `time.Timer` computes `time.Until` the next
+`t.Truncate(time.Hour).Add(time.Hour)`, then re-arms itself the same way after every fire, so it
+doesn't drift to whatever minute the process happened to boot at. `ListOrgsDueForDigest`
+(system pool, `BYPASSRLS`, cross-tenant by nature — same as `workflows.RunScheduler`/
+`RunApprovalExpiryJob`) encodes all 3 due-conditions in one query: local-hour match, not already
+sent today (`digest_last_sent_at`, compared in the org's own timezone — the double-send guard
+against a mid-hour process restart re-firing something that already went out), and real activity
+in the last 7 days (skips ghost emails to churned/empty orgs, per spec).
+
+**Unsubscribe uses a dedicated `notify.DigestTokenSigner`** (org-scoped HMAC token, deliberately
+**no expiry** — unlike `ActionTokenSigner`'s approval-scoped tokens, an unsubscribe link has no
+natural TTL and should keep working for as long as digest emails could ever arrive), signed by
+its own `DIGEST_UNSUBSCRIBE_SECRET` — same dedicated-secret-per-purpose blast-radius reasoning as
+`PUSH_ACTION_TOKEN_SECRET`/`A2A_TASK_TOKEN_SECRET`. `DisableDigestForOrg` can only ever turn the
+digest *off*, never on — a leaked/replayed unsubscribe token can't be used to re-enable something
+a founder disabled some other way. `GET /settings/digest/unsubscribe` is registered on a second,
+ungated router group at the same `/api/v1/settings` prefix as the authenticated group
+(`Handler.RegisterPublic`, mirroring `approvalsapi.Handler.RegisterActions`'s existing
+ungated-group-plus-handler-does-its-own-auth pattern) — `Handler.Unsubscribe` does its own
+token verification instead of `middleware.RequireAuth`.
+
+**`PUT /settings/digest`, not the plan's literal `PATCH`** — matches this codebase's own already-
+established convention for a full-replace org settings endpoint (`PUT /settings/approvals`
+already does the same); validates `digest_timezone` via `time.LoadLocation` before ever writing
+it, so an unrecognized zone string fails the request at save time rather than at the SQL side's
+`AT TIME ZONE` on the next actual send.
+
+**`POST /settings/digest/test` sends to the caller's own email only**, not every org admin —
+matches the plan's "delivers... to your own email" framing and means testing never spams
+teammates; builds a real payload from real (usually empty, in dev) data, so `HadActivity=false`'s
+"No runs yesterday" branch is exactly what a fresh org actually sees on its first test send.
+
+**Testing**: `internal/core/notify/digesttoken_test.go` (plain unit tests, no DB, mirroring
+`actiontoken_test.go`'s exact shape — round-trip, unset-secret-rejects-everything, tampered
+signature, malformed token, wrong-org isolation). `internal/core/digest/digest_integration_test.go`
+covers `BuildPayload`'s timezone-boundary/sub-run-exclusion correctness and
+`ListOrgsDueForDigest`'s 3 due-conditions directly against Postgres.
+`internal/api/settings/digest_integration_test.go` covers the full HTTP surface — settings
+GET/PUT round-trip, timezone/hour validation, test-send (asserted via a `fakeEmailSender` test
+double, the first `EmailSender` fake this codebase has needed — every other integration test
+left `BREVO_API_KEY` unset and got `notify.noopSender`'s logged no-op instead), and unsubscribe
+(success, garbage token, wrong-secret token). Live-verified against the real dev org, both sides:
+`POST /settings/digest/test` correctly built and logged (via the dev-mode `noopSender`, no real
+`BREVO_API_KEY` configured in this environment) `"Your FounderStack digest for Saturday, Sep 19"`
+addressed to the real signed-in admin's own email; the frontend toggle/hour-select/timezone-
+select/test-send/reload-persistence were all clicked through in a real browser (see
+`founderstack-web/AGENTS.md`'s own workflow 20 section).
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -2089,6 +2175,8 @@ machine — CI runs the authoritative version of the same check regardless.
 | `POST /api/v1/a2a/agents/{agent_id}/tasks/send` | `internal/api/a2a/handler.go` (`RegisterTasksSend`) | none — bearer `internal/core/a2a.TaskTokenSigner` token instead (see workflow 18's own section) | Real A2A dispatch target: runs one specialist's delegated sub-run to completion (workflow 18) |
 | `GET /api/v1/templates`, `GET /templates/{id}` | `internal/api/templates/handler.go` | `middleware.RequireAuth` | Browse the global agent-template gallery (workflow 19) |
 | `POST /api/v1/templates/{id}/install` | `internal/api/templates/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | Install a template as a new, fully-editable agent for this org (workflow 19) |
+| `GET/PUT /api/v1/settings/digest`, `POST /settings/digest/test` | `internal/api/settings/digest.go` | `middleware.RequireAuth` | Daily digest preferences + immediate test send (workflow 20) |
+| `GET /api/v1/settings/digest/unsubscribe` | `internal/api/settings/digest.go` (`RegisterPublic`) | none — `notify.DigestTokenSigner` query-string token instead | No-login one-click unsubscribe link target (workflow 20) |
 
 (Workflow 15 is deliberately deferred — see that section's own scope note. Everything else in
 `WORKFLOW_PLAN_GO.md` — workflow 20 onward — is unbuilt. Add rows here as routers land.)
@@ -2176,7 +2264,9 @@ Workflow 10's 6 vars (`BREVO_API_KEY`, `BREVO_FROM_EMAIL`, `WEBPUSH_VAPID_PUBLIC
 `WEBPUSH_VAPID_PRIVATE_KEY`, `WEBPUSH_VAPID_SUBJECT`, `PUSH_ACTION_TOKEN_SECRET`) are **not** in
 that required list either, same reasoning — the app boots and every approval still works with
 any/all of them blank, just with that one notification channel degrading to a logged no-op (see
-"Human Approval Gate (workflow 10)" above).
+"Human Approval Gate (workflow 10)" above). `DIGEST_UNSUBSCRIBE_SECRET` (workflow 20) is the same
+shape again: unset just means every digest email's unsubscribe link is dead until it's set, the
+digest itself still sends fine (reusing the same `BREVO_API_KEY`/`BREVO_FROM_EMAIL` as workflow 10).
 
 `DEV_TOKEN_SECRET` is deliberately **not** in that required list — it's local-testing-only
 (see "Authentication" above) and should stay unset everywhere real, including production.

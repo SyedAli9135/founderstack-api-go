@@ -16,6 +16,7 @@ import (
 	"github.com/founderstack/api/internal/api/authctx"
 	"github.com/founderstack/api/internal/api/response"
 	"github.com/founderstack/api/internal/core/llm"
+	"github.com/founderstack/api/internal/core/notify"
 	"github.com/founderstack/api/internal/db/dbgen"
 	"github.com/founderstack/api/internal/db/tenant"
 	"github.com/founderstack/api/internal/pkg/vault"
@@ -29,12 +30,18 @@ type Handler struct {
 	appPool          *pgxpool.Pool
 	encryptionKey    []byte
 	apiKeyMockPrefix string
+	email            notify.EmailSender
+	digestTokens     *notify.DigestTokenSigner
+	appBaseURL       string
 }
 
 // encryptionKey is the decoded ENCRYPTION_KEY, resolved once at startup so a misconfigured
 // key fails the process at boot, not on a founder's first key submission.
-func NewHandler(appPool *pgxpool.Pool, encryptionKey []byte, apiKeyMockPrefix string) *Handler {
-	return &Handler{appPool: appPool, encryptionKey: encryptionKey, apiKeyMockPrefix: apiKeyMockPrefix}
+func NewHandler(appPool *pgxpool.Pool, encryptionKey []byte, apiKeyMockPrefix string, email notify.EmailSender, digestTokens *notify.DigestTokenSigner, appBaseURL string) *Handler {
+	return &Handler{
+		appPool: appPool, encryptionKey: encryptionKey, apiKeyMockPrefix: apiKeyMockPrefix,
+		email: email, digestTokens: digestTokens, appBaseURL: appBaseURL,
+	}
 }
 
 // rg must already have middleware.RequireAuth applied.
@@ -50,6 +57,20 @@ func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.PUT("/approvals", h.UpdateApprovalsSettings)
 	rg.POST("/push-subscription", h.SubmitPushSubscription)
 	rg.DELETE("/push-subscription", h.DeletePushSubscription)
+
+	// Daily digest config (workflow 20) — see digest.go.
+	rg.GET("/digest", h.GetDigestSettings)
+	rg.PUT("/digest", h.UpdateDigestSettings)
+	rg.POST("/digest/test", h.SendTestDigest)
+}
+
+// RegisterPublic wires the one digest route with no Clerk session: the
+// unsubscribe link in a digest email's footer. rg must NOT have
+// middleware.RequireAuth applied — Unsubscribe does its own token-based
+// auth, same "ungated group, handler does its own auth" pattern as
+// approvals.Handler.RegisterActions.
+func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
+	rg.GET("/digest/unsubscribe", h.Unsubscribe)
 }
 
 type submitAPIKeyRequest struct {

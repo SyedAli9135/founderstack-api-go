@@ -43,6 +43,7 @@ import (
 	workflowsapi "github.com/founderstack/api/internal/api/workflows"
 	"github.com/founderstack/api/internal/config"
 	corea2a "github.com/founderstack/api/internal/core/a2a"
+	coredigest "github.com/founderstack/api/internal/core/digest"
 	coredocs "github.com/founderstack/api/internal/core/documents"
 	"github.com/founderstack/api/internal/core/graph"
 	"github.com/founderstack/api/internal/core/integrations"
@@ -137,12 +138,14 @@ func run() error {
 	// unset, so notifier is never nil and safe to use without a further
 	// nil check.
 	actionTokens := notify.NewActionTokenSigner(cfg.PushActionTokenSecret)
+	emailSender := notify.NewEmailSender(cfg.BrevoAPIKey, cfg.BrevoFromEmail)
 	notifier := notify.New(
-		notify.NewEmailSender(cfg.BrevoAPIKey, cfg.BrevoFromEmail),
+		emailSender,
 		notify.NewWebPushSender(cfg.WebPushVAPIDPublicKey, cfg.WebPushVAPIDPrivateKey, cfg.WebPushVAPIDSubject),
 		actionTokens,
 		cfg.AppBaseURL,
 	)
+	digestTokens := notify.NewDigestTokenSigner(cfg.DigestUnsubscribeSecret)
 
 	var launcher *graph.Launcher
 	if cfg.MockLLMMode {
@@ -180,7 +183,7 @@ func run() error {
 	// to a prior process restart.
 	docsProcessor.RecoverStuckJobs(ctx, systemPool)
 
-	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, docsSearcher, mcpRegistry, graphEngine, launcher, actionTokens, taskTokens)
+	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, docsSearcher, mcpRegistry, graphEngine, launcher, actionTokens, taskTokens, emailSender, digestTokens)
 
 	// All 3 background jobs run on systemPool (BYPASSRLS) — each scans
 	// across every org, which is inherently cross-tenant — and stop when
@@ -189,6 +192,7 @@ func run() error {
 	go integrations.RunRefreshJob(ctx, systemPool, encryptionKey, integrationsRegistry)
 	go coreworkflows.RunScheduler(ctx, systemPool)
 	go coreworkflows.RunApprovalExpiryJob(ctx, systemPool, launcher)
+	go coredigest.RunScheduler(ctx, systemPool, emailSender, digestTokens, cfg.AppBaseURL)
 
 	srv := &http.Server{
 		Addr:              addr(),
@@ -259,7 +263,7 @@ func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	return client, nil
 }
 
-func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, docsSearcher *coredocs.Searcher, mcpRegistry *coremcp.Registry, graphEngine *graph.Engine, launcher *graph.Launcher, actionTokens *notify.ActionTokenSigner, taskTokens *corea2a.TaskTokenSigner) *gin.Engine {
+func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, docsSearcher *coredocs.Searcher, mcpRegistry *coremcp.Registry, graphEngine *graph.Engine, launcher *graph.Launcher, actionTokens *notify.ActionTokenSigner, taskTokens *corea2a.TaskTokenSigner, emailSender notify.EmailSender, digestTokens *notify.DigestTokenSigner) *gin.Engine {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -277,9 +281,18 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 
 	// Every route under here requires a verified session; each handler
 	// scopes its own queries via tenant.WithTx against the app_user pool.
+	settingsHandler := settings.NewHandler(db, encryptionKey, cfg.APIKeyMockPrefix, emailSender, digestTokens, cfg.AppBaseURL)
 	apiSettings := router.Group("/api/v1/settings")
 	apiSettings.Use(middleware.RequireAuth(systemDB, cfg))
-	settings.NewHandler(db, encryptionKey, cfg.APIKeyMockPrefix).Register(apiSettings)
+	settingsHandler.Register(apiSettings)
+
+	// Deliberately ungated — a digest email's unsubscribe link has no
+	// live Clerk session; Handler.Unsubscribe does its own token-based
+	// auth per request instead. Same path prefix as apiSettings above,
+	// same "route patterns don't collide" reasoning as
+	// apiIntegrationsCallback below.
+	apiSettingsPublic := router.Group("/api/v1/settings")
+	settingsHandler.RegisterPublic(apiSettingsPublic)
 
 	apiWebhooks := router.Group("/api/webhooks")
 	webhooks.NewClerkHandler(systemDB, cfg.ClerkWebhookSecret.Expose()).Register(apiWebhooks)

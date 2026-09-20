@@ -12,8 +12,11 @@ import (
 	"github.com/founderstack/api/internal/pkg/secret"
 )
 
+// htmlBody may be empty -- callers that only ever send plain text (like
+// the approval-gate notifier) leave it blank; Brevo just omits
+// htmlContent from the request in that case.
 type EmailSender interface {
-	Send(ctx context.Context, toEmail, subject, textBody string) error
+	Send(ctx context.Context, toEmail, subject, textBody, htmlBody string) error
 }
 
 // noopSender degrades gracefully when BREVO_API_KEY/BREVO_FROM_EMAIL are
@@ -31,7 +34,7 @@ func NewEmailSender(apiKey secret.Value, fromEmail string) EmailSender {
 
 type noopSender struct{}
 
-func (noopSender) Send(ctx context.Context, toEmail, subject, textBody string) error {
+func (noopSender) Send(ctx context.Context, toEmail, subject, textBody, htmlBody string) error {
 	slog.Warn("notify: email not sent — BREVO_API_KEY/BREVO_FROM_EMAIL not configured", "to", toEmail, "subject", subject)
 	return nil
 }
@@ -55,14 +58,16 @@ type brevoSendRequest struct {
 	To          []brevoEmailAddress `json:"to"`
 	Subject     string              `json:"subject"`
 	TextContent string              `json:"textContent"`
+	HTMLContent string              `json:"htmlContent,omitempty"`
 }
 
-func (s *brevoSender) Send(ctx context.Context, toEmail, subject, textBody string) error {
+func (s *brevoSender) Send(ctx context.Context, toEmail, subject, textBody, htmlBody string) error {
 	body, err := json.Marshal(brevoSendRequest{
 		Sender:      brevoEmailAddress{Email: s.fromEmail},
 		To:          []brevoEmailAddress{{Email: toEmail}},
 		Subject:     subject,
 		TextContent: textBody,
+		HTMLContent: htmlBody,
 	})
 	if err != nil {
 		return fmt.Errorf("notify: marshal brevo request: %w", err)

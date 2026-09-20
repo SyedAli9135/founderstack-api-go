@@ -95,7 +95,7 @@ func (n *Notifier) notifyApprovers(ctx context.Context, appPool *pgxpool.Pool, o
 	for _, approver := range approvers {
 		subject := "Approval needed: " + summary
 		body := fmt.Sprintf("An agent run needs your approval.\n\n%s\n\nApproval ID: %s\nOpen the app to approve or reject.", summary, approvalID)
-		if err := n.Email.Send(ctx, approver.email, subject, body); err != nil {
+		if err := n.Email.Send(ctx, approver.email, subject, body, ""); err != nil {
 			slog.Warn("notify: send approval email failed", "org_id", orgID, "to", approver.email, "err", err)
 		}
 	}

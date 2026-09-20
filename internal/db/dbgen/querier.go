@@ -37,6 +37,10 @@ type Querier interface {
 	DeactivateWorkflow(ctx context.Context, arg DeactivateWorkflowParams) (int64, error)
 	DeleteDocumentChunks(ctx context.Context, docID pgtype.UUID) error
 	DeletePushSubscription(ctx context.Context, arg DeletePushSubscriptionParams) error
+	// Backs the no-login unsubscribe link — deliberately only ever turns the
+	// digest off, never on, so a leaked/replayed token can't be used to
+	// re-enable something a founder actively disabled some other way.
+	DisableDigestForOrg(ctx context.Context, id pgtype.UUID) error
 	// Fills in the completion-summary fields checkpoint() itself doesn't own
 	// (status stays checkpoint()'s alone) — only called once a run reaches a
 	// genuinely terminal status, never for awaiting_approval.
@@ -121,6 +125,23 @@ type Querier interface {
 	// for every calendar day (the handler fills gaps itself, since a query
 	// can't easily manufacture rows for days with zero cost_ledger activity).
 	GetDailyCostUsage(ctx context.Context, arg GetDailyCostUsageParams) ([]GetDailyCostUsageRow, error)
+	GetDigestCostUSD(ctx context.Context, arg GetDigestCostUSDParams) (float64, error)
+	// Current state, not time-boxed to yesterday -- a founder needs to know
+	// what's waiting on them right now, not just what queued up yesterday.
+	GetDigestPendingApprovalsCount(ctx context.Context, orgID pgtype.UUID) (int64, error)
+	// "Yesterday" is the previous calendar day in the org's own
+	// digest_timezone, not UTC -- matches what ListOrgsDueForDigest just
+	// fired on. parent_run_id IS NULL excludes workflow 18 specialist
+	// sub-runs from the count, same reasoning as FinalizeRunHoursSaved: only
+	// an orchestrator's own run represents one end-to-end task a founder
+	// would otherwise have done by hand.
+	GetDigestRunStats(ctx context.Context, arg GetDigestRunStatsParams) (GetDigestRunStatsRow, error)
+	GetDigestSettings(ctx context.Context, id pgtype.UUID) (GetDigestSettingsRow, error)
+	// COALESCE(wr.agent_id, w.agent_id): same "derive from workflow unless a
+	// team sub-run overrides it directly" convention as GetRunAgentID.
+	// Returns pgx.ErrNoRows when nothing ran yesterday -- callers treat that
+	// as "no top agent", not an error.
+	GetDigestTopAgent(ctx context.Context, arg GetDigestTopAgentParams) (GetDigestTopAgentRow, error)
 	GetDocument(ctx context.Context, arg GetDocumentParams) (GetDocumentRow, error)
 	// Batch-hydrates a page of search results' filename/category — Pinecone's
 	// own vector metadata only carries doc_id/chunk_index/text (see
@@ -134,6 +155,10 @@ type Querier interface {
 	// exist" convention as every other tenant-scoped lookup in this codebase)
 	// and returns clerk_user_id, needed for the Clerk-side sync call.
 	GetOrgMemberForUpdate(ctx context.Context, arg GetOrgMemberForUpdateParams) (GetOrgMemberForUpdateRow, error)
+	// Backs "send test email" -- BuildPayload needs both, and neither
+	// GetDigestSettings nor auth.sql's GetActiveOrganizationByID returns the
+	// pair together.
+	GetOrgNameAndTimezone(ctx context.Context, id pgtype.UUID) (GetOrgNameAndTimezoneRow, error)
 	// graph.Launcher's run lifecycle (POST /workflows/{id}/run's async goroutine
 	// — see internal/core/graph/launch.go) and the read-only HTTP endpoints
 	// (GET /runs, GET /runs/{id}).
@@ -188,6 +213,7 @@ type Querier interface {
 	// this is looked up fresh at decision time rather than cached on the
 	// request context.
 	GetUserApprovalPermissions(ctx context.Context, id pgtype.UUID) (GetUserApprovalPermissionsRow, error)
+	GetUserEmailByID(ctx context.Context, id pgtype.UUID) (string, error)
 	GetWorkflow(ctx context.Context, arg GetWorkflowParams) (GetWorkflowRow, error)
 	GetWorkflowRun(ctx context.Context, arg GetWorkflowRunParams) (GetWorkflowRunRow, error)
 	// Only called after purgeDocumentJob has successfully removed the
@@ -335,6 +361,10 @@ type Querier interface {
 	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
 	// Paginated GET /billing/ledger.
 	ListCostLedgerPage(ctx context.Context, arg ListCostLedgerPageParams) ([]ListCostLedgerPageRow, error)
+	// Owners/admins only, not every member -- same admin-role check
+	// (role IN ('owner','admin')) already used by org.handler.go/clerk
+	// webhook, reused here rather than invented fresh.
+	ListDigestRecipients(ctx context.Context, orgID pgtype.UUID) ([]string, error)
 	ListDocumentChunkPineconeIDs(ctx context.Context, docID pgtype.UUID) ([]string, error)
 	// Excludes 'deleting': once DELETE .../{id} has been called, the
 	// document shouldn't reappear in a normal list view while
@@ -366,6 +396,11 @@ type Querier interface {
 	// every list, only on a role change or removal (see that package's own
 	// doc comment for why).
 	ListOrgMembers(ctx context.Context, orgID pgtype.UUID) ([]ListOrgMembersRow, error)
+	// Cross-tenant scan (system pool, BYPASSRLS) -- an org is due when its
+	// local hour matches digest_send_hour, it hasn't already gotten today's
+	// digest in its own timezone yet, and it's had some activity in the last
+	// 7 days (skips ghost emails to churned/empty orgs, per spec).
+	ListOrgsDueForDigest(ctx context.Context) ([]ListOrgsDueForDigestRow, error)
 	ListPushSubscriptionsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListPushSubscriptionsForOrgRow, error)
 	// parent_run_id IS NULL excludes a team's specialist sub-runs from the
 	// flat run list — a founder browsing "my runs" sees the team run as one
@@ -416,6 +451,7 @@ type Querier interface {
 	ListWorkflows(ctx context.Context, orgID pgtype.UUID) ([]ListWorkflowsRow, error)
 	MarkConnectionExpired(ctx context.Context, arg MarkConnectionExpiredParams) (int64, error)
 	MarkConnectionExpiredByIDSystem(ctx context.Context, id pgtype.UUID) (int64, error)
+	MarkDigestSent(ctx context.Context, id pgtype.UUID) error
 	MarkDocumentFailed(ctx context.Context, arg MarkDocumentFailedParams) error
 	MarkDocumentIndexed(ctx context.Context, arg MarkDocumentIndexedParams) error
 	// Used only when dependency resolution itself fails before Engine.Run
@@ -450,6 +486,7 @@ type Querier interface {
 	// specific connection by id, already scoped to the right org by virtue of
 	// having come from ListExpiringConnectionsSystem's own row.
 	UpdateConnectionTokensByIDSystem(ctx context.Context, arg UpdateConnectionTokensByIDSystemParams) (int64, error)
+	UpdateDigestSettings(ctx context.Context, arg UpdateDigestSettingsParams) error
 	UpdateDocumentProcessing(ctx context.Context, arg UpdateDocumentProcessingParams) error
 	// Permission flags are recomputed from the new role (see
 	// internal/api/org/handler.go's defaultPermissionsForRole), not passed

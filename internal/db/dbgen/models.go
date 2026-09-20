@@ -211,6 +211,10 @@ type Organization struct {
 	AgentsPaused            bool               `json:"agents_paused"`
 	ApprovalsSlackChannelID *string            `json:"approvals_slack_channel_id"`
 	TotalHoursSaved         float64            `json:"total_hours_saved"`
+	DigestEnabled           bool               `json:"digest_enabled"`
+	DigestSendHour          int32              `json:"digest_send_hour"`
+	DigestTimezone          string             `json:"digest_timezone"`
+	DigestLastSentAt        pgtype.Timestamptz `json:"digest_last_sent_at"`
 }
 
 type PushSubscription struct {
