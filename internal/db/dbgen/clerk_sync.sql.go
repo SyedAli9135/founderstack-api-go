@@ -22,6 +22,27 @@ func (q *Queries) GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID 
 	return id, err
 }
 
+const softDeleteMembership = `-- name: SoftDeleteMembership :execrows
+UPDATE users SET is_active = false
+WHERE clerk_user_id = $1
+  AND org_id = (SELECT id FROM organizations WHERE clerk_org_id = $2)
+`
+
+type SoftDeleteMembershipParams struct {
+	ClerkUserID string `json:"clerk_user_id"`
+	ClerkOrgID  string `json:"clerk_org_id"`
+}
+
+// A single membership removal: only this org's row, never the person's
+// memberships elsewhere.
+func (q *Queries) SoftDeleteMembership(ctx context.Context, arg SoftDeleteMembershipParams) (int64, error) {
+	result, err := q.db.Exec(ctx, softDeleteMembership, arg.ClerkUserID, arg.ClerkOrgID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const softDeleteOrganizationByClerkOrgID = `-- name: SoftDeleteOrganizationByClerkOrgID :execrows
 UPDATE organizations SET is_active = false WHERE clerk_org_id = $1
 `
@@ -38,6 +59,7 @@ const softDeleteUserByClerkUserID = `-- name: SoftDeleteUserByClerkUserID :execr
 UPDATE users SET is_active = false WHERE clerk_user_id = $1
 `
 
+// A full Clerk account deletion (user.deleted): every membership goes.
 func (q *Queries) SoftDeleteUserByClerkUserID(ctx context.Context, clerkUserID string) (int64, error) {
 	result, err := q.db.Exec(ctx, softDeleteUserByClerkUserID, clerkUserID)
 	if err != nil {
@@ -56,6 +78,8 @@ type UpdateUserProfileParams struct {
 	AvatarUrl   *string `json:"avatar_url"`
 }
 
+// Profile fields are per-person, so this deliberately updates every
+// membership row the person holds, across all their orgs.
 func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateUserProfile, arg.ClerkUserID, arg.FullName, arg.AvatarUrl)
 	if err != nil {
@@ -70,22 +94,33 @@ INSERT INTO organizations (clerk_org_id, name, slug, is_active)
 VALUES ($1, $2, $3, true)
 ON CONFLICT (clerk_org_id) DO UPDATE SET
     name = EXCLUDED.name,
-    slug = EXCLUDED.slug,
-    is_active = true
+    slug = CASE WHEN $4::boolean THEN EXCLUDED.slug ELSE organizations.slug END
 RETURNING id
 `
 
 type UpsertOrganizationParams struct {
-	ClerkOrgID string `json:"clerk_org_id"`
-	Name       string `json:"name"`
-	Slug       string `json:"slug"`
+	ClerkOrgID    string `json:"clerk_org_id"`
+	Name          string `json:"name"`
+	Slug          string `json:"slug"`
+	SlugFromClerk bool   `json:"slug_from_clerk"`
 }
 
 // Queries backing the Clerk webhook sync (POST /api/webhooks/clerk). Run
 // through the app_system (BYPASSRLS) pool, never app_user — see
 // internal/api/webhooks/clerk.go.
+// is_active is deliberately left alone on conflict: an organization.updated
+// (or a late-delivered organization.created) must never resurrect an org
+// this backend has deactivated — e.g. a removed client workspace.
+// The webhook substitutes a clerk_org_id-derived slug when Clerk sends none
+// (org slugs disabled on the instance); that stand-in must never replace a
+// real slug already stored, e.g. one a client workspace was created with.
 func (q *Queries) UpsertOrganization(ctx context.Context, arg UpsertOrganizationParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, upsertOrganization, arg.ClerkOrgID, arg.Name, arg.Slug)
+	row := q.db.QueryRow(ctx, upsertOrganization,
+		arg.ClerkOrgID,
+		arg.Name,
+		arg.Slug,
+		arg.SlugFromClerk,
+	)
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
@@ -94,8 +129,7 @@ func (q *Queries) UpsertOrganization(ctx context.Context, arg UpsertOrganization
 const upsertUserForMembership = `-- name: UpsertUserForMembership :exec
 INSERT INTO users (org_id, clerk_user_id, email, full_name, role, can_approve_workflows, can_manage_api_keys, can_manage_integrations, is_active)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
-ON CONFLICT (clerk_user_id) DO UPDATE SET
-    org_id = EXCLUDED.org_id,
+ON CONFLICT (org_id, clerk_user_id) DO UPDATE SET
     role = EXCLUDED.role,
     is_active = true,
     can_approve_workflows = CASE WHEN users.is_active THEN users.can_approve_workflows ELSE EXCLUDED.can_approve_workflows END,

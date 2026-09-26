@@ -100,7 +100,7 @@ func TestDevTokenFallback_DisabledInProduction(t *testing.T) {
 	cfg := &config.Config{AppEnv: "production", DevTokenSecret: "some-secret"}
 	token, _ := devtoken.Sign("some-secret", "user_x")
 
-	if _, err := devTokenFallback(cfg, token); err == nil {
+	if _, _, err := devTokenFallback(cfg, token); err == nil {
 		t.Fatal("devTokenFallback() succeeded in production, want it disabled regardless of a valid token")
 	}
 }
@@ -109,7 +109,7 @@ func TestDevTokenFallback_DisabledWhenSecretUnset(t *testing.T) {
 	cfg := &config.Config{AppEnv: "development", DevTokenSecret: ""}
 	token, _ := devtoken.Sign("anything", "user_x")
 
-	if _, err := devTokenFallback(cfg, token); err == nil {
+	if _, _, err := devTokenFallback(cfg, token); err == nil {
 		t.Fatal("devTokenFallback() succeeded with an empty DevTokenSecret, want it disabled")
 	}
 }
@@ -121,7 +121,7 @@ func TestDevTokenFallback_EnabledInDevReturnsSubject(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sub, err := devTokenFallback(cfg, token)
+	sub, _, err := devTokenFallback(cfg, token)
 	if err != nil {
 		t.Fatalf("devTokenFallback() error = %v, want nil", err)
 	}

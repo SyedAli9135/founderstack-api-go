@@ -17,6 +17,7 @@ type Querier interface {
 	// different, still-active provider's pointer.
 	ClearOrganizationActiveApiKeyForProvider(ctx context.Context, arg ClearOrganizationActiveApiKeyForProviderParams) error
 	CountActiveAgents(ctx context.Context, orgID pgtype.UUID) (int64, error)
+	CountActiveClientWorkspaces(ctx context.Context, parentPracticeID pgtype.UUID) (int64, error)
 	CountCostLedger(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	// Soft delete — is_active=false, row stays for run history (Workflow 9+).
 	// :execrows (not :exec) so the handler can distinguish "deactivated" from
@@ -25,6 +26,7 @@ type Querier interface {
 	// One-way, unlike workflows' pause/resume DeactivateWorkflow — a team has
 	// no equivalent "reactivate" endpoint (see GetAgentTeam's own note).
 	DeactivateAgentTeam(ctx context.Context, arg DeactivateAgentTeamParams) (int64, error)
+	DeactivateClientWorkspace(ctx context.Context, arg DeactivateClientWorkspaceParams) (int64, error)
 	DeactivateKeyByProvider(ctx context.Context, arg DeactivateKeyByProviderParams) (int64, error)
 	// Only ever called after the real Clerk-side removal already succeeded —
 	// see Handler.Remove's doc comment for why the ordering matters.
@@ -64,13 +66,16 @@ type Querier interface {
 	// generalized 2026-08-21 from an Anthropic-only literal to support all 5
 	// catalog providers (see internal/core/llm/catalog.go).
 	GetActiveKeyByOrgIDAndProvider(ctx context.Context, arg GetActiveKeyByOrgIDAndProviderParams) (GetActiveKeyByOrgIDAndProviderRow, error)
+	GetActiveOrganizationByClerkOrgID(ctx context.Context, clerkOrgID string) (GetActiveOrganizationByClerkOrgIDRow, error)
 	GetActiveOrganizationByID(ctx context.Context, id pgtype.UUID) (GetActiveOrganizationByIDRow, error)
 	// Queries backing request authentication (internal/api/middleware/auth.go).
 	// Run through app_system (BYPASSRLS): resolving "who is this JWT for, and
 	// which org do they belong to" is inherently a lookup that happens before
 	// any tenant context exists to scope an RLS-restricted query by — the same
 	// chicken-and-egg reasoning as the Clerk webhook's org creation.
-	GetActiveUserByClerkUserID(ctx context.Context, clerkUserID string) (GetActiveUserByClerkUserIDRow, error)
+	// A person can hold one users row per org, so identity is always the
+	// (org_id, clerk_user_id) pair, never clerk_user_id alone.
+	GetActiveUserInOrg(ctx context.Context, arg GetActiveUserInOrgParams) (GetActiveUserInOrgRow, error)
 	GetAgent(ctx context.Context, arg GetAgentParams) (GetAgentRow, error)
 	// Per-agent cost share (last 30 days) for GET /billing/usage's bar chart.
 	// agent_id is nullable on cost_ledger (a run's tool-call/llm cost rows
@@ -111,6 +116,7 @@ type Querier interface {
 	// follows still goes through the normal org-scoped path once org_id is
 	// known from this row.
 	GetApprovalSystemScoped(ctx context.Context, id pgtype.UUID) (GetApprovalSystemScopedRow, error)
+	GetClientWorkspaceForCaller(ctx context.Context, arg GetClientWorkspaceForCallerParams) (GetClientWorkspaceForCallerRow, error)
 	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
 	// Workflow 14 (token usage & analytics). All read-only, all against
 	// app_user/tenant.WithTx like every other tenant-scoped query in this
@@ -167,6 +173,11 @@ type Querier interface {
 	GetOrgTotalHoursSaved(ctx context.Context, id pgtype.UUID) (float64, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
 	GetOrganizationMaxAgents(ctx context.Context, id pgtype.UUID) (*int32, error)
+	GetPortfolioSummary(ctx context.Context, arg GetPortfolioSummaryParams) (GetPortfolioSummaryRow, error)
+	// Row lock serializes concurrent creates against the same practice, so two
+	// simultaneous requests can't both pass the max_client_workspaces check.
+	GetPracticeForUpdate(ctx context.Context, id pgtype.UUID) (GetPracticeForUpdateRow, error)
+	GetPracticeLimit(ctx context.Context, id pgtype.UUID) (int32, error)
 	// GET /analytics/rag-quality. Sourced from audit_logs' rag.search rows —
 	// the only place avg_rerank_score/from_cache/result_count are recorded at
 	// all (see internal/api/documents/handler.go's auditSearch); a search
@@ -214,6 +225,9 @@ type Querier interface {
 	// request context.
 	GetUserApprovalPermissions(ctx context.Context, id pgtype.UUID) (GetUserApprovalPermissionsRow, error)
 	GetUserEmailByID(ctx context.Context, id pgtype.UUID) (string, error)
+	// Copies the caller's own profile onto the membership row created for a new
+	// client workspace (users.email is NOT NULL; the session JWT doesn't carry it).
+	GetUserProfile(ctx context.Context, id pgtype.UUID) (GetUserProfileRow, error)
 	GetWorkflow(ctx context.Context, arg GetWorkflowParams) (GetWorkflowRow, error)
 	GetWorkflowRun(ctx context.Context, arg GetWorkflowRunParams) (GetWorkflowRunRow, error)
 	// Only called after purgeDocumentJob has successfully removed the
@@ -306,6 +320,9 @@ type Querier interface {
 	// a member removed from every team loses A2A reachability immediately, not
 	// whenever some denormalized column next happens to get refreshed.
 	IsAgentOnActiveTeam(ctx context.Context, arg IsAgentOnActiveTeamParams) (bool, error)
+	// Fallback for a token carrying no active-org claim: only unambiguous when
+	// exactly one membership is in a still-active org.
+	ListActiveMembershipsByClerkUserID(ctx context.Context, clerkUserID string) ([]ListActiveMembershipsByClerkUserIDRow, error)
 	// Joined against agents for display (name, description, model) — the
 	// specialist card the team page and the multi-agent pipeline UI both need,
 	// without a second round trip per member.
@@ -358,6 +375,10 @@ type Querier interface {
 	// InsertTeamWorkflowRun), so no join back to agent_team_members is needed
 	// (and wouldn't survive a member later being removed from the team).
 	ListChildRuns(ctx context.Context, arg ListChildRunsParams) ([]ListChildRunsRow, error)
+	// Includes deactivated workspaces (still inside or past their restore
+	// window) so the portfolio page can offer a restore; the handler decides
+	// restorability from deactivated_at.
+	ListClientWorkspacesWithStats(ctx context.Context, arg ListClientWorkspacesWithStatsParams) ([]ListClientWorkspacesWithStatsRow, error)
 	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
 	// Paginated GET /billing/ledger.
 	ListCostLedgerPage(ctx context.Context, arg ListCostLedgerPageParams) ([]ListCostLedgerPageRow, error)
@@ -373,6 +394,9 @@ type Querier interface {
 	ListDocuments(ctx context.Context, orgID pgtype.UUID) ([]ListDocumentsRow, error)
 	// Background scheduler (internal/core/workflows/scheduler.go) — app_system,
 	// never tenant.WithTx; see the file-level comment above.
+	// The org join keeps a deactivated org (e.g. a removed client workspace)
+	// from running scheduled work — and spending its BYOK key — while it waits
+	// out its restore window.
 	ListDueScheduledWorkflows(ctx context.Context) ([]ListDueScheduledWorkflowsRow, error)
 	// ListExpiredPendingApprovals runs on app_system (BYPASSRLS) — sweeping
 	// expirations across every org is inherently cross-tenant, same reasoning
@@ -449,21 +473,37 @@ type Querier interface {
 	// founder configured here and shouldn't show up as an orphan single-agent
 	// workflow.
 	ListWorkflows(ctx context.Context, orgID pgtype.UUID) ([]ListWorkflowsRow, error)
+	// Workflow 21 (Practice & Client Workspace Model). Every query here runs on
+	// app_system (BYPASSRLS), because a portfolio view is inherently
+	// cross-tenant — RLS can only ever scope to one org at a time. What stands
+	// in for RLS is the users join every read carries: a workspace is only ever
+	// visible to a caller holding an active users row in that exact workspace
+	// (clerk_user_id = the verified JWT subject). Don't add a query to this file
+	// without that join.
+	// Backs the workspace switcher: every active org the person belongs to.
+	ListWorkspacesForClerkUser(ctx context.Context, clerkUserID string) ([]ListWorkspacesForClerkUserRow, error)
 	MarkConnectionExpired(ctx context.Context, arg MarkConnectionExpiredParams) (int64, error)
 	MarkConnectionExpiredByIDSystem(ctx context.Context, id pgtype.UUID) (int64, error)
 	MarkDigestSent(ctx context.Context, id pgtype.UUID) error
 	MarkDocumentFailed(ctx context.Context, arg MarkDocumentFailedParams) error
 	MarkDocumentIndexed(ctx context.Context, arg MarkDocumentIndexedParams) error
+	// A standard org becomes a practice the first time it creates a client workspace.
+	MarkOrganizationAsPractice(ctx context.Context, id pgtype.UUID) error
 	// Used only when dependency resolution itself fails before Engine.Run
 	// ever starts (a bad policy_scope, a registry error, ...) — there's no
 	// checkpoint yet for a normal Engine-driven "failed" transition to have
 	// written, so this writes the terminal status directly.
 	MarkRunFailedPreflight(ctx context.Context, arg MarkRunFailedPreflightParams) error
 	MarkRunStarted(ctx context.Context, arg MarkRunStartedParams) error
+	RestoreClientWorkspace(ctx context.Context, arg RestoreClientWorkspaceParams) (int64, error)
 	RevokeConnection(ctx context.Context, arg RevokeConnectionParams) (int64, error)
 	SetOrganizationActiveApiKey(ctx context.Context, arg SetOrganizationActiveApiKeyParams) error
 	SoftDeleteDocument(ctx context.Context, arg SoftDeleteDocumentParams) error
+	// A single membership removal: only this org's row, never the person's
+	// memberships elsewhere.
+	SoftDeleteMembership(ctx context.Context, arg SoftDeleteMembershipParams) (int64, error)
 	SoftDeleteOrganizationByClerkOrgID(ctx context.Context, clerkOrgID string) (int64, error)
+	// A full Clerk account deletion (user.deleted): every membership goes.
 	SoftDeleteUserByClerkUserID(ctx context.Context, clerkUserID string) (int64, error)
 	// Same shape as InsertWorkflowRun (triggered_by is NULL — the system, not
 	// a user, triggered this one), used because the scheduler has no
@@ -502,6 +542,8 @@ type Querier interface {
 	// a node's tool-call loop or an approval-gate pause. See WORKFLOW_PLAN_GO.md's
 	// Workflow 9 harness planning notes for the full reasoning.
 	UpdateRunCheckpoint(ctx context.Context, arg UpdateRunCheckpointParams) error
+	// Profile fields are per-person, so this deliberately updates every
+	// membership row the person holds, across all their orgs.
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (int64, error)
 	// Partial update via COALESCE, same convention as UpdateAgent — but
 	// trigger_type/cron_expression/next_run_at are 3 fields the *handler*
@@ -516,6 +558,10 @@ type Querier interface {
 	UpdateWorkflow(ctx context.Context, arg UpdateWorkflowParams) (UpdateWorkflowRow, error)
 	UpdateWorkflowNextRunAt(ctx context.Context, arg UpdateWorkflowNextRunAtParams) error
 	UpsertAPIKey(ctx context.Context, arg UpsertAPIKeyParams) (pgtype.UUID, error)
+	// ON CONFLICT covers Clerk's organization.created webhook racing ahead of
+	// this insert: the webhook creates a plain standard row, and this turns it
+	// into the client workspace it actually is.
+	UpsertClientWorkspace(ctx context.Context, arg UpsertClientWorkspaceParams) (pgtype.UUID, error)
 	// Queries backing third-party integration connections (workflow 4),
 	// against the mcp_connections table. Per-org reads/writes (connect,
 	// callback, api-key, status, delete) run through app_user via
@@ -529,6 +575,12 @@ type Querier interface {
 	// Queries backing the Clerk webhook sync (POST /api/webhooks/clerk). Run
 	// through the app_system (BYPASSRLS) pool, never app_user — see
 	// internal/api/webhooks/clerk.go.
+	// is_active is deliberately left alone on conflict: an organization.updated
+	// (or a late-delivered organization.created) must never resurrect an org
+	// this backend has deactivated — e.g. a removed client workspace.
+	// The webhook substitutes a clerk_org_id-derived slug when Clerk sends none
+	// (org slugs disabled on the instance); that stand-in must never replace a
+	// real slug already stored, e.g. one a client workspace was created with.
 	UpsertOrganization(ctx context.Context, arg UpsertOrganizationParams) (pgtype.UUID, error)
 	UpsertPushSubscription(ctx context.Context, arg UpsertPushSubscriptionParams) error
 	// can_approve_workflows/can_manage_api_keys/can_manage_integrations are

@@ -15,6 +15,7 @@ import (
 	coreoption "github.com/cohere-ai/cohere-go/v2/option"
 
 	"github.com/clerk/clerk-sdk-go/v2"
+	"github.com/clerk/clerk-sdk-go/v2/organization"
 	"github.com/clerk/clerk-sdk-go/v2/organizationinvitation"
 	"github.com/clerk/clerk-sdk-go/v2/organizationmembership"
 	"github.com/gin-contrib/cors"
@@ -34,6 +35,7 @@ import (
 	integrationsapi "github.com/founderstack/api/internal/api/integrations"
 	"github.com/founderstack/api/internal/api/middleware"
 	"github.com/founderstack/api/internal/api/org"
+	practiceapi "github.com/founderstack/api/internal/api/practice"
 	runsapi "github.com/founderstack/api/internal/api/runs"
 	"github.com/founderstack/api/internal/api/settings"
 	teamsapi "github.com/founderstack/api/internal/api/teams"
@@ -381,6 +383,15 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiTemplates := router.Group("/api/v1")
 	apiTemplates.Use(middleware.RequireAuth(systemDB, cfg))
 	templatesapi.NewHandler(db).Register(apiTemplates)
+
+	apiPractice := router.Group("/api/v1")
+	apiPractice.Use(middleware.RequireAuth(systemDB, cfg))
+	practiceHandler := practiceapi.NewHandler(systemDB, practiceapi.NewClerkProvisioner(organization.NewClient(&clerk.ClientConfig{})))
+	practiceHandler.Register(apiPractice)
+
+	apiIdentity := router.Group("/api/v1")
+	apiIdentity.Use(middleware.RequireIdentity(cfg))
+	practiceHandler.RegisterIdentityOnly(apiIdentity)
 
 	return router
 }

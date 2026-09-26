@@ -11,15 +11,46 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getActiveOrganizationByClerkOrgID = `-- name: GetActiveOrganizationByClerkOrgID :one
+SELECT id, name, slug, clerk_org_id, organization_type, parent_practice_id
+FROM organizations WHERE clerk_org_id = $1 AND is_active = true
+`
+
+type GetActiveOrganizationByClerkOrgIDRow struct {
+	ID               pgtype.UUID `json:"id"`
+	Name             string      `json:"name"`
+	Slug             string      `json:"slug"`
+	ClerkOrgID       string      `json:"clerk_org_id"`
+	OrganizationType string      `json:"organization_type"`
+	ParentPracticeID pgtype.UUID `json:"parent_practice_id"`
+}
+
+func (q *Queries) GetActiveOrganizationByClerkOrgID(ctx context.Context, clerkOrgID string) (GetActiveOrganizationByClerkOrgIDRow, error) {
+	row := q.db.QueryRow(ctx, getActiveOrganizationByClerkOrgID, clerkOrgID)
+	var i GetActiveOrganizationByClerkOrgIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Slug,
+		&i.ClerkOrgID,
+		&i.OrganizationType,
+		&i.ParentPracticeID,
+	)
+	return i, err
+}
+
 const getActiveOrganizationByID = `-- name: GetActiveOrganizationByID :one
-SELECT id, name, slug, clerk_org_id FROM organizations WHERE id = $1 AND is_active = true
+SELECT id, name, slug, clerk_org_id, organization_type, parent_practice_id
+FROM organizations WHERE id = $1 AND is_active = true
 `
 
 type GetActiveOrganizationByIDRow struct {
-	ID         pgtype.UUID `json:"id"`
-	Name       string      `json:"name"`
-	Slug       string      `json:"slug"`
-	ClerkOrgID string      `json:"clerk_org_id"`
+	ID               pgtype.UUID `json:"id"`
+	Name             string      `json:"name"`
+	Slug             string      `json:"slug"`
+	ClerkOrgID       string      `json:"clerk_org_id"`
+	OrganizationType string      `json:"organization_type"`
+	ParentPracticeID pgtype.UUID `json:"parent_practice_id"`
 }
 
 func (q *Queries) GetActiveOrganizationByID(ctx context.Context, id pgtype.UUID) (GetActiveOrganizationByIDRow, error) {
@@ -30,17 +61,24 @@ func (q *Queries) GetActiveOrganizationByID(ctx context.Context, id pgtype.UUID)
 		&i.Name,
 		&i.Slug,
 		&i.ClerkOrgID,
+		&i.OrganizationType,
+		&i.ParentPracticeID,
 	)
 	return i, err
 }
 
-const getActiveUserByClerkUserID = `-- name: GetActiveUserByClerkUserID :one
+const getActiveUserInOrg = `-- name: GetActiveUserInOrg :one
 
 SELECT id, org_id, role, can_manage_api_keys, can_manage_integrations
-FROM users WHERE clerk_user_id = $1 AND is_active = true
+FROM users WHERE org_id = $1 AND clerk_user_id = $2 AND is_active = true
 `
 
-type GetActiveUserByClerkUserIDRow struct {
+type GetActiveUserInOrgParams struct {
+	OrgID       pgtype.UUID `json:"org_id"`
+	ClerkUserID string      `json:"clerk_user_id"`
+}
+
+type GetActiveUserInOrgRow struct {
 	ID                    pgtype.UUID `json:"id"`
 	OrgID                 pgtype.UUID `json:"org_id"`
 	Role                  string      `json:"role"`
@@ -53,9 +91,11 @@ type GetActiveUserByClerkUserIDRow struct {
 // which org do they belong to" is inherently a lookup that happens before
 // any tenant context exists to scope an RLS-restricted query by — the same
 // chicken-and-egg reasoning as the Clerk webhook's org creation.
-func (q *Queries) GetActiveUserByClerkUserID(ctx context.Context, clerkUserID string) (GetActiveUserByClerkUserIDRow, error) {
-	row := q.db.QueryRow(ctx, getActiveUserByClerkUserID, clerkUserID)
-	var i GetActiveUserByClerkUserIDRow
+// A person can hold one users row per org, so identity is always the
+// (org_id, clerk_user_id) pair, never clerk_user_id alone.
+func (q *Queries) GetActiveUserInOrg(ctx context.Context, arg GetActiveUserInOrgParams) (GetActiveUserInOrgRow, error) {
+	row := q.db.QueryRow(ctx, getActiveUserInOrg, arg.OrgID, arg.ClerkUserID)
+	var i GetActiveUserInOrgRow
 	err := row.Scan(
 		&i.ID,
 		&i.OrgID,
@@ -64,6 +104,40 @@ func (q *Queries) GetActiveUserByClerkUserID(ctx context.Context, clerkUserID st
 		&i.CanManageIntegrations,
 	)
 	return i, err
+}
+
+const listActiveMembershipsByClerkUserID = `-- name: ListActiveMembershipsByClerkUserID :many
+SELECT u.org_id, COALESCE(o.is_active, false)::boolean AS org_is_active
+FROM users u
+JOIN organizations o ON o.id = u.org_id
+WHERE u.clerk_user_id = $1 AND u.is_active = true
+`
+
+type ListActiveMembershipsByClerkUserIDRow struct {
+	OrgID       pgtype.UUID `json:"org_id"`
+	OrgIsActive bool        `json:"org_is_active"`
+}
+
+// Fallback for a token carrying no active-org claim: only unambiguous when
+// exactly one membership is in a still-active org.
+func (q *Queries) ListActiveMembershipsByClerkUserID(ctx context.Context, clerkUserID string) ([]ListActiveMembershipsByClerkUserIDRow, error) {
+	rows, err := q.db.Query(ctx, listActiveMembershipsByClerkUserID, clerkUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListActiveMembershipsByClerkUserIDRow
+	for rows.Next() {
+		var i ListActiveMembershipsByClerkUserIDRow
+		if err := rows.Scan(&i.OrgID, &i.OrgIsActive); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const touchLastLogin = `-- name: TouchLastLogin :exec

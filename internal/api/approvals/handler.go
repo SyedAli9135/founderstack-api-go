@@ -165,12 +165,12 @@ func (h *Handler) resolveActor(c *gin.Context, approvalID pgtype.UUID) (actor, b
 	ctx := c.Request.Context()
 
 	if token := bearerToken(c.GetHeader("Authorization")); token != "" {
-		clerkUserID, err := middleware.VerifyToken(ctx, h.authCache, h.cfg, token)
+		clerkUserID, clerkOrgID, err := middleware.VerifyToken(ctx, h.authCache, h.cfg, token)
 		if err != nil {
 			response.Fail(c, http.StatusUnauthorized, "INVALID_TOKEN", "Invalid session token")
 			return actor{}, false
 		}
-		user, err := middleware.ResolveUser(ctx, dbgen.New(h.systemPool), clerkUserID)
+		user, err := middleware.ResolveUser(ctx, dbgen.New(h.systemPool), clerkUserID, clerkOrgID)
 		if err != nil {
 			response.Fail(c, http.StatusUnauthorized, "USER_NOT_SYNCHRONIZED", "User profile not synchronized")
 			return actor{}, false

@@ -161,3 +161,25 @@ func TestTick_DoesNotFirePausedWorkflow(t *testing.T) {
 		t.Fatalf("workflow_runs rows for a paused workflow = %d, want 0", runCount)
 	}
 }
+
+func TestTick_DoesNotFireWorkflowInDeactivatedOrg(t *testing.T) {
+	systemPool := testSystemPool(t)
+	ctx := context.Background()
+
+	workflowID := testOrgAgentWorkflow(t, systemPool, "0 9 * * 1", time.Now().Add(-time.Hour))
+	if _, err := systemPool.Exec(ctx,
+		"update organizations set is_active = false where id = (select org_id from workflows where id = $1)", workflowID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	tick(ctx, systemPool)
+
+	var runCount int
+	if err := systemPool.QueryRow(ctx, "select count(*) from workflow_runs where workflow_id = $1", workflowID).Scan(&runCount); err != nil {
+		t.Fatal(err)
+	}
+	if runCount != 0 {
+		t.Fatalf("workflow_runs rows for a deactivated org = %d, want 0", runCount)
+	}
+}

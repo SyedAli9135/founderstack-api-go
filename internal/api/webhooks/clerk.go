@@ -136,10 +136,18 @@ func (h *ClerkHandler) upsertOrganization(ctx context.Context, raw json.RawMessa
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return fmt.Errorf("decode organization payload: %w", err)
 	}
+	// organizations.slug is UNIQUE and NOT NULL, but Clerk sends no slug when
+	// the instance has org slugs disabled — every such org would otherwise
+	// collide on "".
+	slug, fromClerk := data.Slug, data.Slug != ""
+	if !fromClerk {
+		slug = strings.ToLower(data.ID)
+	}
 	if _, err := h.db.UpsertOrganization(ctx, dbgen.UpsertOrganizationParams{
-		ClerkOrgID: data.ID,
-		Name:       data.Name,
-		Slug:       data.Slug,
+		ClerkOrgID:    data.ID,
+		Name:          data.Name,
+		Slug:          slug,
+		SlugFromClerk: fromClerk,
 	}); err != nil {
 		return fmt.Errorf("upsert organization: %w", err)
 	}
@@ -238,21 +246,23 @@ func (h *ClerkHandler) softDeleteOrganization(ctx context.Context, raw json.RawM
 	return nil
 }
 
-// A users row is scoped to exactly one org_id in this schema, so a removed membership
-// means deactivated, not partially-linked to an org they no longer belong to.
+// Scoped to the one (org, person) pair: a person can hold memberships in many orgs
+// (a practice plus its client workspaces), and leaving one must not touch the others.
 func (h *ClerkHandler) softDeleteMembership(ctx context.Context, raw json.RawMessage) error {
 	var data membershipPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return fmt.Errorf("decode membership payload: %w", err)
 	}
-	if _, err := h.db.SoftDeleteUserByClerkUserID(ctx, data.PublicUserData.UserID); err != nil {
+	if _, err := h.db.SoftDeleteMembership(ctx, dbgen.SoftDeleteMembershipParams{
+		ClerkUserID: data.PublicUserData.UserID,
+		ClerkOrgID:  data.Organization.ID,
+	}); err != nil {
 		return fmt.Errorf("soft-delete user: %w", err)
 	}
 	return nil
 }
 
-// Same DB write as softDeleteMembership; kept separate because the payload shape differs
-// (a bare {"id": ...}, not nested under public_user_data).
+// A whole Clerk account is gone, so every membership row the person holds goes with it.
 func (h *ClerkHandler) softDeleteUser(ctx context.Context, raw json.RawMessage) error {
 	var data userPayload
 	if err := json.Unmarshal(raw, &data); err != nil {

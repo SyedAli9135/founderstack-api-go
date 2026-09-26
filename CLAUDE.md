@@ -24,7 +24,7 @@ Anthropic-only original). See "BYOK API Keys" below.
 
 **Workflows 1 (bootstrap) through 14 (token usage & analytics), plus workflows 16 (disconnect/
 reconnect integration), 17 (view audit logs), 18 (multi-agent team run / A2A), 19 (agent
-templates marketplace), and 20 (daily email digest), are implemented — workflows 18/19/20's own
+templates marketplace), 20 (daily email digest), and 21 (practice & client workspaces), are implemented — workflows 18/19/20's own
 frontends (team pages, the templates gallery, the digest settings card) live in
 `../founderstack-web`, its own repo, per this codebase's usual backend/frontend split; see that
 repo's `AGENTS.md` for its own detail.
@@ -37,13 +37,13 @@ to build against fabricated inputs. Workflow 14
 Analytics (workflow 14)", "Disconnect / Reconnect Integration (workflow 16)", "View Audit Logs
 (workflow 17)", "Multi-Agent Team Run / A2A (workflow 18)", "Agent Templates Marketplace
 (workflow 19)", and "Daily Email Digest (workflow 20)" below. Don't assume routes, tables, or
-packages from workflow 21+ in
+packages from workflow 22+ in
 `WORKFLOW_PLAN_GO.md` exist — check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
 `internal/api/workflows/`, `internal/api/runs/`, `internal/api/approvals/`, `internal/api/org/`,
 `internal/api/billing/`, `internal/api/auditlogs/`, `internal/api/teams/`, `internal/api/a2a/`,
-and `internal/api/templates/` for what's actually registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
+`internal/api/templates/`, and `internal/api/practice/` for what's actually registered. Workflow 4's code is complete and tested, but nothing will actually connect to a live
 third party until real OAuth app credentials
 are registered on each provider's dashboard and put in `.env` — see "Third-Party Integrations
 (workflow 4)" below and its "Status" note in `WORKFLOW_PLAN_GO.md`.
@@ -1915,6 +1915,104 @@ addressed to the real signed-in admin's own email; the frontend toggle/hour-sele
 select/test-send/reload-persistence were all clicked through in a real browser (see
 `founderstack-web/AGENTS.md`'s own workflow 20 section).
 
+### Practice & Client Workspaces (workflow 21) — `internal/api/practice`, extends `internal/api/middleware/auth.go`, `internal/api/webhooks`
+
+Built 2026-09-26. A **Practice** is a top-level `organizations` row; a **Client Workspace** is an
+`organizations` row with `parent_practice_id` set (`organization_type` is `standard`/`practice`/
+`client_workspace`; a CHECK constraint keeps "has a parent" ⇔ "is a client workspace", so nesting is
+one level only). Each workspace is still its own RLS tenant — `tenant_isolation` is untouched.
+Migration `000018`. Scope decisions (auto-promotion to practice, deferred Stripe billing, placeholder
+`max_client_workspaces = 5`, restore-window-but-no-purge, per-workspace BYOK) are in
+`WORKFLOW_PLAN_GO.md`'s workflow 21 section.
+
+**Identity is now `(org_id, clerk_user_id)`, never `clerk_user_id` alone.** `users` swapped
+`UNIQUE(clerk_user_id)` for `UNIQUE(org_id, clerk_user_id)`. `middleware.ResolveUser` takes the
+token's active org (`claims.ActiveOrganizationID` — the SDK reads both v1 `org_id` and v2 `o.id`),
+resolves the org by `clerk_org_id`, then the user within it. With **no** active-org claim it falls
+back to the person's single active membership, and returns `409 ACTIVE_ORGANIZATION_REQUIRED` if
+there are several — it never guesses. `devtoken` gained `SignForOrg` and `POST /auth/dev-token`
+takes an optional `clerk_org_id`, so multi-org is testable without a real Clerk session.
+
+**Webhook changes that matter**: `UpsertUserForMembership` conflicts on `(org_id, clerk_user_id)`
+(joining a 2nd org adds a row instead of moving the person); `organizationMembership.deleted` uses
+`SoftDeleteMembership` scoped to that one org (the old by-`clerk_user_id` delete would have
+deactivated the person everywhere); `user.deleted` still deactivates every row, which is correct for
+an account deletion. **`UpsertOrganization` no longer sets `is_active = true` on conflict** — an
+`organization.updated` (or late `organization.created`) would otherwise resurrect a removed client
+workspace.
+
+**`internal/api/practice` runs on `app_system`, not `app_user` + `tenant.WithTx`** — deliberately,
+since a portfolio spans tenants and RLS can only ever see one. What stands in for RLS is that every
+query in `internal/db/queries/practice.sql` joins `users` on the caller's `clerk_user_id` +
+`is_active`: a workspace is visible only to someone holding an active membership in *that*
+workspace. `resolvePractice` works from inside a client workspace too (resolves to the parent), but
+requires the caller's own membership in the practice — a client's own staff invited into one
+workspace get `403 NOT_A_PRACTICE_MEMBER`, not visibility over siblings. Mutations additionally need
+owner/admin **in the practice**. A workspace outside the caller's practice is a 404, not a 403.
+
+**Create is a two-system write**: Clerk `organization.Create` (`CreatedBy` = caller, so Clerk makes
+them an admin member), then one `app_system` transaction that row-locks the practice
+(`GetPracticeForUpdate`, so concurrent creates can't both pass the limit), re-checks the limit,
+promotes `standard` → `practice`, upserts the workspace row, and upserts the caller's `users` row
+immediately (so switching in works before the membership webhook lands — it writes identical
+values, so its arrival is a no-op). Any failure after the Clerk call deletes the Clerk org again
+(`rollbackProvisioning`, detached from request cancellation). The upsert on `clerk_org_id` covers
+Clerk's `organization.created` webhook racing ahead of the insert. `WorkspaceProvisioner` is the
+interface tests fake — tests never create real Clerk orgs.
+
+**Clerk org slugs are disabled on the dev instance — found live, not by tests.** Passing `Slug` to
+`organization.Create` there is a `403 organization_slugs_disabled`, so the provisioner sends none;
+`organizations.slug` is generated locally. Clerk still sends its own auto-generated slug in
+webhooks, which then replaces the local one (harmless, still unique). If a webhook ever arrives with
+**no** slug, `upsertOrganization` substitutes the lowercased `clerk_org_id` (the column is UNIQUE,
+so a bare `""` would collide on the second such org) and `UpsertOrganization`'s `slug_from_clerk`
+flag keeps that stand-in from overwriting a real stored slug.
+
+**`GET /me/workspaces` sits behind `middleware.RequireIdentity`, not `RequireAuth`** — it verifies
+the token but resolves no org, because it's how the client recovers when the session's active org
+is unusable (a removed client workspace, a Clerk org never synced, or none selected): the frontend
+asks it for usable workspaces and `setActive`s into one. Found live: without it, a session left on
+a removed workspace dead-ended on `/invitations`. Still scoped to the caller's own active
+memberships; `is_current` compares against the token's org claim.
+
+**Removal is a soft deactivate** (`is_active=false`, `deactivated_at=now()`); `RequireAuth` then
+rejects the workspace as an active org (`404 ORGANIZATION_NOT_FOUND`), and
+`ListDueScheduledWorkflows` now joins `organizations.is_active` so a removed workspace stops running
+scheduled workflows (and spending its key). Restore works only while `deactivated_at` is within 30
+days, and re-checks the limit. Runs already in flight at removal are not cancelled.
+
+**Testing**: `internal/api/practice/handler_integration_test.go` (create/list/summary, access
+control incl. cross-practice and client-staff, limit + Clerk rollback, remove/restore/expiry),
+`internal/api/middleware/auth_integration_test.go` (active-org selection, switching, 409 fallback),
+`TestClerkWebhook_MultiOrgMembership`, `TestDocumentsSearch_ClientWorkspacesNeverLeak` (A's document
+never reaches B's search — also with a vector index that ignores namespaces, since the RLS-scoped
+ACL lookup is the real backstop), `TestTick_DoesNotFireWorkflowInDeactivatedOrg`. Coverage 64.1%.
+
+**Live-verified 2026-09-26 in a real browser against the real Clerk dev instance**: create (two
+workspaces), switching both directions, org-switch cache reset, remove via dialog, restore, and
+per-org API isolation, removing the workspace you're in (auto-switches to the practice), the
+expired window, the limit (UI and 402), and a real member account's permissions (via dev token).
+Live testing also caught that an expired restore at the limit reported "limit reached" — expiry is
+now checked first (410), since it's the permanent reason. Not exercised live: the in-app document
+upload inside a client workspace was then verified too, with `API_KEY_MOCK_PREFIX` +
+`MOCK_LLM_MODE` (see `MOCK_LLM_TESTING.md`): a document in Client A was findable only from A, and a
+mock run + approval in A rolled up into the portfolio. A real second account was then verified live
+too: as a practice member it sees no client workspaces and gets a 403 on create; added to Client A
+via Clerk (real `organizationMembership.created` webhook) it gets a **second** users row, sees only
+A in its portfolio/switcher, and gets its A role inside A; removed from A in Clerk (real
+`.deleted` webhook) only the A row deactivates, the practice membership is untouched. The
+"client's own staff" case was live-tested too, without a third account: the second account's own
+org became a separate practice with a client workspace D, the main account was added to D only,
+and in D it got `NOT_A_PRACTICE_MEMBER` (UI: "Portfolio unavailable") while its own practice's
+portfolio never showed D. **Workflow 21 is fully live-verified.**
+
+**Two pre-existing gaps surfaced by that pass (not workflow 21):** (1) **scheduled workflows never
+execute** — `internal/core/workflows/scheduler.go` (workflow 8, pre-dates the engine) only inserts a
+`pending` `workflow_runs` row and never hands it to the launcher, so every scheduled run sits pending
+forever and counts as an "active run"; (2) the LocalStack `founderstack-documents` bucket isn't
+created by anything — after a LocalStack restart every upload 500s ("Could not store the uploaded
+file") until `docker exec founderstack-api-localstack-1 awslocal s3 mb s3://founderstack-documents`.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -2030,7 +2128,7 @@ timestamp), and malformed-header cases, since this is the one piece of workflow 
 subtle bug is a real security hole, not just a functional bug.
 
 Idempotency is UPSERT-based (`INSERT ... ON CONFLICT DO UPDATE` on `clerk_org_id` /
-`clerk_user_id`), not a separate delivery-ID dedup table — a redelivered or out-of-order
+`(org_id, clerk_user_id)`), not a separate delivery-ID dedup table — a redelivered or out-of-order
 event just re-applies the same write harmlessly. Covered by
 `TestClerkWebhook_FullLifecycle/replaying_organization.created_is_idempotent` in
 `clerk_integration_test.go`: replaying `organization.created` produces the same single row,
@@ -2054,10 +2152,9 @@ documents — soft-delete, never hard), (2) `workflow_runs` and `approvals` refe
 foreign-key violation the moment it has any run history — a real bug in the Python original
 that just hasn't been hit by test data yet, and (3) it preserves `audit_logs`/`cost_ledger`
 history instead of destroying it. `organizationMembership.deleted` and `user.deleted` both
-resolve to the same `SoftDeleteUserByClerkUserID` query — a membership removal and a full
-account deletion are different Clerk events but the same local action, since a `users` row is
-scoped to exactly one `org_id` in this schema: once that membership is gone, so is any reason
-for the row to stay active. Neither cascades beyond the one row, same as `organization.deleted`.
+are soft-deletes, but at different scopes since workflow 21: a membership removal
+(`SoftDeleteMembership`) deactivates only that org's row, while a full account deletion
+(`SoftDeleteUserByClerkUserID`) deactivates every row the person holds. Neither cascades beyond the one row, same as `organization.deleted`.
 
 ### Testing Strategy & CI
 
@@ -2177,9 +2274,12 @@ machine — CI runs the authoritative version of the same check regardless.
 | `POST /api/v1/templates/{id}/install` | `internal/api/templates/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | Install a template as a new, fully-editable agent for this org (workflow 19) |
 | `GET/PUT /api/v1/settings/digest`, `POST /settings/digest/test` | `internal/api/settings/digest.go` | `middleware.RequireAuth` | Daily digest preferences + immediate test send (workflow 20) |
 | `GET /api/v1/settings/digest/unsubscribe` | `internal/api/settings/digest.go` (`RegisterPublic`) | none — `notify.DigestTokenSigner` query-string token instead | No-login one-click unsubscribe link target (workflow 20) |
+| `GET /api/v1/me/workspaces` | `internal/api/practice/handler.go` | `middleware.RequireAuth` | Every active org the caller belongs to — the workspace switcher's source (workflow 21) |
+| `GET/POST /api/v1/practice/client-workspaces`, `DELETE /practice/client-workspaces/{id}`, `POST .../{id}/restore` | `internal/api/practice/handler.go` | `middleware.RequireAuth` (+practice owner/admin guard on mutations) | Client workspace portfolio: list with stats, create via Clerk, soft-remove, restore within 30 days (workflow 21) |
+| `GET /api/v1/practice/portfolio-summary` | `internal/api/practice/handler.go` | `middleware.RequireAuth` | Rolled-up hours saved / active runs / pending approvals / cost across active client workspaces (workflow 21) |
 
 (Workflow 15 is deliberately deferred — see that section's own scope note. Everything else in
-`WORKFLOW_PLAN_GO.md` — workflow 20 onward — is unbuilt. Add rows here as routers land.)
+`WORKFLOW_PLAN_GO.md` — workflow 22 onward — is unbuilt. Add rows here as routers land.)
 
 ### Dependency policy
 

@@ -215,6 +215,10 @@ type Organization struct {
 	DigestSendHour          int32              `json:"digest_send_hour"`
 	DigestTimezone          string             `json:"digest_timezone"`
 	DigestLastSentAt        pgtype.Timestamptz `json:"digest_last_sent_at"`
+	ParentPracticeID        pgtype.UUID        `json:"parent_practice_id"`
+	OrganizationType        string             `json:"organization_type"`
+	MaxClientWorkspaces     int32              `json:"max_client_workspaces"`
+	DeactivatedAt           pgtype.Timestamptz `json:"deactivated_at"`
 }
 
 type PushSubscription struct {

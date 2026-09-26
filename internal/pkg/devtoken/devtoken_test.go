@@ -13,12 +13,29 @@ func TestSignVerify_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sign() error = %v, want nil", err)
 	}
-	sub, err := Verify("dev-secret", token)
+	sub, org, err := Verify("dev-secret", token)
 	if err != nil {
 		t.Fatalf("Verify() error = %v, want nil", err)
 	}
 	if sub != "user_abc123" {
 		t.Fatalf("Verify() = %q, want %q", sub, "user_abc123")
+	}
+	if org != "" {
+		t.Fatalf("Verify() org = %q, want empty for a token minted without one", org)
+	}
+}
+
+func TestSignForOrg_RoundTripsActiveOrg(t *testing.T) {
+	token, err := SignForOrg("dev-secret", "user_abc123", "org_xyz789")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, org, err := Verify("dev-secret", token)
+	if err != nil {
+		t.Fatalf("Verify() error = %v, want nil", err)
+	}
+	if sub != "user_abc123" || org != "org_xyz789" {
+		t.Fatalf("Verify() = (%q, %q), want (user_abc123, org_xyz789)", sub, org)
 	}
 }
 
@@ -27,13 +44,13 @@ func TestVerify_WrongSecretFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Verify("a-different-secret", token); !errors.Is(err, ErrInvalid) {
+	if _, _, err := Verify("a-different-secret", token); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Verify() with wrong secret error = %v, want ErrInvalid", err)
 	}
 }
 
 func TestVerify_GarbageTokenFails(t *testing.T) {
-	if _, err := Verify("dev-secret", "not.a.jwt"); !errors.Is(err, ErrInvalid) {
+	if _, _, err := Verify("dev-secret", "not.a.jwt"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Verify() error = %v, want ErrInvalid", err)
 	}
 }
@@ -49,7 +66,7 @@ func TestVerify_ExpiredTokenFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Verify("dev-secret", signed); !errors.Is(err, ErrInvalid) {
+	if _, _, err := Verify("dev-secret", signed); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Verify() of expired token error = %v, want ErrInvalid", err)
 	}
 }
@@ -64,7 +81,7 @@ func TestVerify_RejectsAlgNoneAttack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Verify("dev-secret", signed); !errors.Is(err, ErrInvalid) {
+	if _, _, err := Verify("dev-secret", signed); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Verify() of an alg=none token error = %v, want ErrInvalid", err)
 	}
 }

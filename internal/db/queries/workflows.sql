@@ -124,8 +124,12 @@ SELECT id, workflow_id, status, triggered_by FROM workflow_runs WHERE org_id = $
 -- never tenant.WithTx; see the file-level comment above.
 
 -- name: ListDueScheduledWorkflows :many
-SELECT id, org_id, cron_expression FROM workflows
-WHERE trigger_type = 'scheduled' AND is_active = true AND next_run_at <= now();
+-- The org join keeps a deactivated org (e.g. a removed client workspace)
+-- from running scheduled work — and spending its BYOK key — while it waits
+-- out its restore window.
+SELECT w.id, w.org_id, w.cron_expression FROM workflows w
+JOIN organizations o ON o.id = w.org_id AND o.is_active = true
+WHERE w.trigger_type = 'scheduled' AND w.is_active = true AND w.next_run_at <= now();
 
 -- name: UpdateWorkflowNextRunAt :exec
 UPDATE workflows SET next_run_at = $2 WHERE id = $1;

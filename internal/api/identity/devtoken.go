@@ -28,6 +28,9 @@ func (h *DevTokenHandler) Register(rg *gin.RouterGroup) {
 
 type devTokenRequest struct {
 	ClerkUserID string `json:"clerk_user_id" binding:"required"`
+	// Optional active org, the dev equivalent of Clerk's setActive — needed
+	// once a person belongs to more than one org.
+	ClerkOrgID string `json:"clerk_org_id"`
 }
 
 // Create mints a token for clerk_user_id. Returns 404, not 403, when
@@ -46,7 +49,7 @@ func (h *DevTokenHandler) Create(c *gin.Context) {
 		return
 	}
 
-	token, err := devtoken.Sign(h.cfg.DevTokenSecret.Expose(), req.ClerkUserID)
+	token, err := devtoken.SignForOrg(h.cfg.DevTokenSecret.Expose(), req.ClerkUserID, req.ClerkOrgID)
 	if err != nil {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not mint dev token")
 		return

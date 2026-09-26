@@ -285,8 +285,9 @@ func (q *Queries) InsertWorkflowRun(ctx context.Context, arg InsertWorkflowRunPa
 
 const listDueScheduledWorkflows = `-- name: ListDueScheduledWorkflows :many
 
-SELECT id, org_id, cron_expression FROM workflows
-WHERE trigger_type = 'scheduled' AND is_active = true AND next_run_at <= now()
+SELECT w.id, w.org_id, w.cron_expression FROM workflows w
+JOIN organizations o ON o.id = w.org_id AND o.is_active = true
+WHERE w.trigger_type = 'scheduled' AND w.is_active = true AND w.next_run_at <= now()
 `
 
 type ListDueScheduledWorkflowsRow struct {
@@ -297,6 +298,9 @@ type ListDueScheduledWorkflowsRow struct {
 
 // Background scheduler (internal/core/workflows/scheduler.go) — app_system,
 // never tenant.WithTx; see the file-level comment above.
+// The org join keeps a deactivated org (e.g. a removed client workspace)
+// from running scheduled work — and spending its BYOK key — while it waits
+// out its restore window.
 func (q *Queries) ListDueScheduledWorkflows(ctx context.Context) ([]ListDueScheduledWorkflowsRow, error) {
 	rows, err := q.db.Query(ctx, listDueScheduledWorkflows)
 	if err != nil {

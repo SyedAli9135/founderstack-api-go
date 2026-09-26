@@ -565,3 +565,186 @@ func TestClerkWebhook_MalformedEventDataReturns500(t *testing.T) {
 		t.Fatalf("body = %s, want it to contain WEBHOOK_PROCESSING_FAILED", rec.Body.String())
 	}
 }
+
+// Workflow 21: one Clerk user can belong to several orgs (a practice plus
+// its client workspaces), each its own users row.
+func TestClerkWebhook_MultiOrgMembership(t *testing.T) {
+	pool := testPool(t)
+	secret, secretBytes := testSecret(t)
+	router := testRouter(t, pool, secret)
+	ctx := context.Background()
+
+	suffix := response.NewID()[:12]
+	orgA, orgB := "org_multi_a_"+suffix, "org_multi_b_"+suffix
+	userID := "user_multi_" + suffix
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "delete from users where clerk_user_id = $1", userID)
+		_, _ = pool.Exec(context.Background(), "delete from organizations where clerk_org_id in ($1, $2)", orgA, orgB)
+	})
+
+	membership := func(eventType, clerkOrgID string) *httptest.ResponseRecorder {
+		return postWebhook(t, router, secretBytes, map[string]any{
+			"type": eventType,
+			"data": map[string]any{
+				"organization": map[string]any{"id": clerkOrgID},
+				"public_user_data": map[string]any{
+					"user_id": userID, "identifier": "operator@example.com", "first_name": "Grace", "last_name": "Hopper",
+				},
+				"role": "org:admin",
+			},
+		})
+	}
+	activeRows := func() map[string]bool {
+		rows, err := pool.Query(ctx,
+			`select o.clerk_org_id, u.is_active from users u join organizations o on o.id = u.org_id
+			 where u.clerk_user_id = $1`, userID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string]bool{}
+		for rows.Next() {
+			var org string
+			var active bool
+			if err := rows.Scan(&org, &active); err != nil {
+				t.Fatal(err)
+			}
+			out[org] = active
+		}
+		return out
+	}
+
+	for _, org := range []string{orgA, orgB} {
+		rec := postWebhook(t, router, secretBytes, map[string]any{
+			"type": "organization.created", "data": map[string]any{"id": org, "name": "Multi " + org, "slug": "multi-" + org[len(org)-14:]},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("organization.created %s: status = %d; body = %s", org, rec.Code, rec.Body.String())
+		}
+	}
+
+	t.Run("joining two orgs creates two rows, not one overwritten row", func(t *testing.T) {
+		for _, org := range []string{orgA, orgB} {
+			if rec := membership("organizationMembership.created", org); rec.Code != http.StatusOK {
+				t.Fatalf("membership %s: status = %d; body = %s", org, rec.Code, rec.Body.String())
+			}
+		}
+		got := activeRows()
+		if len(got) != 2 || !got[orgA] || !got[orgB] {
+			t.Fatalf("memberships = %v, want active rows in both %s and %s", got, orgA, orgB)
+		}
+	})
+
+	t.Run("replaying a membership event stays idempotent per org", func(t *testing.T) {
+		if rec := membership("organizationMembership.updated", orgA); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		if got := activeRows(); len(got) != 2 {
+			t.Fatalf("memberships = %v, want still exactly 2 rows", got)
+		}
+	})
+
+	t.Run("user.updated updates the profile on every membership row", func(t *testing.T) {
+		rec := postWebhook(t, router, secretBytes, map[string]any{
+			"type": "user.updated",
+			"data": map[string]any{"id": userID, "first_name": "Rear Admiral", "last_name": "Hopper", "image_url": "https://img.example.com/g.png"},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		var n int
+		if err := pool.QueryRow(ctx,
+			`select count(*) from users where clerk_user_id = $1 and full_name = 'Rear Admiral Hopper' and avatar_url = 'https://img.example.com/g.png'`,
+			userID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 2 {
+			t.Fatalf("updated rows = %d, want 2", n)
+		}
+	})
+
+	t.Run("membership.deleted in one org leaves the other membership untouched", func(t *testing.T) {
+		if rec := membership("organizationMembership.deleted", orgA); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		got := activeRows()
+		if got[orgA] || !got[orgB] {
+			t.Fatalf("memberships = %v, want %s inactive and %s still active", got, orgA, orgB)
+		}
+	})
+
+	t.Run("organization.updated never resurrects a deactivated org", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, "update organizations set is_active = false where clerk_org_id = $1", orgB); err != nil {
+			t.Fatal(err)
+		}
+		rec := postWebhook(t, router, secretBytes, map[string]any{
+			"type": "organization.updated", "data": map[string]any{"id": orgB, "name": "Renamed", "slug": "multi-" + orgB[len(orgB)-14:]},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		var name string
+		var active bool
+		if err := pool.QueryRow(ctx, "select name, is_active from organizations where clerk_org_id = $1", orgB).Scan(&name, &active); err != nil {
+			t.Fatal(err)
+		}
+		if name != "Renamed" || active {
+			t.Fatalf("org = (%q, active=%v), want renamed but still inactive", name, active)
+		}
+	})
+
+	t.Run("user.deleted deactivates every membership", func(t *testing.T) {
+		membership("organizationMembership.created", orgA)
+		rec := postWebhook(t, router, secretBytes, map[string]any{"type": "user.deleted", "data": map[string]any{"id": userID}})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		for org, active := range activeRows() {
+			if active {
+				t.Fatalf("membership in %s still active after user.deleted", org)
+			}
+		}
+	})
+}
+
+// Clerk instances with org slugs disabled send no slug at all.
+func TestClerkWebhook_OrgsWithoutSlugs(t *testing.T) {
+	pool := testPool(t)
+	secret, secretBytes := testSecret(t)
+	router := testRouter(t, pool, secret)
+	ctx := context.Background()
+
+	suffix := response.NewID()[:12]
+	orgA, orgB := "org_noslug_a_"+suffix, "org_noslug_b_"+suffix
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "delete from organizations where clerk_org_id in ($1, $2)", orgA, orgB)
+	})
+
+	for _, org := range []string{orgA, orgB} {
+		rec := postWebhook(t, router, secretBytes, map[string]any{
+			"type": "organization.created", "data": map[string]any{"id": org, "name": "No Slug", "slug": nil},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("organization.created %s without slug: status = %d; body = %s", org, rec.Code, rec.Body.String())
+		}
+	}
+
+	t.Run("a slugless update never clobbers a stored slug", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, "update organizations set slug = $2 where clerk_org_id = $1", orgA, "real-slug-"+suffix); err != nil {
+			t.Fatal(err)
+		}
+		rec := postWebhook(t, router, secretBytes, map[string]any{
+			"type": "organization.updated", "data": map[string]any{"id": orgA, "name": "Renamed", "slug": nil},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		var slug, name string
+		if err := pool.QueryRow(ctx, "select slug, name from organizations where clerk_org_id = $1", orgA).Scan(&slug, &name); err != nil {
+			t.Fatal(err)
+		}
+		if slug != "real-slug-"+suffix || name != "Renamed" {
+			t.Fatalf("org = (%q, %q), want the stored slug kept and the name updated", slug, name)
+		}
+	})
+}

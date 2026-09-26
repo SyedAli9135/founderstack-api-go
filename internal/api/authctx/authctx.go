@@ -10,13 +10,17 @@ const key = "authctx_user"
 // User is the local (not Clerk's) identity for this request. OrgID scopes
 // every tenant-scoped DB operation via tenant.WithTx.
 type User struct {
-	ID                    pgtype.UUID
-	OrgID                 pgtype.UUID
-	Role                  string
-	OrgName               string
-	OrgSlug               string
-	ClerkOrgID            string
-	ClerkUserID           string
+	ID          pgtype.UUID
+	OrgID       pgtype.UUID
+	Role        string
+	OrgName     string
+	OrgSlug     string
+	ClerkOrgID  string
+	ClerkUserID string
+	// OrganizationType is "standard", "practice", or "client_workspace";
+	// ParentPracticeID is set only for a client workspace.
+	OrganizationType      string
+	ParentPracticeID      pgtype.UUID
 	CanManageAPIKeys      bool
 	CanManageIntegrations bool
 }
@@ -69,4 +73,29 @@ func FromContext(c *gin.Context) (User, bool) {
 	}
 	u, ok := v.(User)
 	return u, ok
+}
+
+const identityKey = "authctx_identity"
+
+// Identity is a verified session with no org resolved — enough to list the
+// person's own memberships when their active org itself is unusable.
+type Identity struct {
+	ClerkUserID string
+	ClerkOrgID  string
+}
+
+// SetIdentity stores id on c. Called once, by middleware.RequireIdentity.
+func SetIdentity(c *gin.Context, id Identity) {
+	c.Set(identityKey, id)
+}
+
+// IdentityFromContext returns the verified identity, or ok=false if
+// middleware.RequireIdentity hasn't run on this route.
+func IdentityFromContext(c *gin.Context) (Identity, bool) {
+	v, exists := c.Get(identityKey)
+	if !exists {
+		return Identity{}, false
+	}
+	id, ok := v.(Identity)
+	return id, ok
 }

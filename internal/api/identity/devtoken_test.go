@@ -76,11 +76,34 @@ func TestDevTokenHandler_MintsAVerifiableToken(t *testing.T) {
 		t.Fatal("response contained no token")
 	}
 
-	sub, err := devtoken.Verify(cfg.DevTokenSecret.Expose(), got.Data.Token)
+	sub, _, err := devtoken.Verify(cfg.DevTokenSecret.Expose(), got.Data.Token)
 	if err != nil {
 		t.Fatalf("the minted token failed devtoken.Verify: %v", err)
 	}
 	if sub != "user_abc123" {
 		t.Fatalf("verified subject = %q, want %q", sub, "user_abc123")
+	}
+}
+
+func TestDevToken_CarriesOptionalActiveOrg(t *testing.T) {
+	cfg := &config.Config{AppEnv: "development", DevTokenSecret: "dev-secret"}
+	rec := postDevToken(t, testRouter(cfg), `{"clerk_user_id":"user_abc123","clerk_org_id":"org_xyz789"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Data struct {
+			Token string `json:"token"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	_, org, err := devtoken.Verify(cfg.DevTokenSecret.Expose(), got.Data.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if org != "org_xyz789" {
+		t.Fatalf("verified org = %q, want org_xyz789", org)
 	}
 }
