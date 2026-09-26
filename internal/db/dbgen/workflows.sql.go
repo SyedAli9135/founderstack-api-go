@@ -11,6 +11,24 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const claimDueScheduledWorkflow = `-- name: ClaimDueScheduledWorkflow :one
+SELECT w.id FROM workflows w
+JOIN organizations o ON o.id = w.org_id AND o.is_active = true
+WHERE w.id = $1 AND w.trigger_type = 'scheduled' AND w.is_active = true AND w.next_run_at <= now()
+FOR UPDATE OF w SKIP LOCKED
+`
+
+// Re-checks "still due" under a row lock inside the firing transaction.
+// SKIP LOCKED means that if several API processes tick at once, each due
+// workflow is claimed by exactly one of them; the others get no row and
+// move on, so a slot never fires twice.
+func (q *Queries) ClaimDueScheduledWorkflow(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, claimDueScheduledWorkflow, id)
+	var id_2 pgtype.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const deactivateWorkflow = `-- name: DeactivateWorkflow :execrows
 UPDATE workflows SET is_active = false WHERE org_id = $1 AND id = $2 AND is_active = true
 `
@@ -133,6 +151,22 @@ func (q *Queries) GetWorkflowRun(ctx context.Context, arg GetWorkflowRunParams) 
 		&i.TriggeredBy,
 	)
 	return i, err
+}
+
+const hasInFlightRun = `-- name: HasInFlightRun :one
+SELECT EXISTS (
+    SELECT 1 FROM workflow_runs
+    WHERE workflow_id = $1 AND status IN ('pending', 'running', 'awaiting_approval')
+)::boolean
+`
+
+// Stale pending/running rows are reaped by ReapStaleRuns first, so this
+// only sees runs that are genuinely still in progress.
+func (q *Queries) HasInFlightRun(ctx context.Context, workflowID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasInFlightRun, workflowID)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const insertTeamWorkflow = `-- name: InsertTeamWorkflow :one
@@ -285,15 +319,17 @@ func (q *Queries) InsertWorkflowRun(ctx context.Context, arg InsertWorkflowRunPa
 
 const listDueScheduledWorkflows = `-- name: ListDueScheduledWorkflows :many
 
-SELECT w.id, w.org_id, w.cron_expression FROM workflows w
+SELECT w.id, w.org_id, w.agent_id, w.cron_expression, w.task_input_template FROM workflows w
 JOIN organizations o ON o.id = w.org_id AND o.is_active = true
 WHERE w.trigger_type = 'scheduled' AND w.is_active = true AND w.next_run_at <= now()
 `
 
 type ListDueScheduledWorkflowsRow struct {
-	ID             pgtype.UUID `json:"id"`
-	OrgID          pgtype.UUID `json:"org_id"`
-	CronExpression *string     `json:"cron_expression"`
+	ID                pgtype.UUID `json:"id"`
+	OrgID             pgtype.UUID `json:"org_id"`
+	AgentID           pgtype.UUID `json:"agent_id"`
+	CronExpression    *string     `json:"cron_expression"`
+	TaskInputTemplate *string     `json:"task_input_template"`
 }
 
 // Background scheduler (internal/core/workflows/scheduler.go) — app_system,
@@ -310,7 +346,13 @@ func (q *Queries) ListDueScheduledWorkflows(ctx context.Context) ([]ListDueSched
 	var items []ListDueScheduledWorkflowsRow
 	for rows.Next() {
 		var i ListDueScheduledWorkflowsRow
-		if err := rows.Scan(&i.ID, &i.OrgID, &i.CronExpression); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrgID,
+			&i.AgentID,
+			&i.CronExpression,
+			&i.TaskInputTemplate,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -400,9 +442,45 @@ func (q *Queries) ListWorkflows(ctx context.Context, orgID pgtype.UUID) ([]ListW
 	return items, nil
 }
 
-const systemInsertWorkflowRun = `-- name: SystemInsertWorkflowRun :exec
+const reapStaleRuns = `-- name: ReapStaleRuns :many
+UPDATE workflow_runs SET status = 'failed', completed_at = now()
+WHERE status IN ('pending', 'running') AND updated_at < now() - interval '1 hour'
+RETURNING id, org_id
+`
+
+type ReapStaleRunsRow struct {
+	ID    pgtype.UUID `json:"id"`
+	OrgID pgtype.UUID `json:"org_id"`
+}
+
+// Runs execute as goroutines in the API process and checkpoint (bumping
+// updated_at) at every node, so a pending/running row untouched for an hour
+// belongs to a process that died mid-run. awaiting_approval is excluded: it
+// legitimately waits on a human, and the approval-expiry job resolves it.
+func (q *Queries) ReapStaleRuns(ctx context.Context) ([]ReapStaleRunsRow, error) {
+	rows, err := q.db.Query(ctx, reapStaleRuns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ReapStaleRunsRow
+	for rows.Next() {
+		var i ReapStaleRunsRow
+		if err := rows.Scan(&i.ID, &i.OrgID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const systemInsertWorkflowRun = `-- name: SystemInsertWorkflowRun :one
 INSERT INTO workflow_runs (workflow_id, org_id, status)
 VALUES ($1, $2, 'pending')
+RETURNING id
 `
 
 type SystemInsertWorkflowRunParams struct {
@@ -414,9 +492,11 @@ type SystemInsertWorkflowRunParams struct {
 // a user, triggered this one), used because the scheduler has no
 // per-request user/org session to run InsertWorkflowRun's tenant.WithTx
 // variant under.
-func (q *Queries) SystemInsertWorkflowRun(ctx context.Context, arg SystemInsertWorkflowRunParams) error {
-	_, err := q.db.Exec(ctx, systemInsertWorkflowRun, arg.WorkflowID, arg.OrgID)
-	return err
+func (q *Queries) SystemInsertWorkflowRun(ctx context.Context, arg SystemInsertWorkflowRunParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, systemInsertWorkflowRun, arg.WorkflowID, arg.OrgID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const updateWorkflow = `-- name: UpdateWorkflow :one

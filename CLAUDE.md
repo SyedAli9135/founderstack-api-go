@@ -71,7 +71,8 @@ make vet                    # go vet ./...
 make fmt                    # gofmt -w .
 make tidy                   # go mod tidy
 
-# Local infra (Postgres :5440, Redis :6379, LocalStack :4566)
+# Local infra (Postgres :5440, Redis :6379, LocalStack :4566 — the S3 documents bucket is
+# created automatically on every LocalStack start, see localstack/init/ready.d/)
 make docker-up
 make docker-down
 
@@ -684,8 +685,28 @@ coverage.
 ### Workflow Configuration & Scheduling (workflow 8) — `internal/api/workflows`, `internal/core/workflows`
 
 CRUD over the `workflows` table (trigger type, cron schedule, pause/resume) plus a background
-scheduler that decides *when* a scheduled workflow fires. **Neither "Run Now" nor the scheduler
-executes anything** — both stop at `INSERT`ing a `pending` `workflow_runs` row; turning that into
+scheduler that decides *when* a scheduled workflow fires. **Update (2026-09-26): both now launch
+real runs** — "Run Now" was wired to workflow 9's launcher when that shipped, but the scheduler was
+missed and kept only inserting `pending` rows nothing ever executed (found during workflow 21
+validation, ~120 runs stuck). `RunScheduler` now takes a `RunLauncher` (`Preflight` + `Launch`, the
+exact pair `Handler.Run` calls). Per due workflow, inside one transaction: **claim** the row
+(`ClaimDueScheduledWorkflow` — re-checks "still due" under `FOR UPDATE ... SKIP LOCKED`, so with
+several API processes each slot fires exactly once, even if the first run has already finished),
+preflight (agents paused / no BYOK key → skip, no run row, same as "Run Now" refusing), advance
+`next_run_at`, **skip if the workflow's previous run is still in flight** (`HasInFlightRun`:
+pending/running/awaiting_approval), insert the run; after commit, `Launch` it. A skipped slot still
+advances `next_run_at` so it waits for its next slot; only an unexpected error rolls back and leaves
+it due for the next tick. Each tick first runs **`ReapStaleRuns`**: a pending/running run whose row
+hasn't been touched in an hour is marked `failed` — runs are goroutines in the API process that
+checkpoint (bumping `updated_at`) at every node, so such a row belongs to a process that died
+mid-run; without this it would count as active forever and block its schedule. `awaiting_approval`
+is never reaped (it legitimately waits; the approval-expiry job resolves it). The claim's lock is
+proven by `TestClaimDueScheduledWorkflow_ExclusiveAndRechecksDue`, which fails if `SKIP LOCKED` is
+removed — note `TestTick_ConcurrentTicksFireASlotExactlyOnce` alone does *not* prove it (the
+in-flight guard masks a missing lock when the first run hasn't finished yet). All of it live-verified
+2026-09-26: launch → completed, no-key and agents-paused skips, overlap skip while awaiting approval,
+approval rejected in the UI → run resumed and completed, a dead run reaped. The original text below describes the pre-workflow-9 boundary: **Neither "Run Now" nor
+the scheduler executed anything** — both stop at `INSERT`ing a `pending` `workflow_runs` row; turning that into
 an actual run (calling the LLM, executing tools) is workflow 9's job (`internal/core/graph`, not
 built). This is a deliberate, documented boundary carried over from workflow 7's "config only, no
 execution" precedent, not an oversight — a founder clicking "Run Now" today gets a real, durable
@@ -2006,12 +2027,20 @@ org became a separate practice with a client workspace D, the main account was a
 and in D it got `NOT_A_PRACTICE_MEMBER` (UI: "Portfolio unavailable") while its own practice's
 portfolio never showed D. **Workflow 21 is fully live-verified.**
 
-**Two pre-existing gaps surfaced by that pass (not workflow 21):** (1) **scheduled workflows never
-execute** — `internal/core/workflows/scheduler.go` (workflow 8, pre-dates the engine) only inserts a
-`pending` `workflow_runs` row and never hands it to the launcher, so every scheduled run sits pending
-forever and counts as an "active run"; (2) the LocalStack `founderstack-documents` bucket isn't
-created by anything — after a LocalStack restart every upload 500s ("Could not store the uploaded
-file") until `docker exec founderstack-api-localstack-1 awslocal s3 mb s3://founderstack-documents`.
+**Two pre-existing gaps surfaced by that pass (not workflow 21), both fixed 2026-09-26:** (1)
+scheduled workflows never executed — see the update at the top of "Workflow Configuration &
+Scheduling (workflow 8)"; the ~120 stale never-started scheduled runs were marked `failed`. (2) the
+LocalStack `founderstack-documents` bucket was created by nothing, so every upload 500'd after a
+LocalStack restart — `localstack/init/ready.d/create-buckets.sh` (mounted by
+`docker-compose.local.yml`) now creates `$S3_BUCKET_DOCUMENTS` whenever LocalStack becomes ready.
+**Uploaded files still don't survive a restart**: the dev LocalStack license is the free "freemium"
+tier, which silently ignores `PERSISTENCE=1` (tried and verified — `/var/lib/localstack/state` stays
+empty). Existing `documents` rows then point at missing S3 objects (search still works from
+Pinecone; download/reindex fail) until the file is re-uploaded or copied back with `awslocal s3 cp`
+to the row's `s3_path`. Real persistence would need a paid LocalStack tier or a different local S3
+(e.g. MinIO — the Go code needs no change, `AWS_S3_ENDPOINT_URL` is already configurable).
+Note the compose project is shared with the Python repo (see "Shared local Postgres"), whose own
+compose file doesn't mount this script — start infra from this repo to get it.
 
 ### No ORM — `pgx` + `sqlc`, not GORM
 

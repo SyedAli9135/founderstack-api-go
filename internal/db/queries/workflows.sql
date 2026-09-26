@@ -127,17 +127,45 @@ SELECT id, workflow_id, status, triggered_by FROM workflow_runs WHERE org_id = $
 -- The org join keeps a deactivated org (e.g. a removed client workspace)
 -- from running scheduled work — and spending its BYOK key — while it waits
 -- out its restore window.
-SELECT w.id, w.org_id, w.cron_expression FROM workflows w
+SELECT w.id, w.org_id, w.agent_id, w.cron_expression, w.task_input_template FROM workflows w
 JOIN organizations o ON o.id = w.org_id AND o.is_active = true
 WHERE w.trigger_type = 'scheduled' AND w.is_active = true AND w.next_run_at <= now();
 
 -- name: UpdateWorkflowNextRunAt :exec
 UPDATE workflows SET next_run_at = $2 WHERE id = $1;
 
--- name: SystemInsertWorkflowRun :exec
+-- name: SystemInsertWorkflowRun :one
 -- Same shape as InsertWorkflowRun (triggered_by is NULL — the system, not
 -- a user, triggered this one), used because the scheduler has no
 -- per-request user/org session to run InsertWorkflowRun's tenant.WithTx
 -- variant under.
 INSERT INTO workflow_runs (workflow_id, org_id, status)
-VALUES ($1, $2, 'pending');
+VALUES ($1, $2, 'pending')
+RETURNING id;
+
+-- name: ClaimDueScheduledWorkflow :one
+-- Re-checks "still due" under a row lock inside the firing transaction.
+-- SKIP LOCKED means that if several API processes tick at once, each due
+-- workflow is claimed by exactly one of them; the others get no row and
+-- move on, so a slot never fires twice.
+SELECT w.id FROM workflows w
+JOIN organizations o ON o.id = w.org_id AND o.is_active = true
+WHERE w.id = $1 AND w.trigger_type = 'scheduled' AND w.is_active = true AND w.next_run_at <= now()
+FOR UPDATE OF w SKIP LOCKED;
+
+-- name: HasInFlightRun :one
+-- Stale pending/running rows are reaped by ReapStaleRuns first, so this
+-- only sees runs that are genuinely still in progress.
+SELECT EXISTS (
+    SELECT 1 FROM workflow_runs
+    WHERE workflow_id = $1 AND status IN ('pending', 'running', 'awaiting_approval')
+)::boolean;
+
+-- name: ReapStaleRuns :many
+-- Runs execute as goroutines in the API process and checkpoint (bumping
+-- updated_at) at every node, so a pending/running row untouched for an hour
+-- belongs to a process that died mid-run. awaiting_approval is excluded: it
+-- legitimately waits on a human, and the approval-expiry job resolves it.
+UPDATE workflow_runs SET status = 'failed', completed_at = now()
+WHERE status IN ('pending', 'running') AND updated_at < now() - interval '1 hour'
+RETURNING id, org_id;

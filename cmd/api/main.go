@@ -192,7 +192,7 @@ func run() error {
 	// ctx is cancelled by the same SIGINT/SIGTERM the HTTP server shuts
 	// down on.
 	go integrations.RunRefreshJob(ctx, systemPool, encryptionKey, integrationsRegistry)
-	go coreworkflows.RunScheduler(ctx, systemPool)
+	go coreworkflows.RunScheduler(ctx, systemPool, launcher)
 	go coreworkflows.RunApprovalExpiryJob(ctx, systemPool, launcher)
 	go coredigest.RunScheduler(ctx, systemPool, emailSender, digestTokens, cfg.AppBaseURL)
 

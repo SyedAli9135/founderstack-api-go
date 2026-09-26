@@ -11,6 +11,11 @@ import (
 )
 
 type Querier interface {
+	// Re-checks "still due" under a row lock inside the firing transaction.
+	// SKIP LOCKED means that if several API processes tick at once, each due
+	// workflow is claimed by exactly one of them; the others get no row and
+	// move on, so a slot never fires twice.
+	ClaimDueScheduledWorkflow(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
 	// Only clears active_api_key_id/llm_provider when provider is the org's
 	// *currently active* provider — with multiple providers now storable per
 	// org, deactivating a non-active provider's key must not clobber a
@@ -233,6 +238,9 @@ type Querier interface {
 	// Only called after purgeDocumentJob has successfully removed the
 	// Pinecone vectors and the S3 object — see internal/core/documents/purge.go.
 	HardDeleteDocument(ctx context.Context, arg HardDeleteDocumentParams) error
+	// Stale pending/running rows are reaped by ReapStaleRuns first, so this
+	// only sees runs that are genuinely still in progress.
+	HasInFlightRun(ctx context.Context, workflowID pgtype.UUID) (bool, error)
 	IncrementOrgTotalHoursSaved(ctx context.Context, arg IncrementOrgTotalHoursSavedParams) error
 	// ON CONFLICT ... DO NOTHING against the partial unique index added in
 	// 000006_agents_unique_org_name_active: a real duplicate name returns 0
@@ -495,6 +503,11 @@ type Querier interface {
 	// written, so this writes the terminal status directly.
 	MarkRunFailedPreflight(ctx context.Context, arg MarkRunFailedPreflightParams) error
 	MarkRunStarted(ctx context.Context, arg MarkRunStartedParams) error
+	// Runs execute as goroutines in the API process and checkpoint (bumping
+	// updated_at) at every node, so a pending/running row untouched for an hour
+	// belongs to a process that died mid-run. awaiting_approval is excluded: it
+	// legitimately waits on a human, and the approval-expiry job resolves it.
+	ReapStaleRuns(ctx context.Context) ([]ReapStaleRunsRow, error)
 	RestoreClientWorkspace(ctx context.Context, arg RestoreClientWorkspaceParams) (int64, error)
 	RevokeConnection(ctx context.Context, arg RevokeConnectionParams) (int64, error)
 	SetOrganizationActiveApiKey(ctx context.Context, arg SetOrganizationActiveApiKeyParams) error
@@ -509,7 +522,7 @@ type Querier interface {
 	// a user, triggered this one), used because the scheduler has no
 	// per-request user/org session to run InsertWorkflowRun's tenant.WithTx
 	// variant under.
-	SystemInsertWorkflowRun(ctx context.Context, arg SystemInsertWorkflowRunParams) error
+	SystemInsertWorkflowRun(ctx context.Context, arg SystemInsertWorkflowRunParams) (pgtype.UUID, error)
 	// Best-effort, fire-and-forget from RequireAuth — the WHERE guard keeps
 	// this to one write per user per 5 minutes, not one per request.
 	TouchLastLogin(ctx context.Context, id pgtype.UUID) error

@@ -36,6 +36,11 @@ services:
       - DEBUG=1
       - DOCKER_HOST=unix:///var/run/docker.sock
       - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN- }
+      - S3_BUCKET_DOCUMENTS=${S3_BUCKET_DOCUMENTS:-founderstack-documents}
+    volumes:
+      # Scripts here run once LocalStack is ready — creates the documents
+      # bucket on every start, since LocalStack itself keeps no state.
+      - ./localstack/init/ready.d:/etc/localstack/init/ready.d
 
 volumes:
   db_data:
