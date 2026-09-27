@@ -126,6 +126,25 @@ type AuditLog struct {
 	MetadataInfo []byte             `json:"metadata_info"`
 }
 
+type ClientReport struct {
+	ID              pgtype.UUID        `json:"id"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	OrgID           pgtype.UUID        `json:"org_id"`
+	CreatedByUserID pgtype.UUID        `json:"created_by_user_id"`
+	Title           string             `json:"title"`
+	DateFrom        pgtype.Date        `json:"date_from"`
+	DateTo          pgtype.Date        `json:"date_to"`
+	Timezone        string             `json:"timezone"`
+	VisibleSections []byte             `json:"visible_sections"`
+	Snapshot        []byte             `json:"snapshot"`
+	ShareToken      string             `json:"share_token"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	ViewCount       int32              `json:"view_count"`
+	LastViewedAt    pgtype.Timestamptz `json:"last_viewed_at"`
+	IsRevoked       bool               `json:"is_revoked"`
+}
+
 type CostLedger struct {
 	ID               pgtype.UUID        `json:"id"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`

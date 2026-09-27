@@ -24,7 +24,7 @@ Anthropic-only original). See "BYOK API Keys" below.
 
 **Workflows 1 (bootstrap) through 14 (token usage & analytics), plus workflows 16 (disconnect/
 reconnect integration), 17 (view audit logs), 18 (multi-agent team run / A2A), 19 (agent
-templates marketplace), 20 (daily email digest), 21 (practice & client workspaces), and 22 (SOP library), are implemented — workflows 18/19/20's own
+templates marketplace), 20 (daily email digest), 21 (practice & client workspaces), 22 (SOP library), and 23 (client reports), are implemented — workflows 18/19/20's own
 frontends (team pages, the templates gallery, the digest settings card) live in
 `../founderstack-web`, its own repo, per this codebase's usual backend/frontend split; see that
 repo's `AGENTS.md` for its own detail.
@@ -37,7 +37,7 @@ to build against fabricated inputs. Workflow 14
 Analytics (workflow 14)", "Disconnect / Reconnect Integration (workflow 16)", "View Audit Logs
 (workflow 17)", "Multi-Agent Team Run / A2A (workflow 18)", "Agent Templates Marketplace
 (workflow 19)", and "Daily Email Digest (workflow 20)" below. Don't assume routes, tables, or
-packages from workflow 23+ in
+packages from workflow 24+ in
 `WORKFLOW_PLAN_GO.md` exist — check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
@@ -2100,6 +2100,52 @@ fired by the scheduler with its rendered input. Live-verified in the browser
 2026-09-26 against the real tool catalog in mock mode, including a deployed workflow actually
 running with its rendered task input.
 
+### Client-Facing Reports & Sharing (workflow 23) — `internal/api/reports`
+
+Built 2026-09-27. An operator generates a report for one workspace over a date window and shares
+it by an unguessable link that needs no login (`GET /api/public/reports/{token}`). Migration
+`000020` (`client_reports`, RLS on `org_id`).
+
+**A report is a frozen snapshot, not a live query** (`client_reports.snapshot`, a column the plan
+didn't list): the client sees exactly the numbers the operator previewed, and the public endpoint
+never runs aggregation against tenant data. **Hidden sections are never computed or stored** —
+`buildSnapshot` only queries cost/tokens/runs when `visible_sections` asks for them, so no later
+bug can leak an operator's margins through the link. The public payload also omits
+`visible_sections` itself: "cost: false" would reveal a withheld view; the page renders a section
+iff it's in the snapshot. The window is `[date_from 00:00, date_to+1 00:00)` in the workspace's
+`digest_timezone`, so "September" is the client's September; runs are counted once per end-to-end
+task (`parent_run_id IS NULL`), a team run's cost includes its specialists' sub-runs.
+
+**Who can do what:** create/list/preview/revoke require owner/admin of the reported workspace —
+any workspace, not just a practice's clients (a founder can report on their own org). Aggregation
+and the insert run under `tenant.WithTx` on that workspace; the cross-workspace list and the token
+lookup use `app_system`, pinned to the caller's owner/admin memberships or the token. Create and
+revoke write `report.created`/`report.revoked` audit rows. The operator's preview
+(`GET /reports/{id}`) never counts as a client view.
+
+**The public endpoint:** missing, revoked, expired and deactivated-workspace tokens all return the
+identical `404 REPORT_NOT_AVAILABLE` (never reveal whether a token existed); valid views bump
+`view_count`/`last_viewed_at` and are served `Cache-Control: no-store` + `X-Robots-Tag: noindex`.
+Tokens are 24 `crypto/rand` bytes, URL-safe base64 (32 chars). **Rate limit:** 30/min per client IP
+via a Redis fixed window (`RedisLimiter`, works across API processes, fails open on Redis errors —
+192-bit tokens make it defence in depth). **Client IP is only trustworthy because of
+`TRUSTED_PROXIES`** (new, `router.SetTrustedProxies`): Gin trusts every proxy's `X-Forwarded-For`
+by default, which let any caller spoof a new IP per request; empty now trusts none. Set it to the
+load balancer's range in production. Live-verified: 35 requests with a different forged
+`X-Forwarded-For` each still hit 429 after the limit.
+
+**Found while building this — a pre-existing config bug, fixed:** viper only unmarshals env vars
+for keys in `Load`'s defaults map, and `DIGEST_UNSUBSCRIBE_SECRET` (workflow 20) was never added —
+so it never loaded, and every digest's unsubscribe link was dead even when configured.
+`TestLoad_EveryStringFieldIsLoadableFromEnv` now sets every string field's env var and fails for
+any field missing from the defaults map.
+
+**Testing**: `internal/api/reports/handler_integration_test.go` (outcomes-only default stores
+nothing hidden, opted-in sections, timezone boundary, tenant isolation, public view counting and
+no-store, revoke/expired/unknown uniformity, statuses, audit, access, validation, 429, and a real
+Redis limiter ignoring spoofed `X-Forwarded-For`), `snapshot_test.go` (window, status, token).
+Live-verified in a real browser 2026-09-27.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -2366,9 +2412,11 @@ machine — CI runs the authoritative version of the same check regardless.
 | `GET /api/v1/practice/portfolio-summary` | `internal/api/practice/handler.go` | `middleware.RequireAuth` | Rolled-up hours saved / active runs / pending approvals / cost across active client workspaces (workflow 21) |
 | `GET/POST /api/v1/practice/sops`, `GET /practice/sops/tools`, `GET/PATCH/DELETE /practice/sops/{id}` | `internal/api/practice/sops.go` | `middleware.RequireAuth` (+practice owner/admin on writes) | SOP library: list, create (scratch or from an existing agent), versioned edit, detach-on-delete, full tool catalog (workflow 22) |
 | `POST /api/v1/practice/sops/{id}/deploy`, `GET .../deployments`, `PATCH/DELETE .../deployments/{deployment_id}`, `POST .../deployments/{deployment_id}/sync` | `internal/api/practice/sops.go` | `middleware.RequireAuth` (+practice and target-workspace owner/admin) | Deploy a SOP to a client workspace, per-client overrides, sync to latest version, un-deploy (workflow 22) |
+| `POST/GET /api/v1/reports`, `GET/DELETE /api/v1/reports/{id}` | `internal/api/reports/handler.go` | `middleware.RequireAuth` (+owner/admin of the reported workspace) | Generate a client report snapshot + share link, list across administered workspaces, preview, revoke (workflow 23) |
+| `GET /api/public/reports/{token}` | `internal/api/reports/handler.go` (`RegisterPublic`) | none — unguessable token, per-IP rate limit | The client's no-login view of a shared report (workflow 23) |
 
 (Workflow 15 is deliberately deferred — see that section's own scope note. Everything else in
-`WORKFLOW_PLAN_GO.md` — workflow 23 onward — is unbuilt. Add rows here as routers land.)
+`WORKFLOW_PLAN_GO.md` — workflow 24 onward — is unbuilt. Add rows here as routers land.)
 
 ### Dependency policy
 
@@ -2456,6 +2504,11 @@ any/all of them blank, just with that one notification channel degrading to a lo
 "Human Approval Gate (workflow 10)" above). `DIGEST_UNSUBSCRIBE_SECRET` (workflow 20) is the same
 shape again: unset just means every digest email's unsubscribe link is dead until it's set, the
 digest itself still sends fine (reusing the same `BREVO_API_KEY`/`BREVO_FROM_EMAIL` as workflow 10).
+
+`TRUSTED_PROXIES` (workflow 23) is optional too: empty trusts no proxy's `X-Forwarded-For`; set it
+to the load balancer's IPs/CIDRs in production so client IPs (and the public report rate limit)
+are correct. **Any new optional setting must also be added to `Load`'s defaults map** or viper
+never reads it — `TestLoad_EveryStringFieldIsLoadableFromEnv` enforces this for string fields.
 
 `DEV_TOKEN_SECRET` is deliberately **not** in that required list — it's local-testing-only
 (see "Authentication" above) and should stay unset everywhere real, including production.

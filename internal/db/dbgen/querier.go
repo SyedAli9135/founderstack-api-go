@@ -133,6 +133,10 @@ type Querier interface {
 	// follows still goes through the normal org-scoped path once org_id is
 	// known from this row.
 	GetApprovalSystemScoped(ctx context.Context, id pgtype.UUID) (GetApprovalSystemScopedRow, error)
+	// Public, unauthenticated lookup. The handler treats missing, revoked,
+	// expired, and deactivated-workspace identically.
+	GetClientReportByToken(ctx context.Context, shareToken string) (GetClientReportByTokenRow, error)
+	GetClientReportForUser(ctx context.Context, arg GetClientReportForUserParams) (GetClientReportForUserRow, error)
 	GetClientWorkspaceForCaller(ctx context.Context, arg GetClientWorkspaceForCallerParams) (GetClientWorkspaceForCallerRow, error)
 	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
 	// Workflow 14 (token usage & analytics). All read-only, all against
@@ -202,6 +206,19 @@ type Querier interface {
 	// avg_rerank_score/avg_chunks_retrieved, which is the correct average,
 	// not a value worth excluding.
 	GetRagQualityStats(ctx context.Context, arg GetRagQualityStatsParams) (GetRagQualityStatsRow, error)
+	GetReportCostTotals(ctx context.Context, arg GetReportCostTotalsParams) (GetReportCostTotalsRow, error)
+	// System pool (app_system) below.
+	// prepared_by: the practice a client workspace belongs to, else the org itself.
+	GetReportOrgInfo(ctx context.Context, id pgtype.UUID) (GetReportOrgInfoRow, error)
+	// Workflow 23 (Client-Facing Reports & Sharing).
+	//
+	// Report *data* is aggregated under tenant.WithTx on the reported workspace
+	// (app_user + RLS), so a report can only ever contain that tenant's rows.
+	// Windows are half-open [from, to) timestamps the handler computes from the
+	// report's date range in the workspace's own timezone.
+	// parent_run_id IS NULL counts each end-to-end task once (a team run's
+	// specialist sub-runs aren't separate outcomes), same as the digest.
+	GetReportRunSummary(ctx context.Context, arg GetReportRunSummaryParams) (GetReportRunSummaryRow, error)
 	// Resolves a run's agent_id via its workflow — Launcher.Resume needs this
 	// before it can rebuild the RunDeps/Nodes a suspended run's checkpoint
 	// alone doesn't carry (agent_id isn't part of RunState's own JSON).
@@ -288,6 +305,7 @@ type Querier interface {
 	// job (see WORKFLOW_PLAN_GO.md) — estimated_cost_usd is written as 0 for
 	// now; token counts themselves are real and useful on their own.
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
+	InsertClientReport(ctx context.Context, arg InsertClientReportParams) (InsertClientReportRow, error)
 	InsertCostLedgerEntry(ctx context.Context, arg InsertCostLedgerEntryParams) error
 	// Queries backing workflow 6 (document upload / RAG). Tenant-scoped reads
 	// and writes run through app_user via tenant.WithTx, same convention as
@@ -405,6 +423,9 @@ type Querier interface {
 	// InsertTeamWorkflowRun), so no join back to agent_team_members is needed
 	// (and wouldn't survive a member later being removed from the team).
 	ListChildRuns(ctx context.Context, arg ListChildRunsParams) ([]ListChildRunsRow, error)
+	// Operator-side list: only reports of workspaces where the caller is an
+	// active owner/admin. target_org_id NULL lists across all of them.
+	ListClientReportsForUser(ctx context.Context, arg ListClientReportsForUserParams) ([]ListClientReportsForUserRow, error)
 	// Includes deactivated workspaces (still inside or past their restore
 	// window) so the portfolio page can offer a restore; the handler decides
 	// restorability from deactivated_at.
@@ -457,6 +478,11 @@ type Querier interface {
 	// 7 days (skips ghost emails to churned/empty orgs, per spec).
 	ListOrgsDueForDigest(ctx context.Context) ([]ListOrgsDueForDigestRow, error)
 	ListPushSubscriptionsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListPushSubscriptionsForOrgRow, error)
+	ListReportCostByAgent(ctx context.Context, arg ListReportCostByAgentParams) ([]ListReportCostByAgentRow, error)
+	// cost_usd includes a team run's specialist sub-runs, so one row carries the
+	// whole task's cost.
+	ListReportRuns(ctx context.Context, arg ListReportRunsParams) ([]ListReportRunsRow, error)
+	ListReportWorkflowOutcomes(ctx context.Context, arg ListReportWorkflowOutcomesParams) ([]ListReportWorkflowOutcomesRow, error)
 	// parent_run_id IS NULL excludes a team's specialist sub-runs from the
 	// flat run list — a founder browsing "my runs" sees the team run as one
 	// row; its specialists only surface via GET /teams/{id}/runs/{run_id}'s
@@ -554,7 +580,9 @@ type Querier interface {
 	// belongs to a process that died mid-run. awaiting_approval is excluded: it
 	// legitimately waits on a human, and the approval-expiry job resolves it.
 	ReapStaleRuns(ctx context.Context) ([]ReapStaleRunsRow, error)
+	RecordClientReportView(ctx context.Context, id pgtype.UUID) error
 	RestoreClientWorkspace(ctx context.Context, arg RestoreClientWorkspaceParams) (int64, error)
+	RevokeClientReport(ctx context.Context, arg RevokeClientReportParams) (int64, error)
 	RevokeConnection(ctx context.Context, arg RevokeConnectionParams) (int64, error)
 	SetOrganizationActiveApiKey(ctx context.Context, arg SetOrganizationActiveApiKeyParams) error
 	SoftDeleteDocument(ctx context.Context, arg SoftDeleteDocumentParams) error

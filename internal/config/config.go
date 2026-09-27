@@ -120,6 +120,24 @@ type Config struct {
 	// every digest email's unsubscribe link degrading to empty (see
 	// notify.DigestTokenSigner.Sign's own empty-secret guard).
 	DigestUnsubscribeSecret secret.Value `mapstructure:"DIGEST_UNSUBSCRIBE_SECRET"`
+
+	// TrustedProxies is a comma-separated list of proxy IPs/CIDRs whose
+	// X-Forwarded-For Gin may believe. Empty (the default) trusts none, so
+	// the client IP is the connection's own address and a caller can't
+	// spoof a fresh IP per request to dodge workflow 23's per-IP rate limit
+	// on public report links. Set it to the load balancer's range in production.
+	TrustedProxies string `mapstructure:"TRUSTED_PROXIES"`
+}
+
+// TrustedProxyList splits TrustedProxies; nil means trust no proxy.
+func (c *Config) TrustedProxyList() []string {
+	var out []string
+	for _, p := range strings.Split(c.TrustedProxies, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // requiredFields lists the mapstructure keys that must resolve to a
@@ -207,6 +225,8 @@ func Load() (*Config, error) {
 		"WEBPUSH_VAPID_SUBJECT":     "",
 		"PUSH_ACTION_TOKEN_SECRET":  "",
 		"A2A_TASK_TOKEN_SECRET":     "",
+		"DIGEST_UNSUBSCRIBE_SECRET": "",
+		"TRUSTED_PROXIES":           "",
 	}
 	for key, def := range defaults {
 		v.SetDefault(key, def)

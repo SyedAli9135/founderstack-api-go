@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -124,5 +125,37 @@ func TestIsProduction(t *testing.T) {
 				t.Errorf("IsProduction() with AppEnv=%q = %v, want %v", tc.appEnv, got, tc.want)
 			}
 		})
+	}
+}
+
+// Viper only unmarshals env vars for keys it knows (the defaults map), so a
+// field added to Config without a defaults entry silently never loads. This
+// sets every string/secret field's env var and checks it arrives.
+func TestLoad_EveryStringFieldIsLoadableFromEnv(t *testing.T) {
+	setAllRequired(t)
+	typ := reflect.TypeOf(Config{})
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		key := f.Tag.Get("mapstructure")
+		if key == "" || (f.Type.Kind() != reflect.String) {
+			continue
+		}
+		t.Setenv(key, "set-"+key)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	val := reflect.ValueOf(*cfg)
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		key := f.Tag.Get("mapstructure")
+		if key == "" || f.Type.Kind() != reflect.String {
+			continue
+		}
+		if got := val.Field(i).String(); got != "set-"+key {
+			t.Errorf("%s (%s) = %q after setting its env var — missing from Load's defaults map?", f.Name, key, got)
+		}
 	}
 }

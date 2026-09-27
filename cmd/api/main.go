@@ -36,6 +36,7 @@ import (
 	"github.com/founderstack/api/internal/api/middleware"
 	"github.com/founderstack/api/internal/api/org"
 	practiceapi "github.com/founderstack/api/internal/api/practice"
+	reportsapi "github.com/founderstack/api/internal/api/reports"
 	runsapi "github.com/founderstack/api/internal/api/runs"
 	"github.com/founderstack/api/internal/api/settings"
 	teamsapi "github.com/founderstack/api/internal/api/teams"
@@ -271,6 +272,12 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	}
 
 	router := gin.New()
+	// Gin trusts every proxy's X-Forwarded-For by default, which would let a
+	// caller spoof a new IP per request past the public report rate limit.
+	if err := router.SetTrustedProxies(cfg.TrustedProxyList()); err != nil {
+		slog.Error("invalid TRUSTED_PROXIES; trusting no proxies", "error", err)
+		_ = router.SetTrustedProxies(nil)
+	}
 	router.Use(middleware.RequestID())
 	router.Use(middleware.Recovery(cfg))
 	router.Use(cors.New(corsConfig(cfg)))
@@ -392,6 +399,14 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiIdentity := router.Group("/api/v1")
 	apiIdentity.Use(middleware.RequireIdentity(cfg))
 	practiceHandler.RegisterIdentityOnly(apiIdentity)
+
+	// 30 views a minute per IP on the public share link; the only
+	// unauthenticated read of tenant data in the API.
+	reportsHandler := reportsapi.NewHandler(db, systemDB, reportsapi.NewRedisLimiter(rdb, 30, time.Minute))
+	apiReports := router.Group("/api/v1")
+	apiReports.Use(middleware.RequireAuth(systemDB, cfg))
+	reportsHandler.Register(apiReports)
+	reportsHandler.RegisterPublic(router.Group("/api/public"))
 
 	return router
 }
