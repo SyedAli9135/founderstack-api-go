@@ -11,6 +11,7 @@ import (
 )
 
 type Querier interface {
+	ApplySubscriptionState(ctx context.Context, arg ApplySubscriptionStateParams) error
 	// The row lock this UPDATE takes serializes concurrent edits, and
 	// sop_playbook_versions' UNIQUE(sop_playbook_id, version) backs it up.
 	BumpSopPlaybookVersion(ctx context.Context, arg BumpSopPlaybookVersionParams) (int32, error)
@@ -26,6 +27,7 @@ type Querier interface {
 	ClearOrganizationActiveApiKeyForProvider(ctx context.Context, arg ClearOrganizationActiveApiKeyForProviderParams) error
 	CountActiveAgents(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	CountActiveClientWorkspaces(ctx context.Context, parentPracticeID pgtype.UUID) (int64, error)
+	CountActiveWorkflows(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	CountCostLedger(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	// Soft delete — is_active=false, row stays for run history (Workflow 9+).
 	// :execrows (not :exec) so the handler can distinguish "deactivated" from
@@ -177,6 +179,9 @@ type Querier interface {
 	GetHoursSavedSince(ctx context.Context, arg GetHoursSavedSinceParams) (float64, error)
 	GetKeyStatusByProvider(ctx context.Context, arg GetKeyStatusByProviderParams) (GetKeyStatusByProviderRow, error)
 	GetOrgApprovalsSlackChannel(ctx context.Context, id pgtype.UUID) (*string, error)
+	GetOrgBilling(ctx context.Context, id pgtype.UUID) (GetOrgBillingRow, error)
+	GetOrgBillingUsage(ctx context.Context, orgID pgtype.UUID) (GetOrgBillingUsageRow, error)
+	GetOrgIDByStripeCustomer(ctx context.Context, stripeCustomerID *string) (pgtype.UUID, error)
 	// Confirms the target member belongs to the caller's own org (cross-org
 	// access is a 404 here, same "wrong org is indistinguishable from doesn't
 	// exist" convention as every other tenant-scoped lookup in this codebase)
@@ -191,9 +196,11 @@ type Querier interface {
 	// (GET /runs, GET /runs/{id}).
 	// Preflight (kill switch) + provider resolution for Launcher.Launch.
 	GetOrgRunSettings(ctx context.Context, id pgtype.UUID) (GetOrgRunSettingsRow, error)
+	GetOrgStorageAllowance(ctx context.Context, id pgtype.UUID) (GetOrgStorageAllowanceRow, error)
 	GetOrgTotalHoursSaved(ctx context.Context, id pgtype.UUID) (float64, error)
 	GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID string) (pgtype.UUID, error)
 	GetOrganizationMaxAgents(ctx context.Context, id pgtype.UUID) (*int32, error)
+	GetOrganizationMaxWorkflows(ctx context.Context, id pgtype.UUID) (*int32, error)
 	GetPortfolioSummary(ctx context.Context, arg GetPortfolioSummaryParams) (GetPortfolioSummaryRow, error)
 	// Row lock serializes concurrent creates against the same practice, so two
 	// simultaneous requests can't both pass the max_client_workspaces check.
@@ -466,6 +473,7 @@ type Querier interface {
 	// false (not SQL NULL) when llm_provider is unset, so the generated Go
 	// field is a plain bool, not a nullable pointer.
 	ListKeyStatuses(ctx context.Context, orgID pgtype.UUID) ([]ListKeyStatusesRow, error)
+	ListOrgBillingContacts(ctx context.Context, orgID pgtype.UUID) ([]ListOrgBillingContactsRow, error)
 	// Workflow 13 (team members & roles). Postgres — kept in sync by the Clerk
 	// webhook (clerk_sync.sql) — is this app's own source of truth for role
 	// display; internal/api/org/handler.go doesn't call out to Clerk's API on
@@ -560,6 +568,9 @@ type Querier interface {
 	// without that join.
 	// Backs the workspace switcher: every active org the person belongs to.
 	ListWorkspacesForClerkUser(ctx context.Context, clerkUserID string) ([]ListWorkspacesForClerkUserRow, error)
+	// Serializes concurrent webhook deliveries for one org, so "which
+	// subscription is current" is decided against the latest row.
+	LockOrgSubscription(ctx context.Context, id pgtype.UUID) (LockOrgSubscriptionRow, error)
 	MarkConnectionExpired(ctx context.Context, arg MarkConnectionExpiredParams) (int64, error)
 	MarkConnectionExpiredByIDSystem(ctx context.Context, id pgtype.UUID) (int64, error)
 	MarkDigestSent(ctx context.Context, id pgtype.UUID) error
@@ -581,9 +592,12 @@ type Querier interface {
 	// legitimately waits on a human, and the approval-expiry job resolves it.
 	ReapStaleRuns(ctx context.Context) ([]ReapStaleRunsRow, error)
 	RecordClientReportView(ctx context.Context, id pgtype.UUID) error
+	// Returns no row when the event was already processed (a redelivery).
+	RecordStripeEvent(ctx context.Context, arg RecordStripeEventParams) (string, error)
 	RestoreClientWorkspace(ctx context.Context, arg RestoreClientWorkspaceParams) (int64, error)
 	RevokeClientReport(ctx context.Context, arg RevokeClientReportParams) (int64, error)
 	RevokeConnection(ctx context.Context, arg RevokeConnectionParams) (int64, error)
+	SetOrgStripeCustomer(ctx context.Context, arg SetOrgStripeCustomerParams) error
 	SetOrganizationActiveApiKey(ctx context.Context, arg SetOrganizationActiveApiKeyParams) error
 	SoftDeleteDocument(ctx context.Context, arg SoftDeleteDocumentParams) error
 	// A single membership removal: only this org's row, never the person's

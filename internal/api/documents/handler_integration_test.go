@@ -970,3 +970,45 @@ func testOrgAndUserAsMemberOf(t *testing.T, systemPool *pgxpool.Pool, orgID pgty
 	}
 	return orgID, clerkUserID
 }
+
+func TestDocumentsHandler_UploadRespectsPlanStorage(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	orgID, clerkUserID := testOrgAndUser(t, systemPool)
+	store := newFakeBlobStore()
+	processor := coredocs.NewProcessor(appPool, store, fakeEmbedder{}, fakeVectorIndex{})
+	router := testRouter(t, systemPool, appPool, cfg, store, processor)
+
+	// 1 GB plan, 1 GB already used (a row being deleted doesn't count).
+	ctx := context.Background()
+	if _, err := systemPool.Exec(ctx, `update organizations set max_rag_storage_gb = 1 where id = $1`, orgID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := systemPool.Exec(ctx, `insert into documents (org_id, filename, s3_path, byte_size, processing_status)
+		values ($1, 'big.pdf', 'k1', $2, 'completed'), ($1, 'gone.pdf', 'k2', $2, 'deleting')`, orgID, 1<<30); err != nil {
+		t.Fatal(err)
+	}
+
+	upload := func() *httptest.ResponseRecorder {
+		body, ct := multipartUploadBody(t, "notes.txt", "", []byte("hello"))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/documents/upload", body, ct))
+		return rec
+	}
+	rec := upload()
+	if rec.Code != http.StatusBadRequest || !bytes.Contains(rec.Body.Bytes(), []byte("PLAN_LIMIT_REACHED")) {
+		t.Fatalf("upload over the storage limit: %d %s", rec.Code, rec.Body)
+	}
+	if len(store.objects) != 0 {
+		t.Fatal("a rejected upload must not reach S3")
+	}
+
+	// An upgrade raising the allowance takes effect on the next upload.
+	if _, err := systemPool.Exec(ctx, `update organizations set max_rag_storage_gb = 25 where id = $1`, orgID); err != nil {
+		t.Fatal(err)
+	}
+	if rec := upload(); rec.Code >= 300 {
+		t.Fatalf("upload after raising the limit: %d %s", rec.Code, rec.Body)
+	}
+}

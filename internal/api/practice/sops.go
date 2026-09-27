@@ -1,6 +1,7 @@
 package practice
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/founderstack/api/internal/api/authctx"
 	"github.com/founderstack/api/internal/api/response"
+	corebilling "github.com/founderstack/api/internal/core/billing"
 	"github.com/founderstack/api/internal/core/sop"
 	"github.com/founderstack/api/internal/db/dbgen"
 	"github.com/founderstack/api/internal/db/tenant"
@@ -699,6 +701,7 @@ type deployRequest struct {
 var (
 	errAlreadyDeployed = errors.New("sop: already deployed")
 	errAgentLimit      = errors.New("sop: agent plan limit reached")
+	errWorkflowLimit   = errors.New("sop: workflow plan limit reached")
 	errAgentNameTaken  = errors.New("sop: agent name taken")
 	errAgentRemoved    = errors.New("sop: deployed agent removed")
 )
@@ -759,6 +762,11 @@ func (h *Handler) DeploySop(c *gin.Context) {
 		if maxAgents != nil && count >= int64(*maxAgents) {
 			return errAgentLimit
 		}
+		if workflow != nil {
+			if reached, err := corebilling.WorkflowLimitReached(ctx, q, targetID); err != nil || reached {
+				return cmp.Or(err, errWorkflowLimit)
+			}
+		}
 		if agentID, err = insertAgent(ctx, q, targetID, memberID, agent); err != nil {
 			return err
 		}
@@ -802,6 +810,8 @@ func failDeploymentWrite(c *gin.Context, err error, fallback string) {
 		response.Fail(c, http.StatusConflict, "ALREADY_DEPLOYED", "This SOP is already deployed to that workspace — sync it instead")
 	case errors.Is(err, errAgentLimit):
 		response.Fail(c, http.StatusBadRequest, "PLAN_LIMIT_REACHED", "That workspace has reached its plan's agent limit")
+	case errors.Is(err, errWorkflowLimit):
+		response.Fail(c, http.StatusBadRequest, "PLAN_LIMIT_REACHED", "That workspace has reached its plan's workflow limit")
 	case errors.Is(err, errAgentNameTaken) || isUniqueViolation(err):
 		response.Fail(c, http.StatusConflict, "DUPLICATE_AGENT_NAME", "That workspace already has an agent with this SOP's agent name")
 	case errors.Is(err, errAgentRemoved):
@@ -989,6 +999,9 @@ func (h *Handler) applyDeployment(ctx context.Context, d dbgen.GetSopDeploymentR
 				return err
 			}
 		case workflow != nil:
+			if reached, err := corebilling.WorkflowLimitReached(ctx, q, d.TargetOrgID); err != nil || reached {
+				return cmp.Or(err, errWorkflowLimit)
+			}
 			if workflowID, err = insertWorkflow(ctx, q, d.TargetOrgID, memberID, d.AgentID, *workflow); err != nil {
 				return err
 			}

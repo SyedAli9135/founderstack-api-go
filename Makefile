@@ -1,7 +1,7 @@
 .PHONY: run build test test-integration coverage vet fmt tidy install-hooks \
         docker-up docker-down docker-logs \
         migrate-up migrate-down migrate-force migrate-version migrate-create \
-        sqlc-generate \
+        sqlc-generate stripe-setup \
         health
 
 MIGRATIONS_DIR      := internal/db/migrations
@@ -97,3 +97,6 @@ migrate-create: ## Scaffold a new migration pair (usage: make migrate-create NAM
 
 sqlc-generate: ## Regenerate internal/db/dbgen from internal/db/queries + the migration schema
 	$(SQLC) generate
+
+stripe-setup: ## Create the billing plans' Stripe products/prices + portal config (idempotent; test keys only)
+	go run ./cmd/stripe-setup

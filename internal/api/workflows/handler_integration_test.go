@@ -746,3 +746,42 @@ func createTestWorkflow(t *testing.T, cfg *config.Config, router *gin.Engine, cl
 	}
 	return created.ID
 }
+
+func TestWorkflowsHandler_PlanWorkflowLimit(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg)
+	orgID, userID, clerkUserID := testOrgAndUser(t, systemPool)
+	agentID := testAgent(t, appPool, orgID, userID, "Limit Agent")
+	if _, err := systemPool.Exec(context.Background(), `update organizations set max_workflows = 1 where id = $1`, orgID); err != nil {
+		t.Fatal(err)
+	}
+
+	do := func(method, path string, body any) apiEnvelope {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, authedRequest(t, cfg, clerkUserID, method, path, body))
+		var env apiEnvelope
+		_ = json.Unmarshal(rec.Body.Bytes(), &env)
+		return env
+	}
+
+	first := createTestWorkflow(t, cfg, router, clerkUserID, agentID)
+	if env := do(http.MethodPost, "/api/v1/workflows", map[string]any{
+		"agent_id": agentID.String(), "name": "Over the limit", "trigger_type": "manual",
+	}); env.Error.Code != "PLAN_LIMIT_REACHED" {
+		t.Fatalf("second workflow on a 1-workflow plan: want PLAN_LIMIT_REACHED, got %q", env.Error.Code)
+	}
+
+	// Pausing frees the slot; resuming while another workflow holds it is
+	// blocked the same way creating would be.
+	do(http.MethodPatch, "/api/v1/workflows/"+first, map[string]any{"is_active": false})
+	second := createTestWorkflow(t, cfg, router, clerkUserID, agentID)
+	if env := do(http.MethodPatch, "/api/v1/workflows/"+first, map[string]any{"is_active": true}); env.Error.Code != "PLAN_LIMIT_REACHED" {
+		t.Fatalf("reactivating over the limit: want PLAN_LIMIT_REACHED, got %q", env.Error.Code)
+	}
+	// Editing an already-active workflow isn't a new slot.
+	if env := do(http.MethodPatch, "/api/v1/workflows/"+second, map[string]any{"is_active": true, "name": "Renamed"}); env.Error.Code != "" {
+		t.Fatalf("editing an active workflow at the limit: %q", env.Error.Code)
+	}
+}

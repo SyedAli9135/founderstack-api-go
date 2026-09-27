@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,6 +47,7 @@ import (
 	workflowsapi "github.com/founderstack/api/internal/api/workflows"
 	"github.com/founderstack/api/internal/config"
 	corea2a "github.com/founderstack/api/internal/core/a2a"
+	corebilling "github.com/founderstack/api/internal/core/billing"
 	coredigest "github.com/founderstack/api/internal/core/digest"
 	coredocs "github.com/founderstack/api/internal/core/documents"
 	"github.com/founderstack/api/internal/core/graph"
@@ -186,7 +188,22 @@ func run() error {
 	// to a prior process restart.
 	docsProcessor.RecoverStuckJobs(ctx, systemPool)
 
-	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, docsSearcher, mcpRegistry, graphEngine, launcher, actionTokens, taskTokens, emailSender, digestTokens)
+	// Platform billing (workflow 15). Left nil — not a nil *StripeClient
+	// in the interface — when unconfigured, so the handlers' nil checks work.
+	var stripeAPI corebilling.Stripe
+	var billingSyncer *corebilling.Syncer
+	switch key := cfg.StripeSecretKey.Expose(); {
+	case key == "":
+		logger.Warn("STRIPE_SECRET_KEY not set — plan upgrades and the Stripe webhook are disabled")
+	case strings.HasPrefix(key, "sk_live_") && !cfg.IsProduction():
+		return fmt.Errorf("a live STRIPE_SECRET_KEY is not allowed outside APP_ENV=production — use an sk_test_ key")
+	default:
+		client := corebilling.NewStripeClient(key)
+		stripeAPI = client
+		billingSyncer = corebilling.NewSyncer(systemPool, client, emailSender, cfg.FrontendURL)
+	}
+
+	router := newRouter(cfg, dbPool, systemPool, redisClient, pineconeClient, encryptionKey, integrationsRegistry, docsStore, docsProcessor, docsSearcher, mcpRegistry, graphEngine, launcher, actionTokens, taskTokens, emailSender, digestTokens, stripeAPI, billingSyncer)
 
 	// All 3 background jobs run on systemPool (BYPASSRLS) — each scans
 	// across every org, which is inherently cross-tenant — and stop when
@@ -266,7 +283,7 @@ func newPineconeClient(cfg *config.Config) (*pinecone.Client, error) {
 	return client, nil
 }
 
-func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, docsSearcher *coredocs.Searcher, mcpRegistry *coremcp.Registry, graphEngine *graph.Engine, launcher *graph.Launcher, actionTokens *notify.ActionTokenSigner, taskTokens *corea2a.TaskTokenSigner, emailSender notify.EmailSender, digestTokens *notify.DigestTokenSigner) *gin.Engine {
+func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client, pc *pinecone.Client, encryptionKey []byte, registry *integrations.Registry, docsStore *coredocs.Store, docsProcessor *coredocs.Processor, docsSearcher *coredocs.Searcher, mcpRegistry *coremcp.Registry, graphEngine *graph.Engine, launcher *graph.Launcher, actionTokens *notify.ActionTokenSigner, taskTokens *corea2a.TaskTokenSigner, emailSender notify.EmailSender, digestTokens *notify.DigestTokenSigner, stripeAPI corebilling.Stripe, billingSyncer *corebilling.Syncer) *gin.Engine {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -305,6 +322,7 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 
 	apiWebhooks := router.Group("/api/webhooks")
 	webhooks.NewClerkHandler(systemDB, cfg.ClerkWebhookSecret.Expose()).Register(apiWebhooks)
+	webhooks.NewStripeHandler(systemDB, billingSyncer, cfg.StripeWebhookSecret.Expose()).Register(apiWebhooks)
 
 	stateManager := integrations.NewStateManager(rdb, cfg.OAuthStateSecret.Expose())
 	intHandler := integrationsapi.NewHandler(db, encryptionKey, registry, stateManager, cfg.FrontendURL)
@@ -368,7 +386,7 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 
 	apiBilling := router.Group("/api/v1")
 	apiBilling.Use(middleware.RequireAuth(systemDB, cfg))
-	billing.NewHandler(db).Register(apiBilling)
+	billing.NewHandler(db, systemDB, stripeAPI, billingSyncer, cfg.FrontendURL).Register(apiBilling)
 
 	apiAuditLogs := router.Group("/api/v1")
 	apiAuditLogs.Use(middleware.RequireAuth(systemDB, cfg))

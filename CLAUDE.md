@@ -24,14 +24,12 @@ Anthropic-only original). See "BYOK API Keys" below.
 
 **Workflows 1 (bootstrap) through 14 (token usage & analytics), plus workflows 16 (disconnect/
 reconnect integration), 17 (view audit logs), 18 (multi-agent team run / A2A), 19 (agent
-templates marketplace), 20 (daily email digest), 21 (practice & client workspaces), 22 (SOP library), and 23 (client reports), are implemented — workflows 18/19/20's own
+templates marketplace), 20 (daily email digest), 21 (practice & client workspaces), 22 (SOP library), 23 (client reports), and 15 (billing & subscription, built 2026-09-27 against Stripe test mode), are implemented — workflows 18/19/20's own
 frontends (team pages, the templates gallery, the digest settings card) live in
 `../founderstack-web`, its own repo, per this codebase's usual backend/frontend split; see that
 repo's `AGENTS.md` for its own detail.
-Workflow 15 (Manage Billing & Subscription) is deliberately skipped for now** — it needs a real
-(or test-mode) Stripe account for FounderStack's own platform billing plus real pricing/trial
-decisions, neither of which exists yet; unlike every other workflow so far, this isn't something
-to build against fabricated inputs. Workflow 14
+Workflow 24 (practice billing) is next** — it extends workflow 15's billing with per-client-workspace
+pricing; see "Manage Billing & Subscription (workflow 15)" below. Workflow 14
 (usage & analytics), workflow 16 (integration reconnection), workflow 17 (audit logs) — all
 2026-09-07 — and workflows 18/19/20 (2026-09-20) are the most recent — see "View Token Usage &
 Analytics (workflow 14)", "Disconnect / Reconnect Integration (workflow 16)", "View Audit Logs
@@ -2146,6 +2144,64 @@ no-store, revoke/expired/unknown uniformity, statuses, audit, access, validation
 Redis limiter ignoring spoofed `X-Forwarded-For`), `snapshot_test.go` (window, status, token).
 Live-verified in a real browser 2026-09-27.
 
+### Manage Billing & Subscription (workflow 15) — `internal/core/billing`, extends `internal/api/billing`, `internal/api/webhooks`, `cmd/stripe-setup`
+
+Built 2026-09-27 against a Stripe **test-mode** account (`sk_test_` only outside production — boot
+refuses an `sk_live_` key unless `APP_ENV=production`). Migration `000021` (`current_period_end`,
+`cancel_at_period_end`, a 14-day `trial_ends_at` default + backfill, a unique index on
+`stripe_customer_id`, and `stripe_events` — the processed-event log, `app_system` only).
+
+**Tiers live in code** (`internal/core/billing/plans.go`: Starter $29 / Growth $99 / Studio $249,
+each with agent/workflow/storage/integration limits). `make stripe-setup` (`cmd/stripe-setup`)
+creates the Stripe products, prices (found by `lookup_key`, so no price-ID env vars) and a
+billing-portal configuration (found by metadata) — idempotent; a price changed in code gets a new
+Stripe price with `transfer_lookup_key`. **Limits are written onto the org row** by the
+subscription sync, so every limit check reads `organizations.max_*` and knows nothing about
+Stripe; Starter's limits equal the column defaults. Checks: agents (existing), **workflows** (new:
+create, reactivation via PATCH `is_active`, SOP deploy and SOP sync) and **knowledge-base storage**
+(new: upload, before anything reaches S3), all `400 PLAN_LIMIT_REACHED`. Integrations count is
+shown, not enforced. A downgrade never removes anything — over-limit orgs just can't add more.
+
+**Routes**: `GET /billing/subscription` (any member; plan, derived status — Stripe's, or
+`trial`/`trial_expired` when the org has never subscribed — usage vs. limits, the plan table);
+`POST /billing/subscription/upgrade {tier}`; `POST /billing/subscription/confirm {session_id}`;
+`POST /billing/portal`. The three writes need owner/admin of an org that bills itself (a client
+workspace gets `403 BILLING_MANAGED_BY_PRACTICE`) and Stripe configured (`503
+BILLING_NOT_CONFIGURED`). **Upgrade** with no live subscription creates the Stripe customer
+(idempotency key per org) and returns a Checkout URL — the card is only ever entered on Stripe;
+with a live subscription it swaps the plan item in place (prorated, and clears any cancellation
+scheduled in the portal), so a founder can never end up with two subscriptions from our UI.
+**Confirm** applies a completed Checkout immediately on return (another org's session is a 404),
+so the plan shows even if the webhook is slow; the webhook applying it again is a no-op.
+
+**Webhook** `POST /api/webhooks/stripe`: signature verified with `STRIPE_WEBHOOK_SECRET`,
+**API-version mismatch ignored on purpose** (the dashboard endpoint's version needn't match
+stripe-go's pinned one) because the payload is only used for IDs — **every subscription is
+re-fetched from Stripe** before being applied, so out-of-order or stale events converge on Stripe's
+current truth. Dedup: the event id is inserted in a transaction held open while it's handled (a
+concurrent redelivery blocks then skips; a failed handling rolls back so Stripe retries). **Which
+subscription is current** (`Syncer.Apply`, under a `FOR UPDATE` on the org): a subscription updates
+the org it already belongs to, or an org with no live subscription; a completed Checkout
+**adopts** its subscription and cancels (prorated) any other live one, so two paid tabs don't
+double-bill; a stale event for a replaced subscription changes nothing. Handled:
+`checkout.session.completed`, `customer.subscription.created/updated/deleted`, `invoice.paid`,
+`invoice.payment_failed` (→ `past_due`, which **keeps** the paid plan while Stripe retries, and
+emails owners/admins once — skipped on redelivery). Unknown customers are acknowledged (200), not
+retried. `invoice.upcoming` is received but unused until workflow 24.
+
+**Testing**: `billing/subscription_integration_test.go` (trial view, member/client-workspace/
+unconfigured guards, checkout params + customer reuse, confirm incl. foreign session, in-place
+change, portal) and `webhooks/stripe_integration_test.go` (forged signature, payload not trusted,
+dedup, cancel → Starter, checkout replacing a live subscription and the stale deletion after it,
+past_due + one email, unknown customer) against a fake `billing.Stripe`
+(`internal/core/billing/billingtest`); mutation-checked (removing the adoption rule or the dedup
+fails them). Plus workflow and storage limit tests. **Live-verified 2026-09-27** with real Stripe
+test mode through the ngrok webhook: Checkout with test card 4242 → Growth within ~1s via webhook;
+in-place Growth → Studio (one subscription in Stripe); cancel → Starter limits; a test-clock
+renewal with a failing card → `past_due`, sitewide banner, payment-failed notice; recovery in the
+billing portal → active; portal cancel → "Cancels on …"; re-upgrade clears it. Emails log as no-ops
+until `BREVO_API_KEY` is set.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -2376,6 +2432,7 @@ machine — CI runs the authoritative version of the same check regardless.
 | `/api/v1/auth/dev-token` | `internal/api/identity/devtoken.go` | none (self-issues) | local test token minting (workflow 3) |
 | `/api/v1/settings/api-key*` | `internal/api/settings/apikey.go` | `middleware.RequireAuth` | BYOK key CRUD across 5 LLM providers, plus `.../api-key/providers` (catalog+status merge) (workflow 3) |
 | `/api/webhooks/clerk` | `internal/api/webhooks/clerk.go` | Svix signature, not `RequireAuth` | Clerk org/user sync (workflow 2) |
+| `/api/webhooks/stripe` | `internal/api/webhooks/stripe.go` | Stripe signature, not `RequireAuth` | Platform subscription sync (workflow 15) |
 | `/api/v1/integrations`, `/api/v1/integrations/{service}/connect` (all auth types), `.../status`, `DELETE .../{service}` | `internal/api/integrations/handler.go` | `middleware.RequireAuth` | Connect/manage third-party integrations (workflow 4) |
 | `/api/v1/integrations/{service}/callback` | `internal/api/integrations/handler.go` | none — org/service recovered from `state`, not a JWT | OAuth provider redirect target (workflow 4) |
 | `/api/v1/documents/upload`, `GET /documents`, `GET /documents/{id}`, `DELETE /documents/{id}`, `POST /documents/{id}/reindex` | `internal/api/documents/handler.go` | `middleware.RequireAuth` | Upload/list/reindex/delete founder documents for RAG (workflow 6) |
@@ -2397,6 +2454,7 @@ machine — CI runs the authoritative version of the same check regardless.
 | `GET /api/v1/settings/api-key/usage` | `internal/api/settings/apikey.go` | `middleware.RequireAuth` | Calendar-month token/cost aggregate (workflow 14) |
 | `GET /api/v1/billing/usage` | `internal/api/billing/handler.go` | `middleware.RequireAuth` | Rolling-30-day token/cost aggregate + daily trend + per-agent cost share (workflow 14) |
 | `GET /api/v1/billing/ledger` | `internal/api/billing/handler.go` | `middleware.RequireAuth` | Paginated itemized `cost_ledger` feed (workflow 14) |
+| `GET /api/v1/billing/subscription`, `POST .../subscription/upgrade`, `POST .../subscription/confirm`, `POST /api/v1/billing/portal` | `internal/api/billing/subscription.go` | `middleware.RequireAuth` (+owner/admin for the POSTs) | Plan, usage and limits; Stripe Checkout / in-place plan change; apply a completed Checkout; Stripe billing portal (workflow 15) |
 | `GET /api/v1/analytics/agent-performance` | `internal/api/analytics/handler.go` | `middleware.RequireAuth` | Per-agent success rate/avg duration/avg cost (workflow 14) |
 | `GET /api/v1/analytics/rag-quality` | `internal/api/analytics/handler.go` | `middleware.RequireAuth` | Rolling-30-day RAG search quality (avg rerank score, cache hit rate, avg chunks retrieved) (workflow 14) |
 | `GET /api/v1/audit-logs` | `internal/api/auditlogs/handler.go` | `middleware.RequireAuth` (+owner/admin guard) | Cursor-paginated, filterable audit log of every action an agent or user took (workflow 17) |
@@ -2509,6 +2567,10 @@ digest itself still sends fine (reusing the same `BREVO_API_KEY`/`BREVO_FROM_EMA
 to the load balancer's IPs/CIDRs in production so client IPs (and the public report rate limit)
 are correct. **Any new optional setting must also be added to `Load`'s defaults map** or viper
 never reads it — `TestLoad_EveryStringFieldIsLoadableFromEnv` enforces this for string fields.
+
+`STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET` (workflow 15) are optional: unset, the app boots and
+billing writes answer `503 BILLING_NOT_CONFIGURED`. Only `sk_test_` keys are accepted outside
+`APP_ENV=production`. After setting the key once, run `make stripe-setup`.
 
 `DEV_TOKEN_SECRET` is deliberately **not** in that required list — it's local-testing-only
 (see "Authentication" above) and should stay unset everywhere real, including production.

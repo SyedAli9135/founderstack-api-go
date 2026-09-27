@@ -12,6 +12,7 @@ import (
 
 	"github.com/founderstack/api/internal/api/authctx"
 	"github.com/founderstack/api/internal/api/response"
+	corebilling "github.com/founderstack/api/internal/core/billing"
 	"github.com/founderstack/api/internal/db/dbgen"
 	"github.com/founderstack/api/internal/db/tenant"
 )
@@ -19,17 +20,28 @@ import (
 const usageWindowDays = 30
 
 type Handler struct {
-	appPool *pgxpool.Pool
+	appPool     *pgxpool.Pool
+	systemPool  *pgxpool.Pool
+	stripe      corebilling.Stripe
+	syncer      *corebilling.Syncer
+	frontendURL string
 }
 
-func NewHandler(appPool *pgxpool.Pool) *Handler {
-	return &Handler{appPool: appPool}
+// stripe and syncer are nil when STRIPE_SECRET_KEY is unset: the usage
+// routes and GET /billing/subscription still work, and the routes that
+// need Stripe answer 503 BILLING_NOT_CONFIGURED.
+func NewHandler(appPool, systemPool *pgxpool.Pool, stripe corebilling.Stripe, syncer *corebilling.Syncer, frontendURL string) *Handler {
+	return &Handler{appPool: appPool, systemPool: systemPool, stripe: stripe, syncer: syncer, frontendURL: frontendURL}
 }
 
 // rg must already have middleware.RequireAuth applied.
 func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/billing/usage", h.Usage)
 	rg.GET("/billing/ledger", h.Ledger)
+	rg.GET("/billing/subscription", h.Subscription)
+	rg.POST("/billing/subscription/upgrade", h.Upgrade)
+	rg.POST("/billing/subscription/confirm", h.Confirm)
+	rg.POST("/billing/portal", h.Portal)
 }
 
 type dailyUsagePoint struct {

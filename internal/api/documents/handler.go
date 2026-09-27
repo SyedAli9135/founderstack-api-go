@@ -22,6 +22,7 @@ import (
 
 	"github.com/founderstack/api/internal/api/authctx"
 	"github.com/founderstack/api/internal/api/response"
+	corebilling "github.com/founderstack/api/internal/core/billing"
 	coredocs "github.com/founderstack/api/internal/core/documents"
 	"github.com/founderstack/api/internal/core/llm"
 	"github.com/founderstack/api/internal/db/dbgen"
@@ -115,6 +116,20 @@ func (h *Handler) Upload(c *gin.Context) {
 	}
 	if visibility != "all_members" && visibility != "owner_only" {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "visibility must be all_members or owner_only")
+		return
+	}
+
+	var overStorage bool
+	err = tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		overStorage, err = corebilling.StorageLimitReached(ctx, q, user.OrgID, fileHeader.Size)
+		return err
+	})
+	if err != nil {
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not check storage")
+		return
+	}
+	if overStorage {
+		response.Fail(c, http.StatusBadRequest, "PLAN_LIMIT_REACHED", "This upload would exceed your plan's knowledge base storage")
 		return
 	}
 

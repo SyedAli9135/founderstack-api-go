@@ -61,7 +61,7 @@ func testRouter(t *testing.T, systemPool, appPool *pgxpool.Pool, cfg *config.Con
 	r.Use(middleware.RequestID())
 	rg := r.Group("/api/v1")
 	rg.Use(middleware.RequireAuth(systemPool, cfg))
-	NewHandler(appPool).Register(rg)
+	NewHandler(appPool, systemPool, nil, nil, "http://app.test").Register(rg)
 	return r
 }
 

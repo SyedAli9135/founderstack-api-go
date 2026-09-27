@@ -18,6 +18,7 @@ import (
 
 	"github.com/founderstack/api/internal/api/authctx"
 	"github.com/founderstack/api/internal/api/response"
+	corebilling "github.com/founderstack/api/internal/core/billing"
 	"github.com/founderstack/api/internal/core/graph"
 	"github.com/founderstack/api/internal/db/dbgen"
 	"github.com/founderstack/api/internal/db/tenant"
@@ -269,8 +270,11 @@ func (h *Handler) Create(c *gin.Context) {
 	}
 
 	var view workflowView
-	var agentNotFound bool
+	var agentNotFound, limitReached bool
 	err = tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		if limitReached, err = corebilling.WorkflowLimitReached(ctx, q, user.OrgID); err != nil || limitReached {
+			return err
+		}
 		agentRow, err := q.ValidateAgentForOrg(ctx, dbgen.ValidateAgentForOrgParams{
 			OrgID: user.OrgID, ID: pgtype.UUID{Bytes: agentID, Valid: true},
 		})
@@ -297,6 +301,10 @@ func (h *Handler) Create(c *gin.Context) {
 	})
 	if err != nil {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not create workflow")
+		return
+	}
+	if limitReached {
+		response.Fail(c, http.StatusBadRequest, "PLAN_LIMIT_REACHED", "Your plan's workflow limit has been reached")
 		return
 	}
 	if agentNotFound {
@@ -349,6 +357,16 @@ func (h *Handler) Update(c *gin.Context) {
 				return nil
 			}
 			return err
+		}
+
+		if req.IsActive != nil && *req.IsActive && !derefBool(existing.IsActive) {
+			reached, err := corebilling.WorkflowLimitReached(ctx, q, user.OrgID)
+			if err != nil {
+				return err
+			}
+			if reached {
+				return &validationError{code: "PLAN_LIMIT_REACHED", msg: "Your plan's workflow limit has been reached"}
+			}
 		}
 
 		// trigger_type/cron_expression/next_run_at are one coupled unit — computed together

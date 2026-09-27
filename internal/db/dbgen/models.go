@@ -238,6 +238,8 @@ type Organization struct {
 	OrganizationType        string             `json:"organization_type"`
 	MaxClientWorkspaces     int32              `json:"max_client_workspaces"`
 	DeactivatedAt           pgtype.Timestamptz `json:"deactivated_at"`
+	CurrentPeriodEnd        pgtype.Timestamptz `json:"current_period_end"`
+	CancelAtPeriodEnd       bool               `json:"cancel_at_period_end"`
 }
 
 type PushSubscription struct {
@@ -306,6 +308,12 @@ type SopPlaybookVersion struct {
 	Parameters     []byte             `json:"parameters"`
 	Changelog      *string            `json:"changelog"`
 	CreatedBy      pgtype.UUID        `json:"created_by"`
+}
+
+type StripeEvent struct {
+	ID         string             `json:"id"`
+	Type       string             `json:"type"`
+	ReceivedAt pgtype.Timestamptz `json:"received_at"`
 }
 
 type User struct {

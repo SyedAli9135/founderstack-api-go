@@ -127,6 +127,12 @@ type Config struct {
 	// spoof a fresh IP per request to dodge workflow 23's per-IP rate limit
 	// on public report links. Set it to the load balancer's range in production.
 	TrustedProxies string `mapstructure:"TRUSTED_PROXIES"`
+
+	// FounderStack's own platform billing (workflow 15) — not the Stripe
+	// integration agents use, which is per-org OAuth. Both optional: unset,
+	// the app boots and billing routes answer 503 BILLING_NOT_CONFIGURED.
+	StripeSecretKey     secret.Value `mapstructure:"STRIPE_SECRET_KEY"`
+	StripeWebhookSecret secret.Value `mapstructure:"STRIPE_WEBHOOK_SECRET"`
 }
 
 // TrustedProxyList splits TrustedProxies; nil means trust no proxy.
@@ -227,6 +233,8 @@ func Load() (*Config, error) {
 		"A2A_TASK_TOKEN_SECRET":     "",
 		"DIGEST_UNSUBSCRIBE_SECRET": "",
 		"TRUSTED_PROXIES":           "",
+		"STRIPE_SECRET_KEY":         "",
+		"STRIPE_WEBHOOK_SECRET":     "",
 	}
 	for key, def := range defaults {
 		v.SetDefault(key, def)
