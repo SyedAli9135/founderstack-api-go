@@ -1,8 +1,11 @@
 -- name: GetOrgBilling :one
-SELECT id, name, organization_type, plan_tier, subscription_status, trial_ends_at,
-       current_period_end, cancel_at_period_end, stripe_customer_id, stripe_subscription_id,
-       max_agents, max_workflows, max_rag_storage_gb, max_mcp_integrations
-FROM organizations WHERE id = $1;
+SELECT o.id, o.name, o.organization_type, o.plan_tier, o.subscription_status, o.trial_ends_at,
+       o.current_period_end, o.cancel_at_period_end, o.stripe_customer_id, o.stripe_subscription_id,
+       o.max_agents, o.max_workflows, o.max_rag_storage_gb, o.max_mcp_integrations,
+       o.included_client_workspaces, o.max_client_workspaces,
+       (SELECT COUNT(*) FROM organizations c
+            WHERE c.parent_practice_id = o.id AND c.is_active = true)::bigint AS active_client_workspaces
+FROM organizations o WHERE o.id = $1;
 
 -- name: GetOrgBillingUsage :one
 SELECT
@@ -28,8 +31,26 @@ SELECT stripe_subscription_id, subscription_status FROM organizations WHERE id =
 UPDATE organizations SET
     plan_tier = $2, subscription_status = $3, stripe_subscription_id = $4,
     current_period_end = $5, cancel_at_period_end = $6, trial_ends_at = $7,
-    max_agents = $8, max_workflows = $9, max_rag_storage_gb = $10, max_mcp_integrations = $11
+    max_agents = $8, max_workflows = $9, max_rag_storage_gb = $10, max_mcp_integrations = $11,
+    included_client_workspaces = $12, max_client_workspaces = $13
 WHERE id = $1;
+
+-- name: InheritPracticePlan :exec
+-- A client workspace is billed through its practice, so it runs on the
+-- practice's plan limits. Called whenever the practice's plan changes and
+-- when a workspace is created under it.
+UPDATE organizations c SET
+    plan_tier = p.plan_tier, max_agents = p.max_agents, max_workflows = p.max_workflows,
+    max_rag_storage_gb = p.max_rag_storage_gb, max_mcp_integrations = p.max_mcp_integrations
+FROM organizations p
+WHERE p.id = sqlc.arg(practice_id) AND c.parent_practice_id = p.id
+  AND (sqlc.narg(workspace_id)::uuid IS NULL OR c.id = sqlc.narg(workspace_id)::uuid);
+
+-- name: ListPracticesWithLiveSubscriptions :many
+SELECT id FROM organizations
+WHERE organization_type = 'practice' AND is_active = true
+  AND stripe_subscription_id IS NOT NULL
+  AND subscription_status IN ('active', 'trialing', 'past_due');
 
 -- name: RecordStripeEvent :one
 -- Returns no row when the event was already processed (a redelivery).

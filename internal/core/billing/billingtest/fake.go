@@ -23,6 +23,7 @@ type Fake struct {
 	Checkouts     []billing.CheckoutParams
 	Canceled      []string
 	Fetches       int
+	ItemUpdates   int
 	next          int
 }
 
@@ -112,6 +113,58 @@ func (f *Fake) CancelSubscription(_ context.Context, id string) error {
 func (f *Fake) CreatePortalSession(_ context.Context, customerID, _ string) (string, error) {
 	return "https://billing.stripe.test/p/" + customerID, nil
 }
+
+// UpdateItems applies changes to the stored subscription's items.
+func (f *Fake) UpdateItems(_ context.Context, subID string, changes []billing.ItemChange) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := f.Subscriptions[subID]
+	if s == nil {
+		return errors.New("fake: no such subscription")
+	}
+	f.ItemUpdates++
+	for _, ch := range changes {
+		switch {
+		case ch.Delete:
+			kept := s.Items.Data[:0]
+			for _, it := range s.Items.Data {
+				if it.ID != ch.ItemID {
+					kept = append(kept, it)
+				}
+			}
+			s.Items.Data = kept
+		case ch.ItemID != "":
+			for _, it := range s.Items.Data {
+				if it.ID == ch.ItemID {
+					it.Quantity = ch.Quantity
+				}
+			}
+		default:
+			f.next++
+			s.Items.Data = append(s.Items.Data, &stripe.SubscriptionItem{
+				ID: fmt.Sprintf("si_extra_%d", f.next), Quantity: ch.Quantity,
+				Price: &stripe.Price{ID: "price_" + ch.LookupKey, LookupKey: ch.LookupKey},
+			})
+		}
+	}
+	return nil
+}
+
+// ExtraItems returns the subscription's extra-workspace items as
+// lookup key -> quantity.
+func (f *Fake) ExtraItems(subID string) map[string]int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]int64{}
+	for _, it := range f.Subscriptions[subID].Items.Data {
+		if billing.IsExtraWorkspaceLookupKey(it.Price.LookupKey) {
+			out[it.Price.LookupKey] += it.Quantity
+		}
+	}
+	return out
+}
+
+var _ billing.Stripe = (*Fake)(nil)
 
 // Emails is a notify.EmailSender that records what it sends.
 type Emails struct {

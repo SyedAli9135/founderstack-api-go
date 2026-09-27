@@ -271,3 +271,62 @@ func TestSubscription_PortalAndGuards(t *testing.T) {
 		t.Errorf("unconfigured read: %d", rec.Code)
 	}
 }
+
+func TestSubscription_PracticeWorkspacesAndDowngradeGuard(t *testing.T) {
+	appPool, systemPool, cfg := testAppPool(t), testSystemPool(t), testConfig(t)
+	fake := billingtest.New()
+	router := stripeRouter(t, systemPool, appPool, cfg, fake)
+	orgID, admin := testOrgAndUser(t, systemPool)
+	ctx := context.Background()
+
+	growth, _ := corebilling.PlanByTier("growth")
+	customer := "cus_practice_" + orgID.String()[:8]
+	fake.Subscription("sub_practice_"+orgID.String()[:8], customer, growth, stripe.SubscriptionStatusActive)
+	if _, err := systemPool.Exec(ctx, `update organizations set organization_type = 'practice', plan_tier = 'growth',
+		subscription_status = 'active', stripe_customer_id = $2, stripe_subscription_id = $3,
+		current_period_end = now() + interval '20 days', included_client_workspaces = 3, max_client_workspaces = 25
+		where id = $1`, orgID, customer, "sub_practice_"+orgID.String()[:8]); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		suffix := orgID.String()[:8] + string(rune('a'+i))
+		if _, err := systemPool.Exec(ctx, `insert into organizations (clerk_org_id, name, slug, organization_type, parent_practice_id)
+			values ($1, 'Client', $1, 'client_workspace', $2)`, "org_client_"+suffix, orgID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = systemPool.Exec(context.Background(), `delete from organizations where parent_practice_id = $1`, orgID)
+	})
+
+	// 5 active on Growth: 3 included + 2 at $15 on top of $99.
+	v := decode[subscriptionView](t, authedJSON(t, router, cfg, admin, http.MethodGet, "/api/v1/billing/subscription", nil)).Data
+	cw := v.ClientWorkspaces
+	if cw == nil || cw.Active != 5 || cw.Included != 3 || cw.Extra != 2 || cw.ExtraWorkspaceUSD != 15 || cw.Max != 25 {
+		t.Fatalf("client workspaces: %+v", cw)
+	}
+	if v.NextInvoiceEstimateUSD == nil || *v.NextInvoiceEstimateUSD != 99+2*15 {
+		t.Fatalf("next invoice estimate: %v", v.NextInvoiceEstimateUSD)
+	}
+
+	// Starter allows 1: switching would stop billing 4 running workspaces.
+	rec := authedJSON(t, router, cfg, admin, http.MethodPost, "/api/v1/billing/subscription/upgrade", map[string]string{"tier": "starter"})
+	if code := errCode(t, rec); code != "TOO_MANY_CLIENT_WORKSPACES" || !strings.Contains(rec.Body.String(), "Remove 4") {
+		t.Fatalf("downgrade over the cap: %s %s", code, rec.Body)
+	}
+	// Studio has room, so it goes through.
+	if rec := authedJSON(t, router, cfg, admin, http.MethodPost, "/api/v1/billing/subscription/upgrade", map[string]string{"tier": "studio"}); rec.Code != http.StatusOK {
+		t.Fatalf("upgrade to studio: %d %s", rec.Code, rec.Body)
+	}
+
+	// A standard org has no client workspace block at all.
+	if _, err := systemPool.Exec(ctx, `delete from organizations where parent_practice_id = $1`, orgID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := systemPool.Exec(ctx, `update organizations set organization_type = 'standard' where id = $1`, orgID); err != nil {
+		t.Fatal(err)
+	}
+	if v := decode[subscriptionView](t, authedJSON(t, router, cfg, admin, http.MethodGet, "/api/v1/billing/subscription", nil)).Data; v.ClientWorkspaces != nil {
+		t.Fatalf("standard org shouldn't have a client workspace block: %+v", v.ClientWorkspaces)
+	}
+}

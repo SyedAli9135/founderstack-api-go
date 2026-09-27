@@ -140,6 +140,24 @@ func (h *StripeHandler) dispatch(ctx context.Context, evt stripe.Event) error {
 			h.syncer.NotifyPaymentFailed(ctx, orgID, inv.AmountDue, inv.HostedInvoiceURL)
 		}
 		return nil
+
+	case "invoice.upcoming":
+		// Sent a few days before a renewal (Stripe's "upcoming renewal
+		// events" setting). The overage is computed from our own count,
+		// which SyncWorkspaceUsage keeps equal to Stripe's quantity.
+		var inv stripe.Invoice
+		if err := json.Unmarshal(evt.Data.Raw, &inv); err != nil {
+			return err
+		}
+		if inv.Customer == nil {
+			return nil
+		}
+		orgID, err := h.syncer.OrgForCustomer(ctx, inv.Customer.ID)
+		if err != nil {
+			return err
+		}
+		h.syncer.NotifyUpcomingOverage(ctx, orgID)
+		return nil
 	}
 	return nil
 }

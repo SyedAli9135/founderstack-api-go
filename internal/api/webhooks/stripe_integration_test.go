@@ -241,3 +241,39 @@ func TestStripeWebhook_UnknownCustomerAndIrrelevantEvents(t *testing.T) {
 		t.Fatalf("unhandled event type should be acknowledged, got %d", rec.Code)
 	}
 }
+
+func TestStripeWebhook_InvoiceUpcomingWarnsAboutExtraWorkspaces(t *testing.T) {
+	env := newStripeEnv(t)
+	orgID, customer := env.org("upcoming")
+	ctx := context.Background()
+	if _, err := env.pool.Exec(ctx, `update organizations set organization_type = 'practice', plan_tier = 'growth',
+		included_client_workspaces = 3, max_client_workspaces = 25 where id = $1`, orgID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = env.pool.Exec(context.Background(), `delete from organizations where parent_practice_id = $1`, orgID)
+	})
+	addClients := func(n int) {
+		for i := range n {
+			id := fmt.Sprintf("org_upcoming_%s_%d_%d", env.suffix, n, i)
+			if _, err := env.pool.Exec(ctx, `insert into organizations (clerk_org_id, name, slug, organization_type, parent_practice_id)
+				values ($1, 'Client', $1, 'client_workspace', $2)`, id, orgID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	upcoming := &stripe.Invoice{Customer: &stripe.Customer{ID: customer}}
+
+	addClients(3) // exactly the included count: nothing to warn about
+	env.send(env.evt("up1"), "invoice.upcoming", upcoming)
+	if env.emails.Count() != 0 {
+		t.Fatalf("no extra workspaces should mean no email, got %v", env.emails.Sent)
+	}
+	addClients(1)
+	if rec := env.send(env.evt("up2"), "invoice.upcoming", upcoming); rec.Code != http.StatusOK {
+		t.Fatalf("invoice.upcoming: %d %s", rec.Code, rec.Body)
+	}
+	if env.emails.Count() != 1 || env.emails.Sent[0] != "admin-upcoming@example.com" {
+		t.Fatalf("overage warning: %v", env.emails.Sent)
+	}
+}

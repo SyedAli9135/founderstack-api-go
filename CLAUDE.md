@@ -28,14 +28,15 @@ templates marketplace), 20 (daily email digest), 21 (practice & client workspace
 frontends (team pages, the templates gallery, the digest settings card) live in
 `../founderstack-web`, its own repo, per this codebase's usual backend/frontend split; see that
 repo's `AGENTS.md` for its own detail.
-Workflow 24 (practice billing) is next** — it extends workflow 15's billing with per-client-workspace
-pricing; see "Manage Billing & Subscription (workflow 15)" below. Workflow 14
+Workflow 24 (practice billing) is also implemented (2026-09-27)** — all 24 workflows in
+`WORKFLOW_PLAN_GO.md` are now built, apart from the documented, deliberate gaps still unticked there
+(in workflows 1, 3, 4, 9 and 19); see "Practice Billing (workflow 24)" below. Workflow 14
 (usage & analytics), workflow 16 (integration reconnection), workflow 17 (audit logs) — all
 2026-09-07 — and workflows 18/19/20 (2026-09-20) are the most recent — see "View Token Usage &
 Analytics (workflow 14)", "Disconnect / Reconnect Integration (workflow 16)", "View Audit Logs
 (workflow 17)", "Multi-Agent Team Run / A2A (workflow 18)", "Agent Templates Marketplace
 (workflow 19)", and "Daily Email Digest (workflow 20)" below. Don't assume routes, tables, or
-packages from workflow 24+ in
+packages from workflow 25+ in
 `WORKFLOW_PLAN_GO.md` exist — check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
@@ -2201,6 +2202,61 @@ in-place Growth → Studio (one subscription in Stripe); cancel → Starter limi
 renewal with a failing card → `past_due`, sitewide banner, payment-failed notice; recovery in the
 billing portal → active; portal cancel → "Cancels on …"; re-upgrade clears it. Emails log as no-ops
 until `BREVO_API_KEY` is set.
+
+### Practice Billing — per-client-workspace pricing (workflow 24) — extends `internal/core/billing`, `internal/api/practice`, `internal/api/billing`, `internal/api/webhooks`
+
+Built 2026-09-27. Migration `000022` (`included_client_workspaces`; `max_client_workspaces`'s default
+drops from workflow 21's placeholder 5 to Starter's 1; existing rows backfilled from `plan_tier`).
+
+**Terms live in the tier table** (`plans.go`): Starter 1 included, hard cap 1; Growth 3 included then
+$15/mo each up to 25; Studio 10 included then $10/mo each up to 100. Both columns are written by the
+subscription sync like every other limit. `make stripe-setup` also creates the two per-unit
+"additional client workspace" prices (lookup keys `founderstack_{growth,studio}_extra_workspace_monthly`).
+
+**Licensed quantity, not metered usage records — a deliberate deviation from the plan.**
+`SubscriptionItem.CreateUsageRecord` is Stripe's legacy metered API, gone from the API version
+stripe-go v86 pins. Instead the practice's subscription carries one extra item whose **quantity =
+active client workspaces − included**. `Syncer.SyncWorkspaceUsage` is a **reconcile**, not an
+increment: it re-reads the count and the live subscription and only calls Stripe when they differ
+(`workspaceItemChanges`: add, set quantity, remove at zero, swap price on a tier change, drop
+duplicates), so it's safe to run anywhere — the `customer.subscription.updated` its own change causes
+finds nothing to do. It runs after create/remove/restore of a client workspace (best effort,
+detached from the request), after every applied subscription state (plan changes), and from
+`RunWorkspaceUsageJob` (daily safety net). Changes use `create_prorations`, so a workspace added
+mid-period is charged pro rata on the next invoice and one removed stops being billed the same
+day. `invoice.upcoming` emails the practice's owners/admins when the renewal includes extras
+(computed from our count, which the reconcile keeps equal to Stripe's quantity); nothing is sent
+without extras. Stripe only sends `invoice.upcoming` if "upcoming renewal events" is on in the
+dashboard's billing settings (it is on the dev test account).
+
+**Client workspaces run on their practice's plan**: `InheritPracticePlan` copies `plan_tier` and the
+agent/workflow/storage/integration limits onto every child when the practice's plan is applied, and
+onto a new workspace in its create transaction. They have no billing of their own (workflow 15's
+`BILLING_MANAGED_BY_PRACTICE`). **Guards**: creating/restoring past `max_client_workspaces` is `402
+CLIENT_WORKSPACE_LIMIT_REACHED` naming the cap; changing to a plan whose cap is below the active
+count is `409 TOO_MANY_CLIENT_WORKSPACES` ("remove N first") — otherwise a downgrade would silently
+stop billing running workspaces. A portal cancellation can't be blocked that way; the org drops to
+free Starter limits with its workspaces intact (the soft-billing policy — see workflow 15).
+
+**Read paths**: `GET /billing/subscription` adds `client_workspaces {active, included, max, extra,
+extra_workspace_usd}` for a practice and `next_invoice_estimate_usd` (plan + extras, no prorations
+or tax). It reads the org row through `app_system` pinned to the caller's own org, because the
+active-child count spans orgs RLS hides from `app_user`. `GET /practice/client-workspaces` adds
+`practice.billing` (the real active count — the list's own count only covers workspaces the viewer
+belongs to).
+
+**Testing**: `plans_test.go` (`workspaceItemChanges` table incl. tier swap and duplicates,
+`ExtraWorkspaces`, tier consistency), `practice/billing_integration_test.go` (4th workspace on
+Growth adds quantity 1, inheritance, remove/restore, idempotent re-sync, cap message, plan change to
+Studio swapping prices and reaching children, overage email only with extras; mutation-checked),
+`billing` (practice view, estimate, downgrade guard), `webhooks` (`invoice.upcoming`). Workflow 21's
+practice fixtures now insert Growth terms, since a fresh org's default cap is 1. **Live-verified
+2026-09-27** against Stripe test mode on 661's practice: Studio → Growth in place, three workspaces
+created through the UI (warning + "+$15/mo" button on the 4th), Stripe showing Growth ×1 + extra ×1
+and every child on Growth limits, billing page "4 of 3 included" / estimate $114 / Starter disabled
+"remove 3 first", a real `invoice.upcoming` from the test clock sending the overage notice, the real
+renewal invoice ($99 + $15 + $14.03 proration, paid), removal deleting the Stripe item immediately,
+and a client workspace's billing page showing only "billed through the practice".
 
 ### No ORM — `pgx` + `sqlc`, not GORM
 

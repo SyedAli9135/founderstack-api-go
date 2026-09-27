@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/mail"
@@ -32,6 +33,30 @@ type Handler struct {
 	appPool     *pgxpool.Pool
 	provisioner WorkspaceProvisioner
 	tools       ToolCatalog
+	usage       UsageSyncer
+}
+
+// UsageSyncer reports a practice's active client workspace count to
+// billing — *billing.Syncer in production.
+type UsageSyncer interface {
+	SyncWorkspaceUsage(ctx context.Context, practiceID pgtype.UUID) error
+}
+
+// SetUsageSyncer enables per-workspace billing; left unset (Stripe not
+// configured) workspace changes simply aren't reported anywhere.
+func (h *Handler) SetUsageSyncer(u UsageSyncer) { h.usage = u }
+
+// syncUsage runs after a workspace is created, removed or restored, so the
+// practice's next invoice reflects the change the same day. Best effort and
+// detached from the request: the change itself already succeeded, and the
+// daily job repairs a failed sync.
+func (h *Handler) syncUsage(ctx context.Context, practiceID pgtype.UUID) {
+	if h.usage == nil {
+		return
+	}
+	if err := h.usage.SyncWorkspaceUsage(context.WithoutCancel(ctx), practiceID); err != nil {
+		slog.Error("practice: syncing client workspace usage to billing", "practice_id", practiceID.String(), "err", err)
+	}
 }
 
 // systemPool must be app_system: a portfolio spans several tenants, which
@@ -211,13 +236,14 @@ func (h *Handler) ListClientWorkspaces(c *gin.Context) {
 		}
 		out = append(out, ws)
 	}
-	response.OK(c, http.StatusOK, "Client workspaces listed", gin.H{
-		"practice": gin.H{
-			"id": p.id.String(), "name": p.name, "organization_type": p.typ, "role": p.role,
-			"max_client_workspaces": limit, "active_client_workspaces": active,
-		},
-		"workspaces": out,
-	})
+	practice := gin.H{
+		"id": p.id.String(), "name": p.name, "organization_type": p.typ, "role": p.role,
+		"max_client_workspaces": limit, "active_client_workspaces": active,
+	}
+	if b, err := billingTerms(ctx, q, p.id); err == nil {
+		practice["billing"] = b
+	}
+	response.OK(c, http.StatusOK, "Client workspaces listed", gin.H{"practice": practice, "workspaces": out})
 }
 
 // lifecycle maps an org's is_active/deactivated_at to its API status:
@@ -325,6 +351,9 @@ func (h *Handler) CreateClientWorkspace(c *gin.Context) {
 		if err != nil {
 			return err
 		}
+		if err := q.InheritPracticePlan(ctx, dbgen.InheritPracticePlanParams{PracticeID: p.id, WorkspaceID: orgID}); err != nil {
+			return err
+		}
 		// Written now rather than left to the organizationMembership.created
 		// webhook, so switching into the new workspace works immediately.
 		// Same values the webhook will write (Clerk makes the creator an
@@ -345,6 +374,8 @@ func (h *Handler) CreateClientWorkspace(c *gin.Context) {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not create the client workspace")
 		return
 	}
+
+	h.syncUsage(ctx, p.id)
 
 	var contact *string
 	if req.ClientContactEmail != "" {
@@ -378,15 +409,26 @@ func (h *Handler) checkCapacity(ctx context.Context, q *dbgen.Queries, practiceI
 		return err
 	}
 	if n >= int64(max) {
-		return errLimitReached
+		return limitError{max: max}
 	}
 	return nil
 }
 
+// limitError is errLimitReached carrying the plan's cap, for the message.
+type limitError struct{ max int32 }
+
+func (e limitError) Error() string { return errLimitReached.Error() }
+func (e limitError) Unwrap() error { return errLimitReached }
+
 func (h *Handler) failCapacity(c *gin.Context, err error) {
-	if errors.Is(err, errLimitReached) {
+	var le limitError
+	if errors.As(err, &le) {
+		noun := "client workspaces"
+		if le.max == 1 {
+			noun = "client workspace"
+		}
 		response.Fail(c, http.StatusPaymentRequired, "CLIENT_WORKSPACE_LIMIT_REACHED",
-			"Your plan's client workspace limit is reached. Remove a workspace or upgrade your plan.")
+			fmt.Sprintf("Your plan allows %d %s. Upgrade your plan or remove a workspace to add another.", le.max, noun))
 		return
 	}
 	response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not check plan limits")
@@ -417,6 +459,7 @@ func (h *Handler) RemoveClientWorkspace(c *gin.Context) {
 		return
 	}
 	slog.Info("practice: client workspace deactivated", "org_id", ws.ID.String(), "by", user.ClerkUserID)
+	h.syncUsage(c.Request.Context(), p.id)
 	until := time.Now().Add(RestoreWindow).UTC().Format(time.RFC3339)
 	response.OK(c, http.StatusOK, "Client workspace deactivated", gin.H{
 		"id": ws.ID.String(), "status": "deactivated", "restorable_until": until,
@@ -461,6 +504,7 @@ func (h *Handler) RestoreClientWorkspace(c *gin.Context) {
 		response.Fail(c, http.StatusGone, "RESTORE_WINDOW_EXPIRED", "This workspace is past its 30-day restore window")
 		return
 	}
+	h.syncUsage(ctx, p.id)
 	response.OK(c, http.StatusOK, "Client workspace restored", gin.H{"id": ws.ID.String(), "status": "active"})
 }
 

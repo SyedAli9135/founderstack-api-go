@@ -193,7 +193,10 @@ func (fx *fixture) insertOrg(t *testing.T, clerkID, name, slug string) pgtype.UU
 	t.Helper()
 	var id pgtype.UUID
 	if err := fx.pool.QueryRow(context.Background(),
-		"insert into organizations (clerk_org_id, name, slug) values ($1, $2, $3) returning id",
+		// Growth's client workspace terms: a new org's column defaults are
+		// Starter's single workspace, and these tests run several.
+		`insert into organizations (clerk_org_id, name, slug, included_client_workspaces, max_client_workspaces)
+		 values ($1, $2, $3, 3, 25) returning id`,
 		clerkID, name, slug).Scan(&id); err != nil {
 		t.Fatalf("insert org: %v", err)
 	}
@@ -364,7 +367,7 @@ func TestPractice_CreateListAndSummary(t *testing.T) {
 		if code != http.StatusOK || len(out.Workspaces) != 2 {
 			t.Fatalf("list = (%d, %+v)", code, out)
 		}
-		if out.Practice.ActiveClientWorkspaces != 2 || out.Practice.MaxClientWorkspaces != 5 {
+		if out.Practice.ActiveClientWorkspaces != 2 || out.Practice.MaxClientWorkspaces != 25 {
 			t.Fatalf("practice = %+v", out.Practice)
 		}
 		acme := out.Workspaces[0]

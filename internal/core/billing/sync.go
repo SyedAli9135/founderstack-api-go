@@ -127,7 +127,10 @@ func (s *Syncer) Apply(ctx context.Context, orgID pgtype.UUID, sub *stripe.Subsc
 			return nil
 		}
 		applied = true
-		return q.ApplySubscriptionState(ctx, stateParams(orgID, st))
+		if err := q.ApplySubscriptionState(ctx, stateParams(orgID, st)); err != nil {
+			return err
+		}
+		return q.InheritPracticePlan(ctx, dbgen.InheritPracticePlanParams{PracticeID: orgID})
 	})
 	if err != nil {
 		return nil, err
@@ -143,6 +146,14 @@ func (s *Syncer) Apply(ctx context.Context, orgID pgtype.UUID, sub *stripe.Subsc
 	if !applied {
 		return nil, nil
 	}
+	// A plan change moves the practice to another tier's included count and
+	// extra-workspace price. Best effort: the plan itself is already saved,
+	// and the daily job retries a failed reconcile.
+	if IsLive(st.Status) {
+		if err := s.SyncWorkspaceUsage(ctx, orgID); err != nil {
+			slog.Error("billing: syncing workspace usage after plan change", "org_id", orgID.String(), "err", err)
+		}
+	}
 	return &st, nil
 }
 
@@ -152,7 +163,8 @@ func stateParams(orgID pgtype.UUID, st State) dbgen.ApplySubscriptionStateParams
 		ID: orgID, PlanTier: &p.Tier, SubscriptionStatus: &st.Status, StripeSubscriptionID: &st.SubscriptionID,
 		CurrentPeriodEnd: ts(st.PeriodEnd), CancelAtPeriodEnd: st.CancelAtPeriodEnd, TrialEndsAt: ts(st.TrialEnd),
 		MaxAgents: &p.MaxAgents, MaxWorkflows: &p.MaxWorkflows, MaxRagStorageGb: &p.MaxStorageGB,
-		MaxMcpIntegrations: &p.MaxIntegrations,
+		MaxMcpIntegrations: &p.MaxIntegrations, IncludedClientWorkspaces: p.IncludedClientWorkspaces,
+		MaxClientWorkspaces: p.MaxClientWorkspaces,
 	}
 }
 
@@ -188,6 +200,47 @@ func (s *Syncer) NotifyPaymentFailed(ctx context.Context, orgID pgtype.UUID, amo
 		}
 	}
 	slog.Info("billing: payment-failed notice sent", "org", org.Name, "recipients", len(contacts))
+}
+
+// NotifyUpcomingOverage warns a practice's owners and admins, ahead of a
+// renewal, that the invoice includes client workspaces beyond their plan.
+// Nothing is sent when there are none.
+func (s *Syncer) NotifyUpcomingOverage(ctx context.Context, orgID pgtype.UUID) {
+	q := dbgen.New(s.systemPool)
+	org, err := q.GetOrgBilling(ctx, orgID)
+	if err != nil || org.OrganizationType != "practice" {
+		return
+	}
+	plan, ok := PlanByTier(deref(org.PlanTier))
+	extra := plan.ExtraWorkspaces(org.ActiveClientWorkspaces)
+	if !ok || extra == 0 {
+		return
+	}
+	contacts, err := q.ListOrgBillingContacts(ctx, orgID)
+	if err != nil {
+		slog.Error("billing: upcoming-overage email: loading contacts", "err", err)
+		return
+	}
+	subject := fmt.Sprintf("Your next FounderStack invoice includes %d extra client workspace%s", extra, plural(extra))
+	text := fmt.Sprintf("%s has %d active client workspaces; your %s plan includes %d.\n\n"+
+		"Your next invoice includes %d additional workspace%s at $%d/month each ($%d), on top of the $%d plan.\n\n"+
+		"Remove workspaces you no longer need before the renewal to stop paying for them:\n%s/practice\n",
+		org.Name, org.ActiveClientWorkspaces, plan.Name, plan.IncludedClientWorkspaces,
+		extra, plural(extra), plan.ExtraWorkspaceUSD, extra*plan.ExtraWorkspaceUSD, plan.MonthlyPriceUSD, s.frontendURL)
+	html := "<p>" + htmlLines(text) + "</p>"
+	for _, c := range contacts {
+		if err := s.email.Send(ctx, c.Email, subject, text, html); err != nil {
+			slog.Error("billing: upcoming-overage email", "org", org.Name, "err", err)
+		}
+	}
+	slog.Info("billing: upcoming-overage notice sent", "org", org.Name, "extra_workspaces", extra, "recipients", len(contacts))
+}
+
+func plural(n int64) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func htmlLines(s string) string {

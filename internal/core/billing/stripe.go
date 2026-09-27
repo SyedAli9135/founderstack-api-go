@@ -37,6 +37,16 @@ type Stripe interface {
 	ChangePlan(ctx context.Context, sub *stripe.Subscription, plan Plan) (*stripe.Subscription, error)
 	CancelSubscription(ctx context.Context, id string) error
 	CreatePortalSession(ctx context.Context, customerID, returnURL string) (string, error)
+	UpdateItems(ctx context.Context, subID string, changes []ItemChange) error
+}
+
+// ItemChange is one edit to a subscription's items: remove ItemID
+// (Delete), set its Quantity, or — with no ItemID — add LookupKey's price.
+type ItemChange struct {
+	ItemID    string
+	LookupKey string
+	Quantity  int64
+	Delete    bool
 }
 
 // StripeClient is the real Stripe implementation. Price and portal
@@ -146,6 +156,28 @@ func (c *StripeClient) ChangePlan(ctx context.Context, sub *stripe.Subscription,
 // CancelSubscription ends a subscription now, crediting the unused time.
 func (c *StripeClient) CancelSubscription(ctx context.Context, id string) error {
 	_, err := c.sc.V1Subscriptions.Cancel(ctx, id, &stripe.SubscriptionCancelParams{Prorate: stripe.Bool(true)})
+	return err
+}
+
+// UpdateItems applies changes in one subscription update. Mid-period
+// changes are prorated onto the next invoice rather than charged now.
+func (c *StripeClient) UpdateItems(ctx context.Context, subID string, changes []ItemChange) error {
+	params := &stripe.SubscriptionUpdateParams{ProrationBehavior: stripe.String("create_prorations")}
+	for _, ch := range changes {
+		switch {
+		case ch.Delete:
+			params.Items = append(params.Items, &stripe.SubscriptionUpdateItemParams{ID: stripe.String(ch.ItemID), Deleted: stripe.Bool(true)})
+		case ch.ItemID != "":
+			params.Items = append(params.Items, &stripe.SubscriptionUpdateItemParams{ID: stripe.String(ch.ItemID), Quantity: stripe.Int64(ch.Quantity)})
+		default:
+			priceID, err := c.priceID(ctx, ch.LookupKey)
+			if err != nil {
+				return err
+			}
+			params.Items = append(params.Items, &stripe.SubscriptionUpdateItemParams{Price: stripe.String(priceID), Quantity: stripe.Int64(ch.Quantity)})
+		}
+	}
+	_, err := c.sc.V1Subscriptions.Update(ctx, subID, params)
 	return err
 }
 

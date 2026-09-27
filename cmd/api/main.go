@@ -213,6 +213,9 @@ func run() error {
 	go coreworkflows.RunScheduler(ctx, systemPool, launcher)
 	go coreworkflows.RunApprovalExpiryJob(ctx, systemPool, launcher)
 	go coredigest.RunScheduler(ctx, systemPool, emailSender, digestTokens, cfg.AppBaseURL)
+	if billingSyncer != nil {
+		go corebilling.RunWorkspaceUsageJob(ctx, systemPool, billingSyncer)
+	}
 
 	srv := &http.Server{
 		Addr:              addr(),
@@ -412,6 +415,9 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	apiPractice := router.Group("/api/v1")
 	apiPractice.Use(middleware.RequireAuth(systemDB, cfg))
 	practiceHandler := practiceapi.NewHandler(systemDB, db, practiceapi.NewClerkProvisioner(organization.NewClient(&clerk.ClientConfig{})), mcpRegistry)
+	if billingSyncer != nil {
+		practiceHandler.SetUsageSyncer(billingSyncer)
+	}
 	practiceHandler.Register(apiPractice)
 
 	apiIdentity := router.Group("/api/v1")

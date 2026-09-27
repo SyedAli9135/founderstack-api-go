@@ -15,22 +15,25 @@ const applySubscriptionState = `-- name: ApplySubscriptionState :exec
 UPDATE organizations SET
     plan_tier = $2, subscription_status = $3, stripe_subscription_id = $4,
     current_period_end = $5, cancel_at_period_end = $6, trial_ends_at = $7,
-    max_agents = $8, max_workflows = $9, max_rag_storage_gb = $10, max_mcp_integrations = $11
+    max_agents = $8, max_workflows = $9, max_rag_storage_gb = $10, max_mcp_integrations = $11,
+    included_client_workspaces = $12, max_client_workspaces = $13
 WHERE id = $1
 `
 
 type ApplySubscriptionStateParams struct {
-	ID                   pgtype.UUID        `json:"id"`
-	PlanTier             *string            `json:"plan_tier"`
-	SubscriptionStatus   *string            `json:"subscription_status"`
-	StripeSubscriptionID *string            `json:"stripe_subscription_id"`
-	CurrentPeriodEnd     pgtype.Timestamptz `json:"current_period_end"`
-	CancelAtPeriodEnd    bool               `json:"cancel_at_period_end"`
-	TrialEndsAt          pgtype.Timestamptz `json:"trial_ends_at"`
-	MaxAgents            *int32             `json:"max_agents"`
-	MaxWorkflows         *int32             `json:"max_workflows"`
-	MaxRagStorageGb      *int32             `json:"max_rag_storage_gb"`
-	MaxMcpIntegrations   *int32             `json:"max_mcp_integrations"`
+	ID                       pgtype.UUID        `json:"id"`
+	PlanTier                 *string            `json:"plan_tier"`
+	SubscriptionStatus       *string            `json:"subscription_status"`
+	StripeSubscriptionID     *string            `json:"stripe_subscription_id"`
+	CurrentPeriodEnd         pgtype.Timestamptz `json:"current_period_end"`
+	CancelAtPeriodEnd        bool               `json:"cancel_at_period_end"`
+	TrialEndsAt              pgtype.Timestamptz `json:"trial_ends_at"`
+	MaxAgents                *int32             `json:"max_agents"`
+	MaxWorkflows             *int32             `json:"max_workflows"`
+	MaxRagStorageGb          *int32             `json:"max_rag_storage_gb"`
+	MaxMcpIntegrations       *int32             `json:"max_mcp_integrations"`
+	IncludedClientWorkspaces int32              `json:"included_client_workspaces"`
+	MaxClientWorkspaces      int32              `json:"max_client_workspaces"`
 }
 
 func (q *Queries) ApplySubscriptionState(ctx context.Context, arg ApplySubscriptionStateParams) error {
@@ -46,6 +49,8 @@ func (q *Queries) ApplySubscriptionState(ctx context.Context, arg ApplySubscript
 		arg.MaxWorkflows,
 		arg.MaxRagStorageGb,
 		arg.MaxMcpIntegrations,
+		arg.IncludedClientWorkspaces,
+		arg.MaxClientWorkspaces,
 	)
 	return err
 }
@@ -62,27 +67,33 @@ func (q *Queries) CountActiveWorkflows(ctx context.Context, orgID pgtype.UUID) (
 }
 
 const getOrgBilling = `-- name: GetOrgBilling :one
-SELECT id, name, organization_type, plan_tier, subscription_status, trial_ends_at,
-       current_period_end, cancel_at_period_end, stripe_customer_id, stripe_subscription_id,
-       max_agents, max_workflows, max_rag_storage_gb, max_mcp_integrations
-FROM organizations WHERE id = $1
+SELECT o.id, o.name, o.organization_type, o.plan_tier, o.subscription_status, o.trial_ends_at,
+       o.current_period_end, o.cancel_at_period_end, o.stripe_customer_id, o.stripe_subscription_id,
+       o.max_agents, o.max_workflows, o.max_rag_storage_gb, o.max_mcp_integrations,
+       o.included_client_workspaces, o.max_client_workspaces,
+       (SELECT COUNT(*) FROM organizations c
+            WHERE c.parent_practice_id = o.id AND c.is_active = true)::bigint AS active_client_workspaces
+FROM organizations o WHERE o.id = $1
 `
 
 type GetOrgBillingRow struct {
-	ID                   pgtype.UUID        `json:"id"`
-	Name                 string             `json:"name"`
-	OrganizationType     string             `json:"organization_type"`
-	PlanTier             *string            `json:"plan_tier"`
-	SubscriptionStatus   *string            `json:"subscription_status"`
-	TrialEndsAt          pgtype.Timestamptz `json:"trial_ends_at"`
-	CurrentPeriodEnd     pgtype.Timestamptz `json:"current_period_end"`
-	CancelAtPeriodEnd    bool               `json:"cancel_at_period_end"`
-	StripeCustomerID     *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID *string            `json:"stripe_subscription_id"`
-	MaxAgents            *int32             `json:"max_agents"`
-	MaxWorkflows         *int32             `json:"max_workflows"`
-	MaxRagStorageGb      *int32             `json:"max_rag_storage_gb"`
-	MaxMcpIntegrations   *int32             `json:"max_mcp_integrations"`
+	ID                       pgtype.UUID        `json:"id"`
+	Name                     string             `json:"name"`
+	OrganizationType         string             `json:"organization_type"`
+	PlanTier                 *string            `json:"plan_tier"`
+	SubscriptionStatus       *string            `json:"subscription_status"`
+	TrialEndsAt              pgtype.Timestamptz `json:"trial_ends_at"`
+	CurrentPeriodEnd         pgtype.Timestamptz `json:"current_period_end"`
+	CancelAtPeriodEnd        bool               `json:"cancel_at_period_end"`
+	StripeCustomerID         *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID     *string            `json:"stripe_subscription_id"`
+	MaxAgents                *int32             `json:"max_agents"`
+	MaxWorkflows             *int32             `json:"max_workflows"`
+	MaxRagStorageGb          *int32             `json:"max_rag_storage_gb"`
+	MaxMcpIntegrations       *int32             `json:"max_mcp_integrations"`
+	IncludedClientWorkspaces int32              `json:"included_client_workspaces"`
+	MaxClientWorkspaces      int32              `json:"max_client_workspaces"`
+	ActiveClientWorkspaces   int64              `json:"active_client_workspaces"`
 }
 
 func (q *Queries) GetOrgBilling(ctx context.Context, id pgtype.UUID) (GetOrgBillingRow, error) {
@@ -103,6 +114,9 @@ func (q *Queries) GetOrgBilling(ctx context.Context, id pgtype.UUID) (GetOrgBill
 		&i.MaxWorkflows,
 		&i.MaxRagStorageGb,
 		&i.MaxMcpIntegrations,
+		&i.IncludedClientWorkspaces,
+		&i.MaxClientWorkspaces,
+		&i.ActiveClientWorkspaces,
 	)
 	return i, err
 }
@@ -178,6 +192,28 @@ func (q *Queries) GetOrganizationMaxWorkflows(ctx context.Context, id pgtype.UUI
 	return max_workflows, err
 }
 
+const inheritPracticePlan = `-- name: InheritPracticePlan :exec
+UPDATE organizations c SET
+    plan_tier = p.plan_tier, max_agents = p.max_agents, max_workflows = p.max_workflows,
+    max_rag_storage_gb = p.max_rag_storage_gb, max_mcp_integrations = p.max_mcp_integrations
+FROM organizations p
+WHERE p.id = $1 AND c.parent_practice_id = p.id
+  AND ($2::uuid IS NULL OR c.id = $2::uuid)
+`
+
+type InheritPracticePlanParams struct {
+	PracticeID  pgtype.UUID `json:"practice_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+// A client workspace is billed through its practice, so it runs on the
+// practice's plan limits. Called whenever the practice's plan changes and
+// when a workspace is created under it.
+func (q *Queries) InheritPracticePlan(ctx context.Context, arg InheritPracticePlanParams) error {
+	_, err := q.db.Exec(ctx, inheritPracticePlan, arg.PracticeID, arg.WorkspaceID)
+	return err
+}
+
 const listOrgBillingContacts = `-- name: ListOrgBillingContacts :many
 SELECT email, full_name FROM users
 WHERE org_id = $1 AND is_active = true AND role IN ('owner', 'admin')
@@ -201,6 +237,33 @@ func (q *Queries) ListOrgBillingContacts(ctx context.Context, orgID pgtype.UUID)
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPracticesWithLiveSubscriptions = `-- name: ListPracticesWithLiveSubscriptions :many
+SELECT id FROM organizations
+WHERE organization_type = 'practice' AND is_active = true
+  AND stripe_subscription_id IS NOT NULL
+  AND subscription_status IN ('active', 'trialing', 'past_due')
+`
+
+func (q *Queries) ListPracticesWithLiveSubscriptions(ctx context.Context) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listPracticesWithLiveSubscriptions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

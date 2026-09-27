@@ -31,52 +31,67 @@ func run(ctx context.Context) error {
 	sc := stripe.NewClient(key)
 
 	for _, p := range billing.Plans {
-		if err := ensurePrice(ctx, sc, p); err != nil {
-			return fmt.Errorf("%s: %w", p.Tier, err)
+		prices := []price{{label: p.Tier, product: "FounderStack " + p.Name, lookupKey: p.LookupKey, usd: p.MonthlyPriceUSD, tier: p.Tier}}
+		//each tier's "additional client workspace", billed per unit.
+		if p.ExtraWorkspaceLookupKey != "" {
+			prices = append(prices, price{
+				label: p.Tier + "+ws", product: "FounderStack additional client workspace (" + p.Name + ")",
+				lookupKey: p.ExtraWorkspaceLookupKey, usd: p.ExtraWorkspaceUSD, tier: p.Tier,
+			})
+		}
+		for _, pr := range prices {
+			if err := ensurePrice(ctx, sc, pr); err != nil {
+				return fmt.Errorf("%s: %w", pr.lookupKey, err)
+			}
 		}
 	}
 	return ensurePortal(ctx, sc)
 }
 
-func ensurePrice(ctx context.Context, sc *stripe.Client, p billing.Plan) error {
-	want := p.MonthlyPriceUSD * 100
+type price struct {
+	label, product, lookupKey, tier string
+	usd                             int64
+}
+
+func ensurePrice(ctx context.Context, sc *stripe.Client, p price) error {
+	want := p.usd * 100
 	var productID string
-	params := &stripe.PriceListParams{Active: stripe.Bool(true), LookupKeys: []*string{stripe.String(p.LookupKey)}}
-	for price, err := range sc.V1Prices.List(ctx, params).All(ctx) {
+	params := &stripe.PriceListParams{Active: stripe.Bool(true), LookupKeys: []*string{stripe.String(p.lookupKey)}}
+	for existing, err := range sc.V1Prices.List(ctx, params).All(ctx) {
 		if err != nil {
 			return err
 		}
-		if price.UnitAmount == want && price.Recurring != nil && price.Recurring.Interval == "month" {
-			fmt.Printf("  %-8s ok       %s ($%d/mo)\n", p.Tier, price.ID, p.MonthlyPriceUSD)
+		if existing.UnitAmount == want && existing.Recurring != nil && existing.Recurring.Interval == "month" {
+			fmt.Printf("  %-10s ok       %s ($%d/mo)\n", p.label, existing.ID, p.usd)
 			return nil
 		}
-		productID = price.Product.ID
+		productID = existing.Product.ID
 	}
 
 	if productID == "" {
 		prod, err := sc.V1Products.Create(ctx, &stripe.ProductCreateParams{
-			Name:     stripe.String("FounderStack " + p.Name),
-			Metadata: map[string]string{"tier": p.Tier},
+			Name:     stripe.String(p.product),
+			Metadata: map[string]string{"tier": p.tier},
 		})
 		if err != nil {
 			return err
 		}
 		productID = prod.ID
 	}
-	price, err := sc.V1Prices.Create(ctx, &stripe.PriceCreateParams{
+	created, err := sc.V1Prices.Create(ctx, &stripe.PriceCreateParams{
 		Product:           stripe.String(productID),
 		Currency:          stripe.String("usd"),
 		UnitAmount:        stripe.Int64(want),
 		Recurring:         &stripe.PriceCreateRecurringParams{Interval: stripe.String("month")},
-		LookupKey:         stripe.String(p.LookupKey),
+		LookupKey:         stripe.String(p.lookupKey),
 		TransferLookupKey: stripe.Bool(true),
-		Nickname:          stripe.String(p.Name + " monthly"),
-		Metadata:          map[string]string{"tier": p.Tier},
+		Nickname:          stripe.String(p.product + " monthly"),
+		Metadata:          map[string]string{"tier": p.tier},
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("  %-8s created  %s ($%d/mo)\n", p.Tier, price.ID, p.MonthlyPriceUSD)
+	fmt.Printf("  %-10s created  %s ($%d/mo)\n", p.label, created.ID, p.usd)
 	return nil
 }
 
@@ -89,7 +104,7 @@ func ensurePortal(ctx context.Context, sc *stripe.Client) error {
 			return err
 		}
 		if cfg.Metadata[billing.PortalConfigMetadataKey] == "true" {
-			fmt.Printf("  portal   ok       %s\n", cfg.ID)
+			fmt.Printf("  %-10s ok       %s\n", "portal", cfg.ID)
 			return nil
 		}
 	}
@@ -113,6 +128,6 @@ func ensurePortal(ctx context.Context, sc *stripe.Client) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("  portal   created  %s\n", cfg.ID)
+	fmt.Printf("  %-10s created  %s\n", "portal", cfg.ID)
 	return nil
 }

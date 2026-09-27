@@ -3,6 +3,7 @@ package billing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -35,16 +36,30 @@ type subscriptionView struct {
 	Plan corebilling.Plan `json:"plan"`
 	// Status is Stripe's subscription status, or "trial"/"trial_expired"
 	// for an org that has never subscribed.
-	Status            string             `json:"status"`
-	TrialEndsAt       *string            `json:"trial_ends_at"`
-	NextBillingDate   *string            `json:"next_billing_date"`
-	CancelAtPeriodEnd bool               `json:"cancel_at_period_end"`
-	HasBillingAccount bool               `json:"has_billing_account"`
-	CanManage         bool               `json:"can_manage"`
-	ManagedByPractice bool               `json:"managed_by_practice"`
-	BillingConfigured bool               `json:"billing_configured"`
-	Usage             planUsage          `json:"usage"`
-	Plans             []corebilling.Plan `json:"plans"`
+	Status            string    `json:"status"`
+	TrialEndsAt       *string   `json:"trial_ends_at"`
+	NextBillingDate   *string   `json:"next_billing_date"`
+	CancelAtPeriodEnd bool      `json:"cancel_at_period_end"`
+	HasBillingAccount bool      `json:"has_billing_account"`
+	CanManage         bool      `json:"can_manage"`
+	ManagedByPractice bool      `json:"managed_by_practice"`
+	BillingConfigured bool      `json:"billing_configured"`
+	Usage             planUsage `json:"usage"`
+	// ClientWorkspaces is set for a practice (workflow 24).
+	ClientWorkspaces *clientWorkspaceUsage `json:"client_workspaces,omitempty"`
+	// NextInvoiceEstimateUSD is the plan plus any extra client workspaces
+	// at the current count — an estimate: prorations for mid-period
+	// changes and taxes aren't included.
+	NextInvoiceEstimateUSD *int64             `json:"next_invoice_estimate_usd"`
+	Plans                  []corebilling.Plan `json:"plans"`
+}
+
+type clientWorkspaceUsage struct {
+	Active            int64 `json:"active"`
+	Included          int32 `json:"included"`
+	Max               int32 `json:"max"`
+	Extra             int64 `json:"extra"`
+	ExtraWorkspaceUSD int64 `json:"extra_workspace_usd"`
 }
 
 // Subscription is readable by every member (they see the same plan limits
@@ -64,13 +79,16 @@ func (h *Handler) Subscription(c *gin.Context) {
 }
 
 func (h *Handler) subscriptionView(ctx context.Context, user authctx.User) (subscriptionView, error) {
-	var org dbgen.GetOrgBillingRow
+	// The org row is read through app_system (still pinned to the caller's
+	// own org): its active client workspace count spans child orgs, which
+	// RLS hides from app_user.
+	org, err := dbgen.New(h.systemPool).GetOrgBilling(ctx, user.OrgID)
+	if err != nil {
+		return subscriptionView{}, err
+	}
 	var usage dbgen.GetOrgBillingUsageRow
-	err := tenant.WithTx(ctx, h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+	err = tenant.WithTx(ctx, h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		var err error
-		if org, err = q.GetOrgBilling(ctx, user.OrgID); err != nil {
-			return err
-		}
 		usage, err = q.GetOrgBillingUsage(ctx, user.OrgID)
 		return err
 	})
@@ -108,8 +126,20 @@ func (h *Handler) subscriptionView(ctx context.Context, user authctx.User) (subs
 	if status == "trial" || status == "trial_expired" || status == "trialing" {
 		view.TrialEndsAt = timeString(org.TrialEndsAt)
 	}
+	var extra int64
+	if org.OrganizationType == "practice" {
+		extra = plan.ExtraWorkspaces(org.ActiveClientWorkspaces)
+		view.ClientWorkspaces = &clientWorkspaceUsage{
+			Active: org.ActiveClientWorkspaces, Included: org.IncludedClientWorkspaces, Max: org.MaxClientWorkspaces,
+			Extra: extra, ExtraWorkspaceUSD: plan.ExtraWorkspaceUSD,
+		}
+	}
 	if corebilling.IsLive(status) {
 		view.NextBillingDate = timeString(org.CurrentPeriodEnd)
+		if !org.CancelAtPeriodEnd {
+			estimate := plan.MonthlyPriceUSD + extra*plan.ExtraWorkspaceUSD
+			view.NextInvoiceEstimateUSD = &estimate
+		}
 	}
 	return view, nil
 }
@@ -148,6 +178,16 @@ func (h *Handler) Upgrade(c *gin.Context) {
 	org, err := q.GetOrgBilling(ctx, user.OrgID)
 	if err != nil {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not load subscription")
+		return
+	}
+
+	// A practice can't move to a plan that allows fewer client workspaces
+	// than it's running — that would silently stop billing for the rest.
+	if org.ActiveClientWorkspaces > int64(plan.MaxClientWorkspaces) {
+		response.Fail(c, http.StatusConflict, "TOO_MANY_CLIENT_WORKSPACES", fmt.Sprintf(
+			"%s allows %d client workspace%s and you have %d active. Remove %d before switching.",
+			plan.Name, plan.MaxClientWorkspaces, plural(int64(plan.MaxClientWorkspaces)),
+			org.ActiveClientWorkspaces, org.ActiveClientWorkspaces-int64(plan.MaxClientWorkspaces)))
 		return
 	}
 
@@ -315,6 +355,13 @@ func timeString(t pgtype.Timestamptz) *string {
 	}
 	s := t.Time.UTC().Format(time.RFC3339)
 	return &s
+}
+
+func plural(n int64) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func deref(s *string) string {

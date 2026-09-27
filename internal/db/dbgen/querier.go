@@ -282,6 +282,10 @@ type Querier interface {
 	// only sees runs that are genuinely still in progress.
 	HasInFlightRun(ctx context.Context, workflowID pgtype.UUID) (bool, error)
 	IncrementOrgTotalHoursSaved(ctx context.Context, arg IncrementOrgTotalHoursSavedParams) error
+	// A client workspace is billed through its practice, so it runs on the
+	// practice's plan limits. Called whenever the practice's plan changes and
+	// when a workspace is created under it.
+	InheritPracticePlan(ctx context.Context, arg InheritPracticePlanParams) error
 	// ON CONFLICT ... DO NOTHING against the partial unique index added in
 	// 000006_agents_unique_org_name_active: a real duplicate name returns 0
 	// rows (pgx.ErrNoRows on the :one Scan), which the handler translates to a
@@ -485,6 +489,7 @@ type Querier interface {
 	// digest in its own timezone yet, and it's had some activity in the last
 	// 7 days (skips ghost emails to churned/empty orgs, per spec).
 	ListOrgsDueForDigest(ctx context.Context) ([]ListOrgsDueForDigestRow, error)
+	ListPracticesWithLiveSubscriptions(ctx context.Context) ([]pgtype.UUID, error)
 	ListPushSubscriptionsForOrg(ctx context.Context, orgID pgtype.UUID) ([]ListPushSubscriptionsForOrgRow, error)
 	ListReportCostByAgent(ctx context.Context, arg ListReportCostByAgentParams) ([]ListReportCostByAgentRow, error)
 	// cost_usd includes a team run's specialist sub-runs, so one row carries the
