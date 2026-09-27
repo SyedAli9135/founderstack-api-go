@@ -177,7 +177,14 @@ SELECT
     (SELECT count(*) FROM approvals ap
         WHERE ap.org_id = o.id AND ap.status = 'pending')::bigint AS pending_approvals,
     (SELECT COALESCE(SUM(cl.estimated_cost_usd), 0) FROM cost_ledger cl
-        WHERE cl.org_id = o.id)::double precision AS total_cost_usd
+        WHERE cl.org_id = o.id)::double precision AS total_cost_usd,
+    (SELECT count(*) FROM sop_deployments d
+        JOIN sop_playbooks p ON p.id = d.sop_playbook_id AND p.is_active = true
+        WHERE d.target_org_id = o.id AND d.is_active = true)::bigint AS sops_deployed,
+    (SELECT count(*) FROM sop_deployments d
+        JOIN sop_playbooks p ON p.id = d.sop_playbook_id AND p.is_active = true
+        WHERE d.target_org_id = o.id AND d.is_active = true
+          AND d.deployed_version < p.current_version)::bigint AS sop_updates_available
 FROM organizations o
 JOIN users u ON u.org_id = o.id AND u.clerk_user_id = $2 AND u.is_active = true
 WHERE o.parent_practice_id = $1
@@ -190,18 +197,20 @@ type ListClientWorkspacesWithStatsParams struct {
 }
 
 type ListClientWorkspacesWithStatsRow struct {
-	ID               pgtype.UUID        `json:"id"`
-	ClerkOrgID       string             `json:"clerk_org_id"`
-	Name             string             `json:"name"`
-	Slug             string             `json:"slug"`
-	IsActive         *bool              `json:"is_active"`
-	DeactivatedAt    pgtype.Timestamptz `json:"deactivated_at"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	Settings         []byte             `json:"settings"`
-	HoursSaved       float64            `json:"hours_saved"`
-	ActiveRuns       int64              `json:"active_runs"`
-	PendingApprovals int64              `json:"pending_approvals"`
-	TotalCostUsd     float64            `json:"total_cost_usd"`
+	ID                  pgtype.UUID        `json:"id"`
+	ClerkOrgID          string             `json:"clerk_org_id"`
+	Name                string             `json:"name"`
+	Slug                string             `json:"slug"`
+	IsActive            *bool              `json:"is_active"`
+	DeactivatedAt       pgtype.Timestamptz `json:"deactivated_at"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	Settings            []byte             `json:"settings"`
+	HoursSaved          float64            `json:"hours_saved"`
+	ActiveRuns          int64              `json:"active_runs"`
+	PendingApprovals    int64              `json:"pending_approvals"`
+	TotalCostUsd        float64            `json:"total_cost_usd"`
+	SopsDeployed        int64              `json:"sops_deployed"`
+	SopUpdatesAvailable int64              `json:"sop_updates_available"`
 }
 
 // Includes deactivated workspaces (still inside or past their restore
@@ -229,6 +238,8 @@ func (q *Queries) ListClientWorkspacesWithStats(ctx context.Context, arg ListCli
 			&i.ActiveRuns,
 			&i.PendingApprovals,
 			&i.TotalCostUsd,
+			&i.SopsDeployed,
+			&i.SopUpdatesAvailable,
 		); err != nil {
 			return nil, err
 		}

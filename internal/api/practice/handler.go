@@ -29,13 +29,16 @@ const RestoreWindow = 30 * 24 * time.Hour
 
 type Handler struct {
 	systemPool  *pgxpool.Pool
+	appPool     *pgxpool.Pool
 	provisioner WorkspaceProvisioner
+	tools       ToolCatalog
 }
 
 // systemPool must be app_system: a portfolio spans several tenants, which
-// no single RLS-scoped app_user transaction can see.
-func NewHandler(systemPool *pgxpool.Pool, provisioner WorkspaceProvisioner) *Handler {
-	return &Handler{systemPool: systemPool, provisioner: provisioner}
+// no single RLS-scoped app_user transaction can see. appPool (app_user) is
+// for SOP writes, which always target exactly one tenant and go through RLS.
+func NewHandler(systemPool, appPool *pgxpool.Pool, provisioner WorkspaceProvisioner, tools ToolCatalog) *Handler {
+	return &Handler{systemPool: systemPool, appPool: appPool, provisioner: provisioner, tools: tools}
 }
 
 // RegisterIdentityOnly mounts routes that sit behind middleware.RequireIdentity
@@ -50,6 +53,7 @@ func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.DELETE("/practice/client-workspaces/:id", h.RemoveClientWorkspace)
 	rg.POST("/practice/client-workspaces/:id/restore", h.RestoreClientWorkspace)
 	rg.GET("/practice/portfolio-summary", h.PortfolioSummary)
+	h.registerSops(rg)
 }
 
 type workspaceRef struct {
@@ -138,10 +142,12 @@ func (h *Handler) resolvePractice(c *gin.Context, user authctx.User) (practiceCo
 }
 
 type workspaceStats struct {
-	HoursSaved       float64 `json:"hours_saved"`
-	ActiveRuns       int64   `json:"active_runs"`
-	PendingApprovals int64   `json:"pending_approvals"`
-	TotalCostUSD     float64 `json:"total_cost_usd"`
+	HoursSaved          float64 `json:"hours_saved"`
+	ActiveRuns          int64   `json:"active_runs"`
+	PendingApprovals    int64   `json:"pending_approvals"`
+	TotalCostUSD        float64 `json:"total_cost_usd"`
+	SopsDeployed        int64   `json:"sops_deployed"`
+	SopUpdatesAvailable int64   `json:"sop_updates_available"`
 }
 
 type clientWorkspace struct {
@@ -196,6 +202,7 @@ func (h *Handler) ListClientWorkspaces(c *gin.Context) {
 			Stats: workspaceStats{
 				HoursSaved: r.HoursSaved, ActiveRuns: r.ActiveRuns,
 				PendingApprovals: r.PendingApprovals, TotalCostUSD: r.TotalCostUsd,
+				SopsDeployed: r.SopsDeployed, SopUpdatesAvailable: r.SopUpdatesAvailable,
 			},
 		}
 		ws.Status, ws.DeactivatedAt, ws.RestorableUntil = lifecycle(r.IsActive, r.DeactivatedAt, now)

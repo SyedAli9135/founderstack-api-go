@@ -65,6 +65,28 @@ type workflowView struct {
 	Version                int32      `json:"version"`
 	CreatedAt              time.Time  `json:"created_at"`
 	UpdatedAt              time.Time  `json:"updated_at"`
+	// Set when a practice SOP deployment manages this workflow; a sync
+	// overwrites manual edits (but never un-pauses it).
+	Sop *sopLabel `json:"sop,omitempty"`
+}
+
+type sopLabel struct {
+	Name    string `json:"name"`
+	Version int32  `json:"version"`
+}
+
+func sopLabelsByWorkflow(ctx context.Context, q *dbgen.Queries, orgID pgtype.UUID) (map[pgtype.UUID]*sopLabel, error) {
+	rows, err := q.ListSopManagedResources(ctx, orgID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[pgtype.UUID]*sopLabel, len(rows))
+	for _, r := range rows {
+		if r.WorkflowID.Valid {
+			out[r.WorkflowID] = &sopLabel{Name: r.SopName, Version: r.DeployedVersion}
+		}
+	}
+	return out, nil
 }
 
 // Shared by List/Get/Insert/UpdateWorkflowRow, minus agent_name — Insert/Update don't JOIN
@@ -142,8 +164,14 @@ func (h *Handler) List(c *gin.Context) {
 		if err != nil {
 			return err
 		}
+		labels, err := sopLabelsByWorkflow(ctx, q, user.OrgID)
+		if err != nil {
+			return err
+		}
 		for _, r := range rows {
-			views = append(views, viewFromList(r))
+			v := viewFromList(r)
+			v.Sop = labels[r.ID]
+			views = append(views, v)
 		}
 		return nil
 	})
@@ -173,6 +201,11 @@ func (h *Handler) Get(c *gin.Context) {
 			return err
 		}
 		view = viewFromGet(r)
+		labels, err := sopLabelsByWorkflow(ctx, q, user.OrgID)
+		if err != nil {
+			return err
+		}
+		view.Sop = labels[r.ID]
 		return nil
 	})
 	if err != nil {

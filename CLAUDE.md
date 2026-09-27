@@ -24,7 +24,7 @@ Anthropic-only original). See "BYOK API Keys" below.
 
 **Workflows 1 (bootstrap) through 14 (token usage & analytics), plus workflows 16 (disconnect/
 reconnect integration), 17 (view audit logs), 18 (multi-agent team run / A2A), 19 (agent
-templates marketplace), 20 (daily email digest), and 21 (practice & client workspaces), are implemented — workflows 18/19/20's own
+templates marketplace), 20 (daily email digest), 21 (practice & client workspaces), and 22 (SOP library), are implemented — workflows 18/19/20's own
 frontends (team pages, the templates gallery, the digest settings card) live in
 `../founderstack-web`, its own repo, per this codebase's usual backend/frontend split; see that
 repo's `AGENTS.md` for its own detail.
@@ -37,7 +37,7 @@ to build against fabricated inputs. Workflow 14
 Analytics (workflow 14)", "Disconnect / Reconnect Integration (workflow 16)", "View Audit Logs
 (workflow 17)", "Multi-Agent Team Run / A2A (workflow 18)", "Agent Templates Marketplace
 (workflow 19)", and "Daily Email Digest (workflow 20)" below. Don't assume routes, tables, or
-packages from workflow 22+ in
+packages from workflow 23+ in
 `WORKFLOW_PLAN_GO.md` exist — check
 `internal/api/v1/`, `internal/api/webhooks/`, `internal/api/settings/`, `internal/api/identity/`,
 `internal/api/integrations/`, `internal/api/documents/`, `internal/api/agents/`,
@@ -2042,6 +2042,64 @@ to the row's `s3_path`. Real persistence would need a paid LocalStack tier or a 
 Note the compose project is shared with the Python repo (see "Shared local Postgres"), whose own
 compose file doesn't mount this script — start infra from this repo to get it.
 
+### SOP Library (workflow 22) — `internal/core/sop`, `internal/api/practice/sops.go`
+
+Built 2026-09-26. A practice's reusable playbooks: one agent + an optional workflow + declared
+parameters, versioned, deployed into client workspaces as ordinary `agents`/`workflows` rows.
+Migration `000019` (`sop_playbooks`, `sop_playbook_versions` — immutable history,
+`sop_deployments`). Scope decisions (single agent per SOP per the spec's own schema, parameter
+model, sync/un-deploy/delete semantics) are in `WORKFLOW_PLAN_GO.md`'s workflow 22 section.
+
+**`internal/core/sop` is pure** (no DB/HTTP) and holds the rules: `Validate` mirrors the agents and
+workflows APIs' own checks (50-char prompt, known tools, positive caps, valid cron) so a SOP can
+never deploy something those APIs would reject, plus "every `{{key}}` used is declared";
+`ValidateOverrides`/`Render` apply one client's overrides — parameter values (placeholders in the
+system prompt and task input), cost cap, tool-call cap, cron, requires_approval. Overrides live on
+the deployment and are re-applied on every sync, so they survive version updates; an override for
+a parameter a newer version dropped is ignored, not an error.
+
+**Trust boundaries, same split as workflow 21's `practice.sql`:** cross-tenant reads (library list
+with deployment counts, a SOP's deployments with workspace names and connected integrations) run on
+`app_system`, pinned to the resolved practice and the caller's own memberships. Writes go through
+RLS: playbook create/edit via `tenant.WithTx` on the practice; deploy/sync/override/un-deploy via
+`tenant.WithTx` on the **target client workspace** — the agent, workflow and deployment row are
+written in one transaction there (`sop_deployments`' `WITH CHECK` only admits rows for the current
+org). The one exception is library delete, which runs on `app_system` with the practice guard
+because it must also detach deployments across client workspaces. Deploy/sync additionally require
+owner/admin in the target workspace, not just the practice.
+
+**Semantics:** edit that touches config/parameters bumps `current_version` + writes a version row
+(metadata-only edits don't); deployments then report `update_available` until synced. Sync
+overwrites every SOP-controlled field on the client's rows but never touches `workflows.is_active`
+(a client's pause survives). A client that removed the SOP's agent makes the deployment `broken`;
+sync refuses (`409 DEPLOYMENT_BROKEN`) — remove and redeploy. `PATCH .../deployments/{id}` applies
+new overrides at the deployment's *current* version (re-read from `sop_playbook_versions`) — it
+never silently upgrades. Un-deploy deactivates the agent and pauses the workflow (history kept).
+Library delete leaves deployed agents running and detaches their deployments, so the
+"Managed by SOP" labels (`ListSopManagedResources`, surfaced as `sop` on agent/workflow views)
+disappear rather than advertising a SOP that can never sync again. Deploying doesn't require the
+target to have the SOP's integrations connected; each deployment reports `missing_integrations`.
+
+**Deployment counts follow the viewer's memberships** (library cards, detail header), exactly like
+the deployments list — a practice member who isn't in a client workspace neither sees nor counts
+its deployment (found live: the card said "1 client" while the list the same member saw was empty).
+
+**Found live, not by tests:** the real MCP tool catalog names differ from test fakes
+(`slack.send_message`, not `post_message`); and promoting an agent that predates the 50-char prompt
+rule (or has no tools) is correctly rejected — the frontend explains how to fix the source agent.
+
+**Testing**: `internal/core/sop/sop_test.go` (36 cases), `internal/api/practice/sops_integration_test.go`
+(end-to-end incl. the spec's "edit → both outdated → sync one → only it updates, overrides kept",
+pause-preserved, broken deployment, un-deploy isolation, delete detaches, promote-from-agent,
+member/cross-practice access, client-side RLS can't read playbooks, a later version adding a
+workflow (sync creates it) or dropping it (sync pauses + unlinks it), a dropped-but-overridden
+parameter, and failed deploys — name clash, agent limit — leaving no rows behind). Live-verified
+too: those add/remove branches, the failure messages in the deploy dialog, a "broken" deployment,
+the missing-integrations warning disappearing once connected, and a deployed *scheduled* workflow
+fired by the scheduler with its rendered input. Live-verified in the browser
+2026-09-26 against the real tool catalog in mock mode, including a deployed workflow actually
+running with its rendered task input.
+
 ### No ORM — `pgx` + `sqlc`, not GORM
 
 Deliberate choice over GORM: this schema relies on Postgres RLS policies keyed on `org_id`,
@@ -2306,9 +2364,11 @@ machine — CI runs the authoritative version of the same check regardless.
 | `GET /api/v1/me/workspaces` | `internal/api/practice/handler.go` | `middleware.RequireAuth` | Every active org the caller belongs to — the workspace switcher's source (workflow 21) |
 | `GET/POST /api/v1/practice/client-workspaces`, `DELETE /practice/client-workspaces/{id}`, `POST .../{id}/restore` | `internal/api/practice/handler.go` | `middleware.RequireAuth` (+practice owner/admin guard on mutations) | Client workspace portfolio: list with stats, create via Clerk, soft-remove, restore within 30 days (workflow 21) |
 | `GET /api/v1/practice/portfolio-summary` | `internal/api/practice/handler.go` | `middleware.RequireAuth` | Rolled-up hours saved / active runs / pending approvals / cost across active client workspaces (workflow 21) |
+| `GET/POST /api/v1/practice/sops`, `GET /practice/sops/tools`, `GET/PATCH/DELETE /practice/sops/{id}` | `internal/api/practice/sops.go` | `middleware.RequireAuth` (+practice owner/admin on writes) | SOP library: list, create (scratch or from an existing agent), versioned edit, detach-on-delete, full tool catalog (workflow 22) |
+| `POST /api/v1/practice/sops/{id}/deploy`, `GET .../deployments`, `PATCH/DELETE .../deployments/{deployment_id}`, `POST .../deployments/{deployment_id}/sync` | `internal/api/practice/sops.go` | `middleware.RequireAuth` (+practice and target-workspace owner/admin) | Deploy a SOP to a client workspace, per-client overrides, sync to latest version, un-deploy (workflow 22) |
 
 (Workflow 15 is deliberately deferred — see that section's own scope note. Everything else in
-`WORKFLOW_PLAN_GO.md` — workflow 22 onward — is unbuilt. Add rows here as routers land.)
+`WORKFLOW_PLAN_GO.md` — workflow 23 onward — is unbuilt. Add rows here as routers land.)
 
 ### Dependency policy
 

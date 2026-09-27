@@ -386,7 +386,7 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 
 	apiPractice := router.Group("/api/v1")
 	apiPractice.Use(middleware.RequireAuth(systemDB, cfg))
-	practiceHandler := practiceapi.NewHandler(systemDB, practiceapi.NewClerkProvisioner(organization.NewClient(&clerk.ClientConfig{})))
+	practiceHandler := practiceapi.NewHandler(systemDB, db, practiceapi.NewClerkProvisioner(organization.NewClient(&clerk.ClientConfig{})), mcpRegistry)
 	practiceHandler.Register(apiPractice)
 
 	apiIdentity := router.Group("/api/v1")

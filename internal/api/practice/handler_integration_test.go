@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/founderstack/api/internal/api/middleware"
 	"github.com/founderstack/api/internal/config"
@@ -81,11 +82,41 @@ func testSystemPool(t *testing.T) *pgxpool.Pool {
 
 var testCfg = &config.Config{AppEnv: "development", DevTokenSecret: "test-dev-token-secret"}
 
+// fakeTools stands in for the MCP registry's catalog.
+type fakeTools struct{}
+
+func (fakeTools) ListTools(ctx context.Context) (map[string][]*gomcp.Tool, error) {
+	return map[string][]*gomcp.Tool{
+		"slack":  {{Name: "post_message", Description: "Post a message"}},
+		"stripe": {{Name: "list_payments", Description: "List payments"}},
+	}, nil
+}
+
+// testAppPool is optional for the workflow 21 tests (nil when unset) — only
+// the SOP tests, which write through RLS, require it.
+func testAppPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := os.Getenv("TEST_APP_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_APP_DATABASE_URL not set; skipping integration test")
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("connect to app test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
 func testRouter(pool *pgxpool.Pool, prov WorkspaceProvisioner) *gin.Engine {
+	return testRouterWithApp(pool, nil, prov)
+}
+
+func testRouterWithApp(pool, appPool *pgxpool.Pool, prov WorkspaceProvisioner) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(middleware.RequestID())
-	h := NewHandler(pool, prov)
+	h := NewHandler(pool, appPool, prov, fakeTools{})
 	g := r.Group("/api/v1")
 	g.Use(middleware.RequireAuth(pool, testCfg))
 	h.Register(g)
@@ -255,6 +286,7 @@ type listResponse struct {
 			ActiveRuns       int64   `json:"active_runs"`
 			PendingApprovals int64   `json:"pending_approvals"`
 			TotalCostUSD     float64 `json:"total_cost_usd"`
+			SopsDeployed     int64   `json:"sops_deployed"`
 		} `json:"stats"`
 	} `json:"workspaces"`
 }

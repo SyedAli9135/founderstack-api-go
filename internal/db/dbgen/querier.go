@@ -11,6 +11,9 @@ import (
 )
 
 type Querier interface {
+	// The row lock this UPDATE takes serializes concurrent edits, and
+	// sop_playbook_versions' UNIQUE(sop_playbook_id, version) backs it up.
+	BumpSopPlaybookVersion(ctx context.Context, arg BumpSopPlaybookVersionParams) (int32, error)
 	// Re-checks "still due" under a row lock inside the firing transaction.
 	// SKIP LOCKED means that if several API processes tick at once, each due
 	// workflow is claimed by exactly one of them; the others get no row and
@@ -36,6 +39,9 @@ type Querier interface {
 	// Only ever called after the real Clerk-side removal already succeeded —
 	// see Handler.Remove's doc comment for why the ordering matters.
 	DeactivateMember(ctx context.Context, arg DeactivateMemberParams) error
+	DeactivateSopAgent(ctx context.Context, arg DeactivateSopAgentParams) error
+	DeactivateSopDeployment(ctx context.Context, arg DeactivateSopDeploymentParams) (int64, error)
+	DeactivateSopPlaybook(ctx context.Context, arg DeactivateSopPlaybookParams) (int64, error)
 	// Semantically identical to PATCH {is_active: false} (pause) — kept as its
 	// own endpoint only for symmetry with every other resource's DELETE verb
 	// in this codebase, not because it does anything a pause doesn't already
@@ -44,6 +50,12 @@ type Querier interface {
 	DeactivateWorkflow(ctx context.Context, arg DeactivateWorkflowParams) (int64, error)
 	DeleteDocumentChunks(ctx context.Context, docID pgtype.UUID) error
 	DeletePushSubscription(ctx context.Context, arg DeletePushSubscriptionParams) error
+	// System pool: runs with the library delete, which executes in the
+	// practice's context, while deployments are only writable from their client
+	// workspace's. Stops tracking only — the agents/workflows are untouched and
+	// keep running; this just clears their "Managed by SOP" labels, since a
+	// deleted SOP can never sync them again.
+	DetachSopDeployments(ctx context.Context, sopPlaybookID pgtype.UUID) error
 	// Backs the no-login unsubscribe link — deliberately only ever turns the
 	// digest off, never on, so a leaked/replayed token can't be used to
 	// re-enable something a founder actively disabled some other way.
@@ -222,6 +234,9 @@ type Querier interface {
 	// must belong to, rather than trusting a client-supplied team id, and
 	// which workflow_id to insert the specialist's own sub-run row against.
 	GetRunTeamAndWorkflow(ctx context.Context, arg GetRunTeamAndWorkflowParams) (GetRunTeamAndWorkflowRow, error)
+	GetSopDeployment(ctx context.Context, arg GetSopDeploymentParams) (GetSopDeploymentRow, error)
+	GetSopPlaybook(ctx context.Context, arg GetSopPlaybookParams) (GetSopPlaybookRow, error)
+	GetSopPlaybookVersion(ctx context.Context, arg GetSopPlaybookVersionParams) (GetSopPlaybookVersionRow, error)
 	GetTeamWorkflow(ctx context.Context, arg GetTeamWorkflowParams) (pgtype.UUID, error)
 	// GetUserApprovalPermissions backs both the authenticated and the
 	// action-token approve/reject paths (internal/api/approvals/handler.go) —
@@ -238,6 +253,7 @@ type Querier interface {
 	// Only called after purgeDocumentJob has successfully removed the
 	// Pinecone vectors and the S3 object — see internal/core/documents/purge.go.
 	HardDeleteDocument(ctx context.Context, arg HardDeleteDocumentParams) error
+	HasActiveSopDeployment(ctx context.Context, arg HasActiveSopDeploymentParams) (bool, error)
 	// Stale pending/running rows are reaped by ReapStaleRuns first, so this
 	// only sees runs that are genuinely still in progress.
 	HasInFlightRun(ctx context.Context, workflowID pgtype.UUID) (bool, error)
@@ -286,6 +302,12 @@ type Querier interface {
 	// after — one INSERT instead of an insert-then-update dance.
 	InsertDocument(ctx context.Context, arg InsertDocumentParams) error
 	InsertDocumentChunk(ctx context.Context, arg InsertDocumentChunkParams) error
+	// Client-side writes (tenant.WithTx on the target workspace).
+	InsertSopDeployment(ctx context.Context, arg InsertSopDeploymentParams) (InsertSopDeploymentRow, error)
+	// A name collision with another active SOP returns no row (ErrNoRows), same
+	// convention as InsertAgent.
+	InsertSopPlaybook(ctx context.Context, arg InsertSopPlaybookParams) (pgtype.UUID, error)
+	InsertSopPlaybookVersion(ctx context.Context, arg InsertSopPlaybookVersionParams) error
 	// Workflow 18's own auto-created companion row, one per agent_teams row —
 	// see the note on ListWorkflows above. graph_definition mirrors
 	// InsertWorkflow's own fixed marker; trigger_type is always 'manual' since
@@ -387,6 +409,7 @@ type Querier interface {
 	// window) so the portfolio page can offer a restore; the handler decides
 	// restorability from deactivated_at.
 	ListClientWorkspacesWithStats(ctx context.Context, arg ListClientWorkspacesWithStatsParams) ([]ListClientWorkspacesWithStatsRow, error)
+	ListConnectedServices(ctx context.Context, orgID pgtype.UUID) ([]string, error)
 	ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) ([]ListConnectionsByOrgRow, error)
 	// Paginated GET /billing/ledger.
 	ListCostLedgerPage(ctx context.Context, arg ListCostLedgerPageParams) ([]ListCostLedgerPageRow, error)
@@ -450,6 +473,27 @@ type Querier interface {
 	// requesting user's own role check (role IN ('owner','admin')), computed
 	// in Go, not SQL — see internal/api/documents/handler.go's Search.
 	ListSearchableDocumentIDs(ctx context.Context, arg ListSearchableDocumentIDsParams) ([]pgtype.UUID, error)
+	// Only workspaces the caller belongs to, same rule as the portfolio.
+	ListSopDeploymentsForPlaybook(ctx context.Context, arg ListSopDeploymentsForPlaybookParams) ([]ListSopDeploymentsForPlaybookRow, error)
+	// Tenant-scoped (app_user in the client workspace): which of this
+	// workspace's agents/workflows a SOP deployment manages, for the "Managed by
+	// SOP" labels. sop_name is the deployment's own snapshot, since the
+	// practice's playbook rows are invisible from here.
+	ListSopManagedResources(ctx context.Context, targetOrgID pgtype.UUID) ([]ListSopManagedResourcesRow, error)
+	ListSopPlaybookVersions(ctx context.Context, sopPlaybookID pgtype.UUID) ([]ListSopPlaybookVersionsRow, error)
+	// Workflow 22 (SOP Library). Two trust boundaries, same split as practice.sql:
+	//   * reads that span tenants (a playbook's deployments across client
+	//     workspaces, with their names and connected integrations) run on
+	//     app_system, and every one is pinned to the practice_id the handler
+	//     already authorized plus the caller's own active memberships;
+	//   * writes run on app_user under tenant.WithTx — playbook edits scoped to
+	//     the practice, deploy/sync writes scoped to the target client workspace
+	//     (sop_deployments' WITH CHECK only admits rows for the current org).
+	// System pool: the deployment counts join client organizations, which the
+	// practice's own RLS context can't see. Counts only workspaces the caller
+	// belongs to, the same rule as ListSopDeploymentsForPlaybook, so a card's
+	// count always matches the deployments list behind it.
+	ListSopPlaybooks(ctx context.Context, arg ListSopPlaybooksParams) ([]ListSopPlaybooksRow, error)
 	// Documents whose background job (processDocument or purgeDocumentJob)
 	// may have been running in a process that restarted mid-job — the
 	// goroutine-based tradeoff internal/core/documents.RecoverStuckJobs
@@ -503,6 +547,8 @@ type Querier interface {
 	// written, so this writes the terminal status directly.
 	MarkRunFailedPreflight(ctx context.Context, arg MarkRunFailedPreflightParams) error
 	MarkRunStarted(ctx context.Context, arg MarkRunStartedParams) error
+	MarkSopDeploymentSynced(ctx context.Context, arg MarkSopDeploymentSyncedParams) error
+	PauseSopWorkflow(ctx context.Context, arg PauseSopWorkflowParams) error
 	// Runs execute as goroutines in the API process and checkpoint (bumping
 	// updated_at) at every node, so a pending/running row untouched for an hour
 	// belongs to a process that died mid-run. awaiting_approval is excluded: it
@@ -518,6 +564,12 @@ type Querier interface {
 	SoftDeleteOrganizationByClerkOrgID(ctx context.Context, clerkOrgID string) (int64, error)
 	// A full Clerk account deletion (user.deleted): every membership goes.
 	SoftDeleteUserByClerkUserID(ctx context.Context, clerkUserID string) (int64, error)
+	// Overwrites every SOP-controlled field. Returns no row if the client has
+	// since removed the agent, which the handler reports as a broken deployment.
+	SyncSopAgent(ctx context.Context, arg SyncSopAgentParams) (pgtype.UUID, error)
+	// Deliberately leaves is_active alone: a sync must never un-pause a
+	// workflow the client paused.
+	SyncSopWorkflow(ctx context.Context, arg SyncSopWorkflowParams) (int64, error)
 	// Same shape as InsertWorkflowRun (triggered_by is NULL — the system, not
 	// a user, triggered this one), used because the scheduler has no
 	// per-request user/org session to run InsertWorkflowRun's tenant.WithTx
@@ -555,6 +607,9 @@ type Querier interface {
 	// a node's tool-call loop or an approval-gate pause. See WORKFLOW_PLAN_GO.md's
 	// Workflow 9 harness planning notes for the full reasoning.
 	UpdateRunCheckpoint(ctx context.Context, arg UpdateRunCheckpointParams) error
+	// Name/description/category aren't part of what a deployment renders, so
+	// they change in place without a new version.
+	UpdateSopPlaybookMeta(ctx context.Context, arg UpdateSopPlaybookMetaParams) (int64, error)
 	// Profile fields are per-person, so this deliberately updates every
 	// membership row the person holds, across all their orgs.
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (int64, error)

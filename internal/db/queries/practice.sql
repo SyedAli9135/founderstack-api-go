@@ -55,7 +55,14 @@ SELECT
     (SELECT count(*) FROM approvals ap
         WHERE ap.org_id = o.id AND ap.status = 'pending')::bigint AS pending_approvals,
     (SELECT COALESCE(SUM(cl.estimated_cost_usd), 0) FROM cost_ledger cl
-        WHERE cl.org_id = o.id)::double precision AS total_cost_usd
+        WHERE cl.org_id = o.id)::double precision AS total_cost_usd,
+    (SELECT count(*) FROM sop_deployments d
+        JOIN sop_playbooks p ON p.id = d.sop_playbook_id AND p.is_active = true
+        WHERE d.target_org_id = o.id AND d.is_active = true)::bigint AS sops_deployed,
+    (SELECT count(*) FROM sop_deployments d
+        JOIN sop_playbooks p ON p.id = d.sop_playbook_id AND p.is_active = true
+        WHERE d.target_org_id = o.id AND d.is_active = true
+          AND d.deployed_version < p.current_version)::bigint AS sop_updates_available
 FROM organizations o
 JOIN users u ON u.org_id = o.id AND u.clerk_user_id = $2 AND u.is_active = true
 WHERE o.parent_practice_id = $1

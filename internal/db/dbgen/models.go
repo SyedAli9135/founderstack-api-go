@@ -244,6 +244,51 @@ type Session struct {
 	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
 }
 
+type SopDeployment struct {
+	ID                 pgtype.UUID        `json:"id"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	SopPlaybookID      pgtype.UUID        `json:"sop_playbook_id"`
+	SopName            string             `json:"sop_name"`
+	DeployedVersion    int32              `json:"deployed_version"`
+	TargetOrgID        pgtype.UUID        `json:"target_org_id"`
+	AgentID            pgtype.UUID        `json:"agent_id"`
+	WorkflowID         pgtype.UUID        `json:"workflow_id"`
+	ParameterOverrides []byte             `json:"parameter_overrides"`
+	DeployedBy         pgtype.UUID        `json:"deployed_by"`
+	DeployedAt         pgtype.Timestamptz `json:"deployed_at"`
+	SyncedAt           pgtype.Timestamptz `json:"synced_at"`
+	IsActive           bool               `json:"is_active"`
+}
+
+type SopPlaybook struct {
+	ID             pgtype.UUID        `json:"id"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	PracticeID     pgtype.UUID        `json:"practice_id"`
+	Name           string             `json:"name"`
+	Description    *string            `json:"description"`
+	Category       *string            `json:"category"`
+	CurrentVersion int32              `json:"current_version"`
+	AgentConfig    []byte             `json:"agent_config"`
+	WorkflowConfig []byte             `json:"workflow_config"`
+	Parameters     []byte             `json:"parameters"`
+	CreatedBy      pgtype.UUID        `json:"created_by"`
+	IsActive       bool               `json:"is_active"`
+}
+
+type SopPlaybookVersion struct {
+	ID             pgtype.UUID        `json:"id"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	SopPlaybookID  pgtype.UUID        `json:"sop_playbook_id"`
+	Version        int32              `json:"version"`
+	AgentConfig    []byte             `json:"agent_config"`
+	WorkflowConfig []byte             `json:"workflow_config"`
+	Parameters     []byte             `json:"parameters"`
+	Changelog      *string            `json:"changelog"`
+	CreatedBy      pgtype.UUID        `json:"created_by"`
+}
+
 type User struct {
 	ID                    pgtype.UUID        `json:"id"`
 	CreatedAt             pgtype.Timestamptz `json:"created_at"`
