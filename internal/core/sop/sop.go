@@ -18,6 +18,14 @@ const (
 	DefaultTemperature     = 0.3
 	MinSystemPromptLen     = 50
 	maxNameLen             = 255
+
+	// A playbook is deployed into every client workspace and its prompt is
+	// sent to the model on every run, so each piece is bounded.
+	maxSystemPromptLen = 20000
+	maxTemplateLen     = 20000
+	maxParameters      = 50
+	maxParamValueLen   = 2000
+	maxAllowedTools    = 200
 )
 
 var validTriggerTypes = map[string]bool{"manual": true, "scheduled": true, "webhook": true}
@@ -104,12 +112,24 @@ func Validate(s Spec, knownTools map[string]bool) error {
 	if len(strings.TrimSpace(a.SystemPrompt)) < MinSystemPromptLen {
 		return invalid("SYSTEM_PROMPT_TOO_SHORT", "agent_config.system_prompt must be at least %d characters", MinSystemPromptLen)
 	}
+	if len(a.SystemPrompt) > maxSystemPromptLen {
+		return invalid("SYSTEM_PROMPT_TOO_LONG", "agent_config.system_prompt can be at most %d characters", maxSystemPromptLen)
+	}
+	if len(a.PolicyScope.AllowedTools) > maxAllowedTools {
+		return invalid("TOO_MANY_TOOLS", "agent_config.policy_scope.allowed_tools can list at most %d tools", maxAllowedTools)
+	}
 	if err := validatePolicyScope(a.PolicyScope, knownTools); err != nil {
 		return err
+	}
+	if len(s.Parameters) > maxParameters {
+		return invalid("TOO_MANY_PARAMETERS", "a SOP can declare at most %d parameters", maxParameters)
 	}
 
 	declared := map[string]bool{}
 	for _, p := range s.Parameters {
+		if len(p.Default) > maxParamValueLen {
+			return invalid("PARAMETER_TOO_LONG", "parameter %q default can be at most %d characters", p.Key, maxParamValueLen)
+		}
 		if !paramKeyPattern.MatchString(p.Key) {
 			return invalid("INVALID_PARAMETER_KEY", "parameter key %q must be lowercase letters, digits and underscores, starting with a letter", p.Key)
 		}
@@ -136,6 +156,9 @@ func Validate(s Spec, knownTools map[string]bool) error {
 			return invalid("INVALID_MANUAL_MINUTES", "workflow_config.estimated_manual_minutes can't be negative")
 		}
 		if w.TaskInputTemplate != nil {
+			if len(*w.TaskInputTemplate) > maxTemplateLen {
+				return invalid("TASK_TEMPLATE_TOO_LONG", "workflow_config.task_input_template can be at most %d characters", maxTemplateLen)
+			}
 			texts = append(texts, *w.TaskInputTemplate)
 		}
 	}
@@ -157,9 +180,12 @@ func ValidateOverrides(s Spec, o Overrides) error {
 	for _, p := range s.Parameters {
 		declared[p.Key] = true
 	}
-	for key := range o.Params {
+	for key, value := range o.Params {
 		if !declared[key] {
 			return invalid("UNKNOWN_PARAMETER", "%q is not a parameter of this SOP", key)
+		}
+		if len(value) > maxParamValueLen {
+			return invalid("PARAMETER_TOO_LONG", "parameter %q can be at most %d characters", key, maxParamValueLen)
 		}
 	}
 	if o.MaxCostPerRunUSD != nil && *o.MaxCostPerRunUSD <= 0 {

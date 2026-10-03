@@ -587,3 +587,89 @@ func TestSops_DeployFailuresLeaveNothingBehind(t *testing.T) {
 		}
 	})
 }
+
+// An admin of a different practice must not be able to read, change, deploy,
+// sync or remove anything of this practice's SOP library. These routes run on
+// the RLS-bypassing pool, so isolation rests on the query scoping alone.
+func TestSops_OtherPracticeCannotTouchLibraryOrDeployments(t *testing.T) {
+	sf, pool := newSopFixture(t)
+
+	code, env := sf.do(t, http.MethodPost, "/api/v1/practice/sops", weeklyCloseSop("Victim SOP"))
+	if code != http.StatusCreated {
+		t.Fatalf("create: (%d, %s)", code, env.Error.Code)
+	}
+	var sop sopResp
+	_ = json.Unmarshal(env.Data, &sop)
+	code, env = sf.do(t, http.MethodPost, "/api/v1/practice/sops/"+sop.ID+"/deploy", map[string]any{"target_org_id": sf.a.ID})
+	if code != http.StatusCreated {
+		t.Fatalf("deploy: (%d, %s)", code, env.Error.Code)
+	}
+	var dep struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(env.Data, &dep)
+
+	outsider := func(method, path string, body any) int {
+		code, _ := call(t, sf.r, sf.outsid, sf.otherPracticeClerkID, method, path, body)
+		return code
+	}
+	base := "/api/v1/practice/sops/" + sop.ID
+	for _, tc := range []struct {
+		name, method, path string
+		body               any
+	}{
+		{"read", http.MethodGet, base, nil},
+		{"update", http.MethodPatch, base, map[string]any{"name": "Hijacked"}},
+		{"delete", http.MethodDelete, base, nil},
+		{"deploy the victim's SOP", http.MethodPost, base + "/deploy", map[string]any{"target_org_id": sf.b.ID}},
+		{"list deployments", http.MethodGet, base + "/deployments", nil},
+		{"sync a deployment", http.MethodPost, base + "/deployments/" + dep.ID + "/sync", nil},
+		{"update a deployment", http.MethodPatch, base + "/deployments/" + dep.ID, map[string]any{"parameter_overrides": map[string]any{}}},
+		{"undeploy", http.MethodDelete, base + "/deployments/" + dep.ID, nil},
+	} {
+		if got := outsider(tc.method, tc.path, tc.body); got != http.StatusNotFound {
+			t.Errorf("outsider %s: status = %d, want 404", tc.name, got)
+		}
+	}
+
+	t.Run("outsider's own SOP can't be deployed into this practice's workspace", func(t *testing.T) {
+		code, env := call(t, sf.r, sf.outsid, sf.otherPracticeClerkID, http.MethodPost, "/api/v1/practice/sops", weeklyCloseSop("Outsider SOP"))
+		if code != http.StatusCreated {
+			t.Fatalf("outsider create: (%d, %s)", code, env.Error.Code)
+		}
+		var own sopResp
+		_ = json.Unmarshal(env.Data, &own)
+		t.Cleanup(func() {
+			_, _ = pool.Exec(context.Background(), "delete from sop_playbooks where id = $1", own.ID)
+		})
+		code, env = call(t, sf.r, sf.outsid, sf.otherPracticeClerkID, http.MethodPost, "/api/v1/practice/sops/"+own.ID+"/deploy", map[string]any{"target_org_id": sf.a.ID})
+		if code == http.StatusCreated {
+			t.Fatalf("outsider deployed into a foreign workspace: %d", code)
+		}
+		if env.Error.Code != "TARGET_NOT_CLIENT_WORKSPACE" {
+			t.Fatalf("code = %s, want TARGET_NOT_CLIENT_WORKSPACE", env.Error.Code)
+		}
+	})
+
+	t.Run("the victim's data is untouched", func(t *testing.T) {
+		var name string
+		var playbookActive bool
+		if err := pool.QueryRow(context.Background(), "select name, is_active from sop_playbooks where id = $1", sop.ID).Scan(&name, &playbookActive); err != nil {
+			t.Fatal(err)
+		}
+		if name != "Victim SOP" || !playbookActive {
+			t.Errorf("playbook = (%q, active=%v), want (Victim SOP, true)", name, playbookActive)
+		}
+		var deployments, agents int
+		_ = pool.QueryRow(context.Background(), "select count(*) from sop_deployments where target_org_id = $1 and is_active = true", sf.a.ID).Scan(&deployments)
+		_ = pool.QueryRow(context.Background(), "select count(*) from agents where org_id = $1 and is_active = true", sf.a.ID).Scan(&agents)
+		if deployments != 1 || agents != 1 {
+			t.Errorf("workspace A has %d active deployments and %d active agents, want 1 and 1", deployments, agents)
+		}
+		var foreign int
+		_ = pool.QueryRow(context.Background(), "select count(*) from sop_deployments where target_org_id = $1", sf.b.ID).Scan(&foreign)
+		if foreign != 0 {
+			t.Errorf("workspace B has %d deployments, want 0", foreign)
+		}
+	})
+}

@@ -60,6 +60,18 @@ func TestValidate(t *testing.T) {
 		{"duplicate param", func(s *Spec) { s.Parameters[1].Key = "slack_channel" }, "DUPLICATE_PARAMETER_KEY"},
 		{"undeclared in prompt", func(s *Spec) { s.Parameters = s.Parameters[1:] }, "UNDECLARED_PARAMETER"},
 		{"undeclared in task input", func(s *Spec) { s.Parameters = s.Parameters[:1] }, "UNDECLARED_PARAMETER"},
+		{"prompt too long", func(s *Spec) { s.Agent.SystemPrompt = strings.Repeat("x", maxSystemPromptLen+1) }, "SYSTEM_PROMPT_TOO_LONG"},
+		{"prompt at the limit", func(s *Spec) {
+			s.Agent.SystemPrompt = strings.Repeat("x", maxSystemPromptLen-len("{{slack_channel}} {{client_name}}")-1) + " {{slack_channel}} {{client_name}}"
+		}, ""},
+		{"too many tools", func(s *Spec) {
+			s.Agent.PolicyScope.AllowedTools = make([]string, maxAllowedTools+1)
+		}, "TOO_MANY_TOOLS"},
+		{"too many parameters", func(s *Spec) {
+			s.Parameters = make([]Parameter, maxParameters+1)
+		}, "TOO_MANY_PARAMETERS"},
+		{"parameter default too long", func(s *Spec) { s.Parameters[0].Default = strings.Repeat("x", maxParamValueLen+1) }, "PARAMETER_TOO_LONG"},
+		{"task template too long", func(s *Spec) { s.Workflow.TaskInputTemplate = ptr(strings.Repeat("x", maxTemplateLen+1)) }, "TASK_TEMPLATE_TOO_LONG"},
 		{"manual trigger needs no cron", func(s *Spec) { s.Workflow.TriggerType = "manual"; s.Workflow.CronExpression = nil }, ""},
 	}
 	for _, tc := range tests {
@@ -155,5 +167,17 @@ func TestPlaceholdersAndServices(t *testing.T) {
 	}
 	if got := MissingServices(a, map[string]bool{"slack": true}); !reflect.DeepEqual(got, []string{"stripe"}) {
 		t.Fatalf("MissingServices = %v", got)
+	}
+}
+
+func TestValidateOverrides_ParameterValueTooLong(t *testing.T) {
+	s := baseSpec()
+	o := Overrides{Params: map[string]string{"slack_channel": strings.Repeat("x", maxParamValueLen+1)}}
+	if got := code(ValidateOverrides(s, o)); got != "PARAMETER_TOO_LONG" {
+		t.Fatalf("ValidateOverrides() code = %q, want PARAMETER_TOO_LONG", got)
+	}
+	o.Params["slack_channel"] = strings.Repeat("x", maxParamValueLen)
+	if got := code(ValidateOverrides(s, o)); got != "" {
+		t.Fatalf("ValidateOverrides() at the limit code = %q, want none", got)
 	}
 }
