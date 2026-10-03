@@ -8,6 +8,7 @@ import (
 
 	"github.com/founderstack/api/internal/api/authctx"
 	"github.com/founderstack/api/internal/api/response"
+	"github.com/founderstack/api/internal/core/notify"
 	"github.com/founderstack/api/internal/db/dbgen"
 	"github.com/founderstack/api/internal/db/tenant"
 )
@@ -31,6 +32,11 @@ func (h *Handler) SubmitPushSubscription(c *gin.Context) {
 	var req submitPushSubscriptionRequest
 	if err := c.ShouldBindJSON(&req); err != nil || req.Endpoint == "" || req.Keys.P256dh == "" || req.Keys.Auth == "" {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "Expected a browser PushSubscription (endpoint, keys.p256dh, keys.auth)")
+		return
+	}
+
+	if !notify.ValidPushEndpoint(req.Endpoint) || len(req.Keys.P256dh) > 256 || len(req.Keys.Auth) > 256 {
+		response.Fail(c, http.StatusBadRequest, "INVALID_PUSH_ENDPOINT", "Push endpoint must be an https URL on a supported browser push service")
 		return
 	}
 

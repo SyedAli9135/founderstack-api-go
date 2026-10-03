@@ -47,8 +47,12 @@ func (h *Handler) UpdateApprovalsSettings(c *gin.Context) {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
 		return
 	}
+	if !user.IsOwnerOrAdmin() {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Only an owner or admin can change approval settings")
+		return
+	}
 	var req updateApprovalsSettingsRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.SlackChannelID) > 64 {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "Expected {\"slack_channel_id\": string}")
 		return
 	}

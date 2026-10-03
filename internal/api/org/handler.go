@@ -94,6 +94,28 @@ func (h *Handler) List(c *gin.Context) {
 	response.OK(c, http.StatusOK, "Team members listed", gin.H{"members": members})
 }
 
+func isAdminRole(role string) bool { return role == "owner" || role == "admin" }
+
+// canTouchOwnerRole: admin and owner are otherwise equivalent here, but the
+// owner role itself is protected — only an owner can grant it, change an
+// owner's role, or remove an owner, so an admin can't take over or lock out
+// the person who owns the workspace. newRole is "" when there's no new role.
+func canTouchOwnerRole(actor authctx.User, targetRole, newRole string) bool {
+	if targetRole != "owner" && newRole != "owner" {
+		return true
+	}
+	return actor.Role == "owner"
+}
+
+func hasOtherAdmin(members []dbgen.ListOrgMembersRow, selfID pgtype.UUID) bool {
+	for _, m := range members {
+		if m.ID != selfID && isAdminRole(m.Role) {
+			return true
+		}
+	}
+	return false
+}
+
 type updateRoleRequest struct {
 	Role string `json:"role"`
 }
@@ -128,7 +150,7 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	var target dbgen.GetOrgMemberForUpdateRow
-	var notFound bool
+	var notFound, ownerOnly, lastAdmin bool
 	err := tenant.WithTx(ctx, h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		var err error
 		target, err = q.GetOrgMemberForUpdate(ctx, dbgen.GetOrgMemberForUpdateParams{OrgID: user.OrgID, ID: targetID})
@@ -138,6 +160,22 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 				return nil
 			}
 			return err
+		}
+		if !canTouchOwnerRole(user, target.Role, req.Role) {
+			ownerOnly = true
+			return nil
+		}
+		// Demoting yourself is the one way to leave the org with nobody who
+		// can administer it (every other caller is an owner/admin who stays).
+		if targetID == user.ID && !isAdminRole(req.Role) {
+			members, err := q.ListOrgMembers(ctx, user.OrgID)
+			if err != nil {
+				return err
+			}
+			if !hasOtherAdmin(members, user.ID) {
+				lastAdmin = true
+				return nil
+			}
 		}
 		apiKeys, integrations, approve := defaultPermissionsForRole(req.Role)
 		return q.UpdateMemberRoleAndPermissions(ctx, dbgen.UpdateMemberRoleAndPermissionsParams{
@@ -151,6 +189,14 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 	}
 	if notFound {
 		response.Fail(c, http.StatusNotFound, "MEMBER_NOT_FOUND", "Team member not found")
+		return
+	}
+	if ownerOnly {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Only an owner can grant or change the owner role")
+		return
+	}
+	if lastAdmin {
+		response.Fail(c, http.StatusConflict, "LAST_ADMIN", "The organization must keep at least one owner or admin")
 		return
 	}
 
@@ -202,6 +248,10 @@ func (h *Handler) Remove(c *gin.Context) {
 	}
 	if notFound {
 		response.Fail(c, http.StatusNotFound, "MEMBER_NOT_FOUND", "Team member not found")
+		return
+	}
+	if !canTouchOwnerRole(user, target.Role, "") {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Only an owner can remove an owner")
 		return
 	}
 

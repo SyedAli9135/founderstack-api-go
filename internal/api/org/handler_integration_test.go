@@ -632,3 +632,106 @@ func TestOrgHandler_RevokeInvitation_Success(t *testing.T) {
 		t.Fatalf("Revoke called with %+v, want org=%s invitation=orginv_test123 requester=%s", call, fx.clerkOrgID, fx.adminClerkID)
 	}
 }
+
+// addUser inserts an extra active member with the given role into fx's org.
+func addUser(t *testing.T, systemPool *pgxpool.Pool, fx testOrgFixture, role string) (clerkID string, id pgtype.UUID) {
+	t.Helper()
+	clerkID = "user_org_test_" + role + "_" + randSuffix(t)
+	if err := systemPool.QueryRow(context.Background(),
+		`insert into users (org_id, clerk_user_id, email, role) values ($1, $2, $3, $4) returning id`,
+		fx.orgID, clerkID, clerkID+"@example.com", role,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert %s user: %v", role, err)
+	}
+	return clerkID, id
+}
+
+func roleOf(t *testing.T, systemPool *pgxpool.Pool, id pgtype.UUID) string {
+	t.Helper()
+	var role string
+	if err := systemPool.QueryRow(context.Background(), "select role from users where id = $1", id).Scan(&role); err != nil {
+		t.Fatal(err)
+	}
+	return role
+}
+
+func patchRole(t *testing.T, router *gin.Engine, cfg *config.Config, actorClerkID string, targetID pgtype.UUID, role string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"role": role})
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, authedRequest(t, cfg, actorClerkID, http.MethodPatch, "/api/v1/org/members/"+targetID.String()+"/role", body))
+	return rec
+}
+
+func TestOrgHandler_UpdateRole_AdminCannotGrantOrChangeOwner(t *testing.T) {
+	appPool, systemPool, cfg := testAppPool(t), testSystemPool(t), testConfig(t)
+	fx := newTestOrg(t, systemPool)
+	router := testRouter(t, systemPool, appPool, cfg, &fakeMembershipSyncer{})
+	_, ownerID := addUser(t, systemPool, fx, "owner")
+
+	if rec := patchRole(t, router, cfg, fx.adminClerkID, fx.memberID, "owner"); rec.Code != http.StatusForbidden {
+		t.Errorf("admin granting owner: status = %d, want 403", rec.Code)
+	}
+	if rec := patchRole(t, router, cfg, fx.adminClerkID, ownerID, "viewer"); rec.Code != http.StatusForbidden {
+		t.Errorf("admin demoting owner: status = %d, want 403", rec.Code)
+	}
+	if got := roleOf(t, systemPool, fx.memberID); got != "member" {
+		t.Errorf("member role = %q after refused grant, want member", got)
+	}
+	if got := roleOf(t, systemPool, ownerID); got != "owner" {
+		t.Errorf("owner role = %q after refused demotion, want owner", got)
+	}
+}
+
+func TestOrgHandler_UpdateRole_OwnerCanGrantOwner(t *testing.T) {
+	appPool, systemPool, cfg := testAppPool(t), testSystemPool(t), testConfig(t)
+	fx := newTestOrg(t, systemPool)
+	router := testRouter(t, systemPool, appPool, cfg, &fakeMembershipSyncer{})
+	ownerClerkID, _ := addUser(t, systemPool, fx, "owner")
+
+	if rec := patchRole(t, router, cfg, ownerClerkID, fx.memberID, "owner"); rec.Code != http.StatusOK {
+		t.Fatalf("owner granting owner: status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := roleOf(t, systemPool, fx.memberID); got != "owner" {
+		t.Errorf("member role = %q, want owner", got)
+	}
+}
+
+func TestOrgHandler_UpdateRole_SoleAdminCannotDemoteSelf(t *testing.T) {
+	appPool, systemPool, cfg := testAppPool(t), testSystemPool(t), testConfig(t)
+	fx := newTestOrg(t, systemPool) // the fixture's only owner/admin is fx.admin
+	router := testRouter(t, systemPool, appPool, cfg, &fakeMembershipSyncer{})
+
+	rec := patchRole(t, router, cfg, fx.adminClerkID, fx.adminID, "member")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("sole admin demoting self: status = %d, want 409; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := roleOf(t, systemPool, fx.adminID); got != "admin" {
+		t.Errorf("admin role = %q after refused self-demotion, want admin", got)
+	}
+
+	// With a second admin present the same request is fine.
+	addUser(t, systemPool, fx, "admin")
+	if rec := patchRole(t, router, cfg, fx.adminClerkID, fx.adminID, "member"); rec.Code != http.StatusOK {
+		t.Fatalf("admin demoting self with another admin present: status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOrgHandler_Remove_AdminCannotRemoveOwner(t *testing.T) {
+	appPool, systemPool, cfg := testAppPool(t), testSystemPool(t), testConfig(t)
+	fx := newTestOrg(t, systemPool)
+	syncer := &fakeMembershipSyncer{}
+	router := testRouter(t, systemPool, appPool, cfg, syncer)
+	_, ownerID := addUser(t, systemPool, fx, "owner")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, authedRequest(t, cfg, fx.adminClerkID, http.MethodDelete, "/api/v1/org/members/"+ownerID.String(), nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("admin removing owner: status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+	}
+	syncer.mu.Lock()
+	defer syncer.mu.Unlock()
+	if len(syncer.removeCalls) != 0 {
+		t.Errorf("Clerk Remove called %d times for a refused removal, want 0", len(syncer.removeCalls))
+	}
+}

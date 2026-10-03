@@ -61,6 +61,10 @@ func (h *Handler) UpdateDigestSettings(c *gin.Context) {
 		return
 	}
 
+	if !user.IsOwnerOrAdmin() {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Only an owner or admin can change digest settings")
+		return
+	}
 	var req updateDigestSettingsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY",
