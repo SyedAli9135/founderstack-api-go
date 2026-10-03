@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/clerk/clerk-sdk-go/v2"
 	"github.com/clerk/clerk-sdk-go/v2/jwt"
@@ -28,12 +29,31 @@ import (
 // verifying a Clerk Bearer token outside RequireAuth's gin.HandlerFunc — can
 // hold its own instance.
 type JWKCache struct {
-	mu   sync.RWMutex
-	keys map[string]*clerk.JSONWebKey
+	mu     sync.RWMutex
+	keys   map[string]*clerk.JSONWebKey
+	misses map[string]time.Time
 }
 
+// A kid Clerk doesn't know is remembered briefly so a caller sending random
+// kids can't turn every unauthenticated request into a Clerk API call.
+const (
+	jwkMissTTL      = time.Minute
+	jwkMissCapacity = 1024
+)
+
+func isDefinitiveKeyMiss(err error) bool {
+	var apiErr *clerk.APIErrorResponse
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	s := apiErr.HTTPStatusCode
+	return s >= 400 && s < 500 && s != http.StatusTooManyRequests && s != http.StatusRequestTimeout
+}
+
+var errUnknownKeyID = errors.New("middleware: unknown signing key id")
+
 func NewJWKCache() *JWKCache {
-	return &JWKCache{keys: make(map[string]*clerk.JSONWebKey)}
+	return &JWKCache{keys: make(map[string]*clerk.JSONWebKey), misses: make(map[string]time.Time)}
 }
 
 // get calls fetch only on a cache miss. fetch is a parameter rather than a
@@ -42,17 +62,32 @@ func NewJWKCache() *JWKCache {
 func (c *JWKCache) get(ctx context.Context, keyID string, fetch func(context.Context, string) (*clerk.JSONWebKey, error)) (*clerk.JSONWebKey, error) {
 	c.mu.RLock()
 	jwk, ok := c.keys[keyID]
+	missedAt, missed := c.misses[keyID]
 	c.mu.RUnlock()
 	if ok {
 		return jwk, nil
 	}
+	if missed && time.Since(missedAt) < jwkMissTTL {
+		return nil, errUnknownKeyID
+	}
 
 	fetched, err := fetch(ctx, keyID)
 	if err != nil {
+		// Only a definitive "no such key" is remembered; a network error or
+		// rate limit must not lock out a valid, freshly rotated kid.
+		if isDefinitiveKeyMiss(err) {
+			c.mu.Lock()
+			if len(c.misses) >= jwkMissCapacity {
+				clear(c.misses)
+			}
+			c.misses[keyID] = time.Now()
+			c.mu.Unlock()
+		}
 		return nil, err
 	}
 	c.mu.Lock()
 	c.keys[keyID] = fetched
+	delete(c.misses, keyID)
 	c.mu.Unlock()
 	return fetched, nil
 }

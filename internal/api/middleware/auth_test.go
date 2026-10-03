@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/clerk/clerk-sdk-go/v2"
@@ -127,5 +128,23 @@ func TestDevTokenFallback_EnabledInDevReturnsSubject(t *testing.T) {
 	}
 	if sub != "user_abc" {
 		t.Fatalf("devTokenFallback() = %q, want %q", sub, "user_abc")
+	}
+}
+
+func TestJWKCache_RemembersDefinitiveUnknownKeyID(t *testing.T) {
+	cache := NewJWKCache()
+	calls := 0
+	fetch := func(_ context.Context, keyID string) (*clerk.JSONWebKey, error) {
+		calls++
+		return nil, &clerk.APIErrorResponse{HTTPStatusCode: http.StatusNotFound}
+	}
+
+	for range 3 {
+		if _, err := cache.get(context.Background(), "random-kid", fetch); err == nil {
+			t.Fatal("get() error = nil, want an error for an unknown kid")
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("fetch called %d times, want 1 (an unknown kid should be negatively cached)", calls)
 	}
 }

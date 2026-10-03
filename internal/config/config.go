@@ -159,10 +159,54 @@ var requiredFields = []struct {
 	{"CLERK_SECRET_KEY", func(c *Config) string { return c.ClerkSecretKey.Expose() }},
 	{"CLERK_PUBLISHABLE_KEY", func(c *Config) string { return c.ClerkPublishableKey }},
 	{"CLERK_WEBHOOK_SECRET", func(c *Config) string { return c.ClerkWebhookSecret.Expose() }},
-	{"LOCALSTACK_AUTH_TOKEN", func(c *Config) string { return c.LocalstackAuthToken.Expose() }},
 	{"PINECONE_API_KEY", func(c *Config) string { return c.PineconeAPIKey.Expose() }},
 	{"ENCRYPTION_KEY", func(c *Config) string { return c.EncryptionKey.Expose() }},
 	{"OAUTH_STATE_SECRET", func(c *Config) string { return c.OAuthStateSecret.Expose() }},
+}
+
+// validAppEnvs is the closed set APP_ENV may take. Every dev-only escape
+// hatch (open CORS, dev tokens, mock mode, stack traces in responses) keys
+// off IsProduction, so an unrecognised value such as "prod" must fail boot
+// rather than quietly run a production deployment in development mode.
+var validAppEnvs = map[string]bool{"development": true, "test": true, "staging": true, "production": true}
+
+// insecureProductionMarkers are substrings that only appear in the
+// local-dev credentials/defaults shipped in migrations and docker-compose.
+var insecureProductionMarkers = []string{"app_password", "app_system_password", "sslmode=disable"}
+
+// validateProduction rejects configuration that is only acceptable locally.
+// It returns every problem at once, like the required-field check.
+func (c *Config) validateProduction() []string {
+	var problems []string
+	for _, u := range []struct{ key, val string }{
+		{"APP_DATABASE_URL", c.AppDatabaseURL},
+		{"SYSTEM_DATABASE_URL", c.SystemDatabaseURL},
+	} {
+		for _, marker := range insecureProductionMarkers {
+			if strings.Contains(u.val, marker) {
+				problems = append(problems, u.key+" contains a local-dev credential or sslmode=disable")
+				break
+			}
+		}
+	}
+	if !c.DevTokenSecret.IsEmpty() {
+		problems = append(problems, "DEV_TOKEN_SECRET must be unset")
+	}
+	if c.MockLLMMode {
+		problems = append(problems, "MOCK_LLM_MODE must be false")
+	}
+	if c.AWSS3EndpointURL != "" {
+		problems = append(problems, "AWS_S3_ENDPOINT_URL must be empty (it points at LocalStack)")
+	}
+	if c.AWSAccessKeyID == "test" || c.AWSSecretAccessKey.Expose() == "test" {
+		problems = append(problems, "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are still the local-dev defaults")
+	}
+	for _, u := range []struct{ key, val string }{{"APP_BASE_URL", c.AppBaseURL}, {"FRONTEND_URL", c.FrontendURL}} {
+		if !strings.HasPrefix(u.val, "https://") {
+			problems = append(problems, u.key+" must be an https:// URL")
+		}
+	}
+	return problems
 }
 
 // IsProduction reports whether the process is running with APP_ENV=production.
@@ -245,6 +289,11 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("config: unmarshal: %w", err)
 	}
 
+	cfg.AppEnv = strings.ToLower(strings.TrimSpace(cfg.AppEnv))
+	if !validAppEnvs[cfg.AppEnv] {
+		return nil, fmt.Errorf("config: APP_ENV %q is not one of development, test, staging, production", cfg.AppEnv)
+	}
+
 	var missing []string
 	for _, f := range requiredFields {
 		if strings.TrimSpace(f.value(&cfg)) == "" {
@@ -253,6 +302,12 @@ func Load() (*Config, error) {
 	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("config: missing required environment variable(s): %s", strings.Join(missing, ", "))
+	}
+
+	if cfg.IsProduction() {
+		if problems := cfg.validateProduction(); len(problems) > 0 {
+			return nil, fmt.Errorf("config: unsafe production configuration: %s", strings.Join(problems, "; "))
+		}
 	}
 
 	return &cfg, nil

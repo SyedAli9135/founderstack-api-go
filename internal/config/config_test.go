@@ -142,6 +142,9 @@ func TestLoad_EveryStringFieldIsLoadableFromEnv(t *testing.T) {
 		}
 		t.Setenv(key, "set-"+key)
 	}
+	// APP_ENV is validated against a closed set, so it can't carry the
+	// sentinel; the loop below skips it.
+	t.Setenv("APP_ENV", "staging")
 
 	cfg, err := Load()
 	if err != nil {
@@ -151,11 +154,36 @@ func TestLoad_EveryStringFieldIsLoadableFromEnv(t *testing.T) {
 	for i := 0; i < typ.NumField(); i++ {
 		f := typ.Field(i)
 		key := f.Tag.Get("mapstructure")
-		if key == "" || f.Type.Kind() != reflect.String {
+		if key == "" || key == "APP_ENV" || f.Type.Kind() != reflect.String {
 			continue
 		}
 		if got := val.Field(i).String(); got != "set-"+key {
 			t.Errorf("%s (%s) = %q after setting its env var — missing from Load's defaults map?", f.Name, key, got)
+		}
+	}
+}
+
+func TestLoad_RejectsUnknownAppEnv(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("APP_ENV", "prod")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "APP_ENV") {
+		t.Fatalf("Load() error = %v, want an APP_ENV error", err)
+	}
+}
+
+func TestLoad_RejectsUnsafeProductionConfig(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_DATABASE_URL", "postgresql://app_user:app_password@db:5432/x?sslmode=disable")
+	t.Setenv("DEV_TOKEN_SECRET", "dev")
+	t.Setenv("MOCK_LLM_MODE", "true")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want unsafe production configuration error")
+	}
+	for _, want := range []string{"APP_DATABASE_URL", "DEV_TOKEN_SECRET", "MOCK_LLM_MODE", "https://"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
 		}
 	}
 }

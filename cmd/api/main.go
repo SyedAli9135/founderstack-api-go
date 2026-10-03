@@ -221,6 +221,9 @@ func run() error {
 		Addr:              addr(),
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
+		// No WriteTimeout: the run event stream (SSE) is long-lived.
+		ReadTimeout: 60 * time.Second,
+		IdleTimeout: 120 * time.Second,
 	}
 
 	serveErr := make(chan error, 1)
@@ -247,6 +250,10 @@ func run() error {
 	}
 	return nil
 }
+
+// maxRequestBody caps any request body at the router. Document uploads are
+// the largest legitimate body (50 MiB file cap plus multipart overhead).
+const maxRequestBody = 64 << 20
 
 func addr() string {
 	if port := os.Getenv("PORT"); port != "" {
@@ -300,6 +307,8 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	}
 	router.Use(middleware.RequestID())
 	router.Use(middleware.Recovery(cfg))
+	router.Use(middleware.SecurityHeaders(cfg))
+	router.Use(middleware.LimitBody(maxRequestBody))
 	router.Use(cors.New(corsConfig(cfg)))
 
 	apiV1 := router.Group("/api/v1")
@@ -310,7 +319,7 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 
 	// Every route under here requires a verified session; each handler
 	// scopes its own queries via tenant.WithTx against the app_user pool.
-	settingsHandler := settings.NewHandler(db, encryptionKey, cfg.APIKeyMockPrefix, emailSender, digestTokens, cfg.AppBaseURL)
+	settingsHandler := settings.NewHandler(db, encryptionKey, mockKeyPrefix(cfg), emailSender, digestTokens, cfg.AppBaseURL)
 	apiSettings := router.Group("/api/v1/settings")
 	apiSettings.Use(middleware.RequireAuth(systemDB, cfg))
 	settingsHandler.Register(apiSettings)
@@ -504,9 +513,18 @@ func corsConfig(cfg *config.Config) cors.Config {
 		MaxAge:           12 * time.Hour,
 	}
 	if cfg.IsProduction() {
-		c.AllowOrigins = []string{cfg.AppBaseURL, "https://founderstack.ai"}
+		c.AllowOrigins = []string{cfg.AppBaseURL, cfg.FrontendURL, "https://founderstack.ai"}
 	} else {
 		c.AllowOriginFunc = func(origin string) bool { return true }
 	}
 	return c
+}
+
+// mockKeyPrefix is the BYOK validation short-circuit prefix, disabled in
+// production so a pasted "mock-test-key-..." can never be stored as valid.
+func mockKeyPrefix(cfg *config.Config) string {
+	if cfg.IsProduction() {
+		return ""
+	}
+	return cfg.APIKeyMockPrefix
 }
