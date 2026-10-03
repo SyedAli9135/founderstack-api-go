@@ -118,6 +118,10 @@ func (s *Syncer) Apply(ctx context.Context, orgID pgtype.UUID, sub *stripe.Subsc
 		curLive := curID != "" && IsLive(deref(cur.SubscriptionStatus))
 		switch {
 		case curID == "" || curID == sub.ID:
+		case adopt && curLive && !IsLive(st.Status):
+			// A dead subscription (an old Checkout replayed from a bookmarked or
+			// refreshed success URL) must never displace the live one.
+			return nil
 		case adopt:
 			if curLive {
 				replaced = curID
