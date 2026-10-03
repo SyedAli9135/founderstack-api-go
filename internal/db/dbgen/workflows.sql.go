@@ -29,6 +29,21 @@ func (q *Queries) ClaimDueScheduledWorkflow(ctx context.Context, id pgtype.UUID)
 	return id_2, err
 }
 
+const countActiveRuns = `-- name: CountActiveRuns :one
+SELECT count(*) FROM workflow_runs
+WHERE org_id = $1 AND parent_run_id IS NULL
+  AND status IN ('pending', 'running', 'awaiting_approval')
+`
+
+// Top-level runs still in flight for an org; backs the manual-run concurrency
+// cap (child runs of a team run are not counted, matching the portfolio stats).
+func (q *Queries) CountActiveRuns(ctx context.Context, orgID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveRuns, orgID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deactivateWorkflow = `-- name: DeactivateWorkflow :execrows
 UPDATE workflows SET is_active = false WHERE org_id = $1 AND id = $2 AND is_active = true
 `

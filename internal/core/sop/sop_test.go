@@ -64,6 +64,13 @@ func TestValidate(t *testing.T) {
 		{"prompt at the limit", func(s *Spec) {
 			s.Agent.SystemPrompt = strings.Repeat("x", maxSystemPromptLen-len("{{slack_channel}} {{client_name}}")-1) + " {{slack_channel}} {{client_name}}"
 		}, ""},
+		{"description too long", func(s *Spec) { s.Agent.Description = ptr(strings.Repeat("d", maxDescriptionLen+1)) }, "DESCRIPTION_TOO_LONG"},
+		{"model too long", func(s *Spec) { s.Agent.Model = strings.Repeat("m", maxModelLen+1) }, "INVALID_MODEL"},
+		{"agent type too long", func(s *Spec) { s.Agent.AgentType = strings.Repeat("t", maxAgentTypeLen+1) }, "INVALID_AGENT_TYPE"},
+		{"zero output tokens", func(s *Spec) { s.Agent.MaxOutputTokens = ptr(int32(0)) }, "INVALID_MAX_OUTPUT_TOKENS"},
+		{"huge output tokens", func(s *Spec) { s.Agent.MaxOutputTokens = ptr(int32(1 << 30)) }, "INVALID_MAX_OUTPUT_TOKENS"},
+		{"temperature above 2", func(s *Spec) { s.Agent.Temperature = ptr(3.0) }, "INVALID_TEMPERATURE"},
+		{"negative temperature", func(s *Spec) { s.Agent.Temperature = ptr(-1.0) }, "INVALID_TEMPERATURE"},
 		{"too many tools", func(s *Spec) {
 			s.Agent.PolicyScope.AllowedTools = make([]string, maxAllowedTools+1)
 		}, "TOO_MANY_TOOLS"},

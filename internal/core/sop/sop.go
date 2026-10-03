@@ -26,6 +26,13 @@ const (
 	maxParameters      = 50
 	maxParamValueLen   = 2000
 	maxAllowedTools    = 200
+
+	// Same bounds as the agents API, which a deployed SOP's agent is created through.
+	maxDescriptionLen = 2000
+	maxAgentTypeLen   = 50
+	maxModelLen       = 100
+	maxOutputTokens   = int32(64000)
+	maxTemperature    = 2.0
 )
 
 var validTriggerTypes = map[string]bool{"manual": true, "scheduled": true, "webhook": true}
@@ -114,6 +121,21 @@ func Validate(s Spec, knownTools map[string]bool) error {
 	}
 	if len(a.SystemPrompt) > maxSystemPromptLen {
 		return invalid("SYSTEM_PROMPT_TOO_LONG", "agent_config.system_prompt can be at most %d characters", maxSystemPromptLen)
+	}
+	if a.Description != nil && len(*a.Description) > maxDescriptionLen {
+		return invalid("DESCRIPTION_TOO_LONG", "agent_config.description can be at most %d characters", maxDescriptionLen)
+	}
+	if len(a.AgentType) > maxAgentTypeLen {
+		return invalid("INVALID_AGENT_TYPE", "agent_config.agent_type can be at most %d characters", maxAgentTypeLen)
+	}
+	if len(a.Model) > maxModelLen {
+		return invalid("INVALID_MODEL", "agent_config.model can be at most %d characters", maxModelLen)
+	}
+	if a.MaxOutputTokens != nil && (*a.MaxOutputTokens < 1 || *a.MaxOutputTokens > maxOutputTokens) {
+		return invalid("INVALID_MAX_OUTPUT_TOKENS", "agent_config.max_output_tokens must be between 1 and %d", maxOutputTokens)
+	}
+	if a.Temperature != nil && (*a.Temperature < 0 || *a.Temperature > maxTemperature) {
+		return invalid("INVALID_TEMPERATURE", "agent_config.temperature must be between 0 and %g", maxTemperature)
 	}
 	if len(a.PolicyScope.AllowedTools) > maxAllowedTools {
 		return invalid("TOO_MANY_TOOLS", "agent_config.policy_scope.allowed_tools can list at most %d tools", maxAllowedTools)

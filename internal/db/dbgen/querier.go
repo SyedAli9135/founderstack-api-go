@@ -27,6 +27,9 @@ type Querier interface {
 	ClearOrganizationActiveApiKeyForProvider(ctx context.Context, arg ClearOrganizationActiveApiKeyForProviderParams) error
 	CountActiveAgents(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	CountActiveClientWorkspaces(ctx context.Context, parentPracticeID pgtype.UUID) (int64, error)
+	// Top-level runs still in flight for an org; backs the manual-run concurrency
+	// cap (child runs of a team run are not counted, matching the portfolio stats).
+	CountActiveRuns(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	CountActiveWorkflows(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	CountCostLedger(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	// Soft delete — is_active=false, row stays for run history (Workflow 9+).

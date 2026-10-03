@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -23,6 +24,32 @@ import (
 	"github.com/founderstack/api/internal/db/dbgen"
 	"github.com/founderstack/api/internal/db/tenant"
 )
+
+const (
+	maxNameLen           = 255
+	maxDescriptionLen    = 2000
+	maxTaskTemplateLen   = 20000
+	maxManualMinutes     = int32(100000)
+	maxConcurrentRunsOrg = 10
+)
+
+// validateFields checks the free-form fields shared by create and update; nil
+// means "not supplied". Returns ("", "") when valid.
+func validateFields(name, description, taskTemplate *string, manualMinutes *int32) (string, string) {
+	if name != nil && (strings.TrimSpace(*name) == "" || len(*name) > maxNameLen) {
+		return "INVALID_WORKFLOW_NAME", fmt.Sprintf("name is required (max %d characters)", maxNameLen)
+	}
+	if description != nil && len(*description) > maxDescriptionLen {
+		return "DESCRIPTION_TOO_LONG", fmt.Sprintf("description can be at most %d characters", maxDescriptionLen)
+	}
+	if taskTemplate != nil && len(*taskTemplate) > maxTaskTemplateLen {
+		return "TASK_TEMPLATE_TOO_LONG", fmt.Sprintf("task_input_template can be at most %d characters", maxTaskTemplateLen)
+	}
+	if manualMinutes != nil && (*manualMinutes < 0 || *manualMinutes > maxManualMinutes) {
+		return "INVALID_MANUAL_MINUTES", fmt.Sprintf("estimated_manual_minutes must be between 0 and %d", maxManualMinutes)
+	}
+	return "", ""
+}
 
 var validTriggerTypes = map[string]bool{"manual": true, "scheduled": true, "webhook": true}
 
@@ -248,6 +275,10 @@ func (h *Handler) Create(c *gin.Context) {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "agent_id, name, and trigger_type are required")
 		return
 	}
+	if code, msg := validateFields(&req.Name, req.Description, req.TaskInputTemplate, req.EstimatedManualMinutes); code != "" {
+		response.Fail(c, http.StatusBadRequest, code, msg)
+		return
+	}
 	agentID, err := uuid.Parse(req.AgentID)
 	if err != nil {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "Invalid agent_id")
@@ -344,6 +375,11 @@ func (h *Handler) Update(c *gin.Context) {
 	var req updateWorkflowRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "Malformed request body")
+		return
+	}
+
+	if code, msg := validateFields(req.Name, req.Description, req.TaskInputTemplate, req.EstimatedManualMinutes); code != "" {
+		response.Fail(c, http.StatusBadRequest, code, msg)
 		return
 	}
 
@@ -481,7 +517,7 @@ func (h *Handler) Run(c *gin.Context) {
 	var runID uuid.UUID
 	var agentID uuid.UUID
 	var input string
-	var notFound bool
+	var notFound, inactive, agentInactive, tooManyRuns bool
 	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		wf, err := q.GetWorkflow(ctx, dbgen.GetWorkflowParams{OrgID: user.OrgID, ID: id})
 		if err != nil {
@@ -490,6 +526,27 @@ func (h *Handler) Run(c *gin.Context) {
 				return nil
 			}
 			return err
+		}
+		// The scheduler already skips inactive workflows; a manual run must
+		// not bypass a pause, a delete, or a removed agent either.
+		if !derefBool(wf.IsActive) {
+			inactive = true
+			return nil
+		}
+		if _, err := q.ValidateAgentForOrg(ctx, dbgen.ValidateAgentForOrgParams{OrgID: user.OrgID, ID: wf.AgentID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				agentInactive = true
+				return nil
+			}
+			return err
+		}
+		active, err := q.CountActiveRuns(ctx, user.OrgID)
+		if err != nil {
+			return err
+		}
+		if active >= maxConcurrentRunsOrg {
+			tooManyRuns = true
+			return nil
 		}
 		if wf.TaskInputTemplate != nil {
 			input = *wf.TaskInputTemplate
@@ -510,6 +567,18 @@ func (h *Handler) Run(c *gin.Context) {
 	}
 	if notFound {
 		response.Fail(c, http.StatusNotFound, "WORKFLOW_NOT_FOUND", "Workflow not found")
+		return
+	}
+	switch {
+	case inactive:
+		response.Fail(c, http.StatusConflict, "WORKFLOW_INACTIVE", "This workflow is paused or deleted; re-activate it to run it")
+		return
+	case agentInactive:
+		response.Fail(c, http.StatusConflict, "AGENT_INACTIVE", "This workflow's agent has been deleted")
+		return
+	case tooManyRuns:
+		response.Fail(c, http.StatusTooManyRequests, "TOO_MANY_ACTIVE_RUNS",
+			fmt.Sprintf("Your workspace already has %d runs in progress; wait for one to finish", maxConcurrentRunsOrg))
 		return
 	}
 

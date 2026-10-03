@@ -169,3 +169,10 @@ SELECT EXISTS (
 UPDATE workflow_runs SET status = 'failed', completed_at = now()
 WHERE status IN ('pending', 'running') AND updated_at < now() - interval '1 hour'
 RETURNING id, org_id;
+
+-- name: CountActiveRuns :one
+-- Top-level runs still in flight for an org; backs the manual-run concurrency
+-- cap (child runs of a team run are not counted, matching the portfolio stats).
+SELECT count(*) FROM workflow_runs
+WHERE org_id = $1 AND parent_run_id IS NULL
+  AND status IN ('pending', 'running', 'awaiting_approval');

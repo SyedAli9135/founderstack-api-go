@@ -30,7 +30,48 @@ const (
 	defaultMaxOutputTokens = int32(4096)
 	defaultTemperature     = 0.3
 	minSystemPromptLen     = 50
+
+	// Upper bounds: several map to narrow columns (name varchar(255), slug
+	// varchar(100), agent_type varchar(50), model varchar(100)), where an
+	// oversized value would otherwise surface as a 500; the prompt and
+	// token/temperature caps keep a single agent from costing unbounded
+	// model spend on every run.
+	maxNameLen         = 255
+	maxDescriptionLen  = 2000
+	maxSystemPromptLen = 20000
+	maxAgentTypeLen    = 50
+	maxModelLen        = 100
+	maxOutputTokens    = int32(64000)
+	maxTemperature     = 2.0
+	maxAllowedTools    = 200
 )
+
+// validateFields checks every field a create or update request carries; nil
+// means "not supplied" (updates are partial). Returns ("", "") when valid.
+func validateFields(name, description, agentType, model, systemPrompt *string, maxOut *int32, temperature *float64) (string, string) {
+	if name != nil && (strings.TrimSpace(*name) == "" || len(*name) > maxNameLen) {
+		return "INVALID_AGENT_NAME", fmt.Sprintf("name is required (max %d characters)", maxNameLen)
+	}
+	if description != nil && len(*description) > maxDescriptionLen {
+		return "DESCRIPTION_TOO_LONG", fmt.Sprintf("description can be at most %d characters", maxDescriptionLen)
+	}
+	if agentType != nil && len(*agentType) > maxAgentTypeLen {
+		return "INVALID_AGENT_TYPE", fmt.Sprintf("agent_type can be at most %d characters", maxAgentTypeLen)
+	}
+	if model != nil && len(*model) > maxModelLen {
+		return "INVALID_MODEL", fmt.Sprintf("model can be at most %d characters", maxModelLen)
+	}
+	if systemPrompt != nil && len(*systemPrompt) > maxSystemPromptLen {
+		return "SYSTEM_PROMPT_TOO_LONG", fmt.Sprintf("system_prompt can be at most %d characters", maxSystemPromptLen)
+	}
+	if maxOut != nil && (*maxOut < 1 || *maxOut > maxOutputTokens) {
+		return "INVALID_MAX_OUTPUT_TOKENS", fmt.Sprintf("max_output_tokens must be between 1 and %d", maxOutputTokens)
+	}
+	if temperature != nil && (*temperature < 0 || *temperature > maxTemperature) {
+		return "INVALID_TEMPERATURE", fmt.Sprintf("temperature must be between 0 and %g", maxTemperature)
+	}
+	return "", ""
+}
 
 // Handler implements agent-configuration CRUD plus the available-tools
 // listing the create/edit forms populate their multi-select from.
@@ -276,6 +317,10 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 
+	if code, msg := validateFields(&req.Name, req.Description, &req.AgentType, &req.Model, &req.SystemPrompt, req.MaxOutputTokens, req.Temperature); code != "" {
+		response.Fail(c, http.StatusBadRequest, code, msg)
+		return
+	}
 	if code, msg := h.validatePolicyScope(c.Request.Context(), req.PolicyScope); code != "" {
 		response.Fail(c, http.StatusBadRequest, code, msg)
 		return
@@ -394,6 +439,10 @@ func (h *Handler) Update(c *gin.Context) {
 	var req updateAgentRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "Malformed request body")
+		return
+	}
+	if code, msg := validateFields(req.Name, req.Description, req.AgentType, req.Model, req.SystemPrompt, req.MaxOutputTokens, req.Temperature); code != "" {
+		response.Fail(c, http.StatusBadRequest, code, msg)
 		return
 	}
 	if req.SystemPrompt != nil && len(strings.TrimSpace(*req.SystemPrompt)) < minSystemPromptLen {
@@ -560,6 +609,9 @@ func (h *Handler) validatePolicyScope(ctx context.Context, ps policyScope) (stri
 	if len(ps.AllowedTools) == 0 {
 		return "NO_ALLOWED_TOOLS", "At least one allowed tool is required"
 	}
+	if len(ps.AllowedTools) > maxAllowedTools {
+		return "TOO_MANY_TOOLS", fmt.Sprintf("allowed_tools can list at most %d tools", maxAllowedTools)
+	}
 	if ps.MaxCostPerRunUSD != nil && *ps.MaxCostPerRunUSD <= 0 {
 		return "INVALID_COST_CAP", "max_cost_per_run_usd must be a positive number"
 	}
@@ -622,7 +674,11 @@ func slugify(name string) string {
 			lastHyphen = true
 		}
 	}
-	return strings.TrimRight(b.String(), "-")
+	slug := b.String()
+	if len(slug) > 100 { // slug is varchar(100)
+		slug = slug[:100]
+	}
+	return strings.TrimRight(slug, "-")
 }
 
 func parseAgentID(c *gin.Context) (pgtype.UUID, bool) {
