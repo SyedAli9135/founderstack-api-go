@@ -174,6 +174,10 @@ var validAppEnvs = map[string]bool{"development": true, "test": true, "staging":
 // local-dev credentials/defaults shipped in migrations and docker-compose.
 var insecureProductionMarkers = []string{"app_password", "app_system_password", "sslmode=disable"}
 
+// minProductionSecretLen: every signing/encryption secret is HMAC or AES key
+// material, so a short one is a brute-forceable one.
+const minProductionSecretLen = 32
+
 // validateProduction rejects configuration that is only acceptable locally.
 // It returns every problem at once, like the required-field check.
 func (c *Config) validateProduction() []string {
@@ -200,6 +204,19 @@ func (c *Config) validateProduction() []string {
 	}
 	if c.AWSAccessKeyID == "test" || c.AWSSecretAccessKey.Expose() == "test" {
 		problems = append(problems, "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are still the local-dev defaults")
+	}
+	for _, sec := range []struct {
+		key string
+		val secret.Value
+	}{
+		{"ENCRYPTION_KEY", c.EncryptionKey}, {"OAUTH_STATE_SECRET", c.OAuthStateSecret},
+		{"PUSH_ACTION_TOKEN_SECRET", c.PushActionTokenSecret}, {"A2A_TASK_TOKEN_SECRET", c.A2ATaskTokenSecret},
+		{"DIGEST_UNSUBSCRIBE_SECRET", c.DigestUnsubscribeSecret},
+	} {
+		// Optional secrets may be unset; one that is set must not be guessable.
+		if !sec.val.IsEmpty() && len(sec.val.Expose()) < minProductionSecretLen {
+			problems = append(problems, fmt.Sprintf("%s must be at least %d characters", sec.key, minProductionSecretLen))
+		}
 	}
 	for _, u := range []struct{ key, val string }{{"APP_BASE_URL", c.AppBaseURL}, {"FRONTEND_URL", c.FrontendURL}} {
 		if !strings.HasPrefix(u.val, "https://") {

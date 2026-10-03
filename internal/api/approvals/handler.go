@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -201,6 +202,9 @@ func (h *Handler) Approve(c *gin.Context) {
 	h.decide(c, true, "")
 }
 
+// The reason is stored, audited and handed to the resumed run.
+const maxReasonLen = 1000
+
 type rejectRequest struct {
 	Reason string `json:"reason"`
 }
@@ -209,6 +213,10 @@ func (h *Handler) Reject(c *gin.Context) {
 	var req rejectRequest
 	if err := c.ShouldBindJSON(&req); err != nil || req.Reason == "" {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "A non-empty \"reason\" is required to reject")
+		return
+	}
+	if len(req.Reason) > maxReasonLen {
+		response.Fail(c, http.StatusBadRequest, "REASON_TOO_LONG", fmt.Sprintf("reason can be at most %d characters", maxReasonLen))
 		return
 	}
 	h.decide(c, false, req.Reason)

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -190,6 +191,10 @@ func (h *Handler) Cancel(c *gin.Context) {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
 		return
 	}
+	if !user.CanTriggerWorkflows() {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Viewers cannot cancel workflow runs")
+		return
+	}
 	id, ok := parseRunID(c)
 	if !ok {
 		return
@@ -219,11 +224,27 @@ func (h *Handler) Stream(c *gin.Context) {
 		return
 	}
 
-	if !h.runExists(c, user.OrgID, id) {
+	status, ok := h.runStatus(c, user.OrgID, id)
+	if !ok {
 		return
 	}
 
 	runID := uuid.UUID(id.Bytes)
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	// A finished run will never publish again, so a subscriber would wait on
+	// it forever. Answer with its terminal event and close, the same shape a
+	// live subscriber receives at the end of a run.
+	if !runInFlight(status) {
+		evType := graph.EventComplete
+		if status != "completed" {
+			evType = graph.EventError
+		}
+		payload, _ := json.Marshal(graph.Event{Type: evType, RunID: runID, Data: gin.H{"status": status}, Timestamp: time.Now().UTC()})
+		fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", evType, payload)
+		return
+	}
+
 	events, unsubscribe := h.engine.Bus.Subscribe(runID)
 	defer unsubscribe()
 
@@ -357,26 +378,39 @@ func (h *Handler) Cost(c *gin.Context) {
 // exists at all. On false, it has already written the response (404 or
 // 500) — the caller should just return without writing its own.
 func (h *Handler) runExists(c *gin.Context, orgID, runID pgtype.UUID) bool {
+	_, ok := h.runStatus(c, orgID, runID)
+	return ok
+}
+
+// runStatus is runExists that also returns the run's status. Same contract:
+// on false the response (404 or 500) has already been written.
+func (h *Handler) runStatus(c *gin.Context, orgID, runID pgtype.UUID) (string, bool) {
+	var status string
 	var exists bool
 	err := tenant.WithTx(c.Request.Context(), h.appPool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
-		_, err := q.GetRunStatus(ctx, dbgen.GetRunStatusParams{OrgID: orgID, ID: runID})
+		st, err := q.GetRunStatus(ctx, dbgen.GetRunStatusParams{OrgID: orgID, ID: runID})
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil
 			}
 			return err
 		}
-		exists = true
+		status, exists = st, true
 		return nil
 	})
 	if err != nil {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not look up run")
-		return false
+		return "", false
 	}
 	if !exists {
 		response.Fail(c, http.StatusNotFound, "RUN_NOT_FOUND", "Run not found")
 	}
-	return exists
+	return status, exists
+}
+
+// runInFlight: the states a run can still publish events from.
+func runInFlight(status string) bool {
+	return status == "pending" || status == "running" || status == "awaiting_approval"
 }
 
 const rfc3339 = "2006-01-02T15:04:05Z07:00"

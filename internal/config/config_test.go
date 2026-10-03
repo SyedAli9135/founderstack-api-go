@@ -187,3 +187,23 @@ func TestLoad_RejectsUnsafeProductionConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_ProductionRejectsShortSigningSecrets(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("ENCRYPTION_KEY", "short")
+	t.Setenv("PUSH_ACTION_TOKEN_SECRET", "also-short")
+	t.Setenv("OAUTH_STATE_SECRET", strings.Repeat("s", minProductionSecretLen)) // long enough: must not be reported
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want an unsafe production configuration error")
+	}
+	for _, want := range []string{"ENCRYPTION_KEY must be at least", "PUSH_ACTION_TOKEN_SECRET must be at least"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "OAUTH_STATE_SECRET must be at least") {
+		t.Errorf("error %q reports a secret that is long enough", err)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -271,11 +272,12 @@ func TestHandler_TasksSend_WrongAgentTokenRejected(t *testing.T) {
 	// Token minted for the lone agent, presented against the finance
 	// agent's endpoint — TaskTokenSigner.Verify must reject this even
 	// though the org id matches.
-	wrongToken := tokens.Sign(uuid.UUID(fx.orgPg.Bytes), uuid.UUID(fx.loneID.Bytes), time.Now().Add(time.Hour))
+	taskID := uuid.New()
+	wrongToken := tokens.Sign(uuid.UUID(fx.orgPg.Bytes), uuid.UUID(fx.loneID.Bytes), fx.dispatchingRunID, taskID, time.Now().Add(time.Hour))
 
 	body, _ := json.Marshal(corea2a.TaskSendRequest{
 		JSONRPC: "2.0", ID: "req-1", Method: "tasks/send",
-		Params: corea2a.TaskSendParams{ID: uuid.NewString(), SessionID: fx.dispatchingRunID.String(), Message: corea2a.TextMessage("user", "do something")},
+		Params: corea2a.TaskSendParams{ID: taskID.String(), SessionID: fx.dispatchingRunID.String(), Message: corea2a.TextMessage("user", "do something")},
 	})
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/a2a/agents/"+fx.financeID.String()+"/tasks/send", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -304,10 +306,12 @@ func TestHandler_TasksSend_NonMemberAgentForbidden(t *testing.T) {
 	tokens := corea2a.NewTaskTokenSigner("test-secret")
 	server := a2aTestServer(t, appPool, systemPool, cfg, tokens)
 
-	validToken := tokens.Sign(uuid.UUID(fx.orgPg.Bytes), uuid.UUID(fx.loneID.Bytes), time.Now().Add(time.Hour))
+	taskID := uuid.New()
+	giveBYOK(t, systemPool, fx)
+	validToken := tokens.Sign(uuid.UUID(fx.orgPg.Bytes), uuid.UUID(fx.loneID.Bytes), fx.dispatchingRunID, taskID, time.Now().Add(time.Hour))
 	body, _ := json.Marshal(corea2a.TaskSendRequest{
 		JSONRPC: "2.0", ID: "req-1", Method: "tasks/send",
-		Params: corea2a.TaskSendParams{ID: uuid.NewString(), SessionID: fx.dispatchingRunID.String(), Message: corea2a.TextMessage("user", "do something")},
+		Params: corea2a.TaskSendParams{ID: taskID.String(), SessionID: fx.dispatchingRunID.String(), Message: corea2a.TextMessage("user", "do something")},
 	})
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/a2a/agents/"+fx.loneID.String()+"/tasks/send", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -319,5 +323,113 @@ func TestHandler_TasksSend_NonMemberAgentForbidden(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403 for an agent not on the dispatching run's team", resp.StatusCode)
+	}
+	var rpc corea2a.TaskSendResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rpc); err != nil || rpc.Error == nil || rpc.Error.Code != -32002 {
+		t.Fatalf("response = %+v (err %v), want rpc error -32002 (not on the team), not a preflight refusal", rpc, err)
+	}
+}
+
+// giveBYOK makes the org pass launcher.Preflight (an active provider key),
+// so a test reaches the checks behind it.
+func giveBYOK(t *testing.T, systemPool *pgxpool.Pool, fx a2aTestFixture) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := systemPool.Exec(ctx, "update organizations set llm_provider = 'anthropic' where id = $1", fx.orgPg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := systemPool.Exec(ctx,
+		`insert into api_key_registry (org_id, provider, key_prefix, encrypted_key, kms_key_id, is_valid)
+		 values ($1, 'anthropic', 'sk-ant-...', 'not-a-real-ciphertext', 'local-aes-gcm', true)`, fx.orgPg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// postTask sends a tasks/send for fx's finance agent, authenticated with a token
+// minted for (tokenRunID, tokenTaskID), asking for (fx.dispatchingRunID, bodyTaskID).
+func postTask(t *testing.T, serverURL string, tokens *corea2a.TaskTokenSigner, fx a2aTestFixture, tokenRunID, tokenTaskID, bodyTaskID uuid.UUID, text string) (int, *corea2a.JSONRPCError) {
+	t.Helper()
+	token := tokens.Sign(uuid.UUID(fx.orgPg.Bytes), uuid.UUID(fx.financeID.Bytes), tokenRunID, tokenTaskID, time.Now().Add(time.Hour))
+	body, _ := json.Marshal(corea2a.TaskSendRequest{
+		JSONRPC: "2.0", ID: "req-1", Method: "tasks/send",
+		Params: corea2a.TaskSendParams{ID: bodyTaskID.String(), SessionID: fx.dispatchingRunID.String(), Message: corea2a.TextMessage("user", text)},
+	})
+	req, _ := http.NewRequest(http.MethodPost, serverURL+"/api/v1/a2a/agents/"+fx.financeID.String()+"/tasks/send", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var rpc corea2a.TaskSendResponse
+	_ = json.NewDecoder(resp.Body).Decode(&rpc)
+	return resp.StatusCode, rpc.Error
+}
+
+func childRunCount(t *testing.T, systemPool *pgxpool.Pool, fx a2aTestFixture) int {
+	t.Helper()
+	var n int
+	if err := systemPool.QueryRow(context.Background(), "select count(*) from workflow_runs where parent_run_id = $1", fx.dispatchingRunID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestHandler_TasksSend_TokenIsBoundToRunAndTask(t *testing.T) {
+	appPool, systemPool, cfg := testAppPool(t), testSystemPool(t), a2aTestConfig()
+	fx := newA2ATestFixture(t, systemPool)
+	tokens := corea2a.NewTaskTokenSigner("test-secret")
+	server := a2aTestServer(t, appPool, systemPool, cfg, tokens)
+	giveBYOK(t, systemPool, fx)
+
+	taskA, taskB := uuid.New(), uuid.New()
+	if status, rpc := postTask(t, server.URL, tokens, fx, fx.dispatchingRunID, taskA, taskB, "hi"); status != http.StatusUnauthorized {
+		t.Errorf("token for another task id: status = %d (%v), want 401", status, rpc)
+	}
+	if status, rpc := postTask(t, server.URL, tokens, fx, uuid.New(), taskA, taskA, "hi"); status != http.StatusUnauthorized {
+		t.Errorf("token for another dispatching run: status = %d (%v), want 401", status, rpc)
+	}
+	if n := childRunCount(t, systemPool, fx); n != 0 {
+		t.Errorf("%d child runs created by rejected requests, want 0", n)
+	}
+}
+
+func TestHandler_TasksSend_RefusesFinishedParentPausedOrgAndHugeInput(t *testing.T) {
+	appPool, systemPool, cfg := testAppPool(t), testSystemPool(t), a2aTestConfig()
+	fx := newA2ATestFixture(t, systemPool)
+	tokens := corea2a.NewTaskTokenSigner("test-secret")
+	server := a2aTestServer(t, appPool, systemPool, cfg, tokens)
+	giveBYOK(t, systemPool, fx)
+	ctx := context.Background()
+
+	send := func(text string) (int, *corea2a.JSONRPCError) {
+		id := uuid.New()
+		return postTask(t, server.URL, tokens, fx, fx.dispatchingRunID, id, id, text)
+	}
+
+	if status, rpc := send(strings.Repeat("x", maxTaskInputLen+1)); status != http.StatusRequestEntityTooLarge {
+		t.Errorf("oversized input: status = %d (%v), want 413", status, rpc)
+	}
+
+	if _, err := systemPool.Exec(ctx, "update organizations set agents_paused = true where id = $1", fx.orgPg); err != nil {
+		t.Fatal(err)
+	}
+	if status, rpc := send("hi"); status != http.StatusForbidden || rpc == nil || rpc.Code != -32003 {
+		t.Errorf("paused org: status = %d (%v), want 403 / -32003", status, rpc)
+	}
+	if _, err := systemPool.Exec(ctx, "update organizations set agents_paused = false where id = $1", fx.orgPg); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := systemPool.Exec(ctx, "update workflow_runs set status = 'completed' where id = $1", fx.dispatchingRunID); err != nil {
+		t.Fatal(err)
+	}
+	if status, rpc := send("hi"); status != http.StatusConflict || rpc == nil || rpc.Code != -32004 {
+		t.Errorf("finished parent: status = %d (%v), want 409 / -32004", status, rpc)
+	}
+
+	if n := childRunCount(t, systemPool, fx); n != 0 {
+		t.Errorf("%d child runs created by refused requests, want 0", n)
 	}
 }

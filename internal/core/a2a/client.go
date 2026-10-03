@@ -39,7 +39,7 @@ func (c *Client) Dispatch(ctx context.Context, orgID, dispatchingRunID, targetAg
 	if c.tokens.secret.IsEmpty() {
 		return Task{}, fmt.Errorf("a2a: dispatch: %w: A2A_TASK_TOKEN_SECRET is not configured", ErrTaskTokenInvalid)
 	}
-	token := c.tokens.Sign(orgID, targetAgentID, time.Now().Add(TaskTokenTTL))
+	token := c.tokens.Sign(orgID, targetAgentID, dispatchingRunID, taskID, time.Now().Add(TaskTokenTTL))
 
 	reqBody := TaskSendRequest{
 		JSONRPC: "2.0",

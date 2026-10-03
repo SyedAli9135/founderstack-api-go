@@ -37,11 +37,11 @@ func NewTaskTokenSigner(secret secret.Value) *TaskTokenSigner {
 // notify.ActionTokenSigner.Sign — a caller can tell at dispatch time
 // whether team runs are actually configured, rather than sending a token
 // Verify will always reject.
-func (s *TaskTokenSigner) Sign(orgID, agentID uuid.UUID, expiresAt time.Time) string {
+func (s *TaskTokenSigner) Sign(orgID, agentID, runID, taskID uuid.UUID, expiresAt time.Time) string {
 	if s.secret.IsEmpty() {
 		return ""
 	}
-	payload := taskTokenPayload(orgID, agentID, expiresAt)
+	payload := taskTokenPayload(orgID, agentID, runID, taskID, expiresAt)
 	mac := hmac.New(sha256.New, []byte(s.secret.Expose()))
 	mac.Write([]byte(payload))
 	sig := mac.Sum(nil)
@@ -57,7 +57,7 @@ func (s *TaskTokenSigner) Sign(orgID, agentID uuid.UUID, expiresAt time.Time) st
 // an input to check against — unlike agentID, which the handler already
 // knows independently from the URL path and must confirm the token agrees
 // with, not trust blindly.
-func (s *TaskTokenSigner) Verify(token string, agentID uuid.UUID) (orgID uuid.UUID, err error) {
+func (s *TaskTokenSigner) Verify(token string, agentID, runID, taskID uuid.UUID) (orgID uuid.UUID, err error) {
 	if s.secret.IsEmpty() {
 		return uuid.Nil, ErrTaskTokenInvalid
 	}
@@ -81,11 +81,15 @@ func (s *TaskTokenSigner) Verify(token string, agentID uuid.UUID) (orgID uuid.UU
 		return uuid.Nil, ErrTaskTokenInvalid
 	}
 
-	gotOrgID, gotAgentID, expiresAt, err := parseTaskTokenPayload(string(payloadBytes))
+	gotOrgID, gotAgentID, gotRunID, gotTaskID, expiresAt, err := parseTaskTokenPayload(string(payloadBytes))
 	if err != nil {
 		return uuid.Nil, ErrTaskTokenInvalid
 	}
-	if subtle.ConstantTimeCompare(gotAgentID[:], agentID[:]) != 1 {
+	// Bound to one agent, one dispatching run and one task id, so a leaked
+	// token can't start any other specialist run.
+	if subtle.ConstantTimeCompare(gotAgentID[:], agentID[:]) != 1 ||
+		subtle.ConstantTimeCompare(gotRunID[:], runID[:]) != 1 ||
+		subtle.ConstantTimeCompare(gotTaskID[:], taskID[:]) != 1 {
 		return uuid.Nil, ErrTaskTokenInvalid
 	}
 	if time.Now().After(expiresAt) {
@@ -94,26 +98,27 @@ func (s *TaskTokenSigner) Verify(token string, agentID uuid.UUID) (orgID uuid.UU
 	return gotOrgID, nil
 }
 
-func taskTokenPayload(orgID, agentID uuid.UUID, expiresAt time.Time) string {
-	return orgID.String() + "|" + agentID.String() + "|" + strconv.FormatInt(expiresAt.Unix(), 10)
+func taskTokenPayload(orgID, agentID, runID, taskID uuid.UUID, expiresAt time.Time) string {
+	return orgID.String() + "|" + agentID.String() + "|" + runID.String() + "|" + taskID.String() + "|" + strconv.FormatInt(expiresAt.Unix(), 10)
 }
 
-func parseTaskTokenPayload(payload string) (orgID, agentID uuid.UUID, expiresAt time.Time, err error) {
+func parseTaskTokenPayload(payload string) (orgID, agentID, runID, taskID uuid.UUID, expiresAt time.Time, err error) {
+	bad := func() (uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, time.Time, error) {
+		return uuid.Nil, uuid.Nil, uuid.Nil, uuid.Nil, time.Time{}, ErrTaskTokenInvalid
+	}
 	parts := strings.Split(payload, "|")
-	if len(parts) != 3 {
-		return uuid.Nil, uuid.Nil, time.Time{}, ErrTaskTokenInvalid
+	if len(parts) != 5 {
+		return bad()
 	}
-	orgID, err = uuid.Parse(parts[0])
+	ids := make([]uuid.UUID, 4)
+	for i := range ids {
+		if ids[i], err = uuid.Parse(parts[i]); err != nil {
+			return bad()
+		}
+	}
+	unixSeconds, err := strconv.ParseInt(parts[4], 10, 64)
 	if err != nil {
-		return uuid.Nil, uuid.Nil, time.Time{}, ErrTaskTokenInvalid
+		return bad()
 	}
-	agentID, err = uuid.Parse(parts[1])
-	if err != nil {
-		return uuid.Nil, uuid.Nil, time.Time{}, ErrTaskTokenInvalid
-	}
-	unixSeconds, err := strconv.ParseInt(parts[2], 10, 64)
-	if err != nil {
-		return uuid.Nil, uuid.Nil, time.Time{}, ErrTaskTokenInvalid
-	}
-	return orgID, agentID, time.Unix(unixSeconds, 0), nil
+	return ids[0], ids[1], ids[2], ids[3], time.Unix(unixSeconds, 0), nil
 }

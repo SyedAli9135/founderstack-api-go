@@ -13,14 +13,14 @@ import (
 
 func TestTaskTokenSigner_RoundTrip(t *testing.T) {
 	signer := NewTaskTokenSigner(secret.Value("test-secret"))
-	orgID, agentID := uuid.New(), uuid.New()
+	orgID, agentID, runID, taskID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 
-	token := signer.Sign(orgID, agentID, time.Now().Add(time.Hour))
+	token := signer.Sign(orgID, agentID, runID, taskID, time.Now().Add(time.Hour))
 	if token == "" {
 		t.Fatal("Sign() returned empty token with a configured secret")
 	}
 
-	gotOrgID, err := signer.Verify(token, agentID)
+	gotOrgID, err := signer.Verify(token, agentID, runID, taskID)
 	if err != nil {
 		t.Fatalf("Verify() error = %v, want nil", err)
 	}
@@ -31,33 +31,33 @@ func TestTaskTokenSigner_RoundTrip(t *testing.T) {
 
 func TestTaskTokenSigner_UnsetSecretRejectsEverything(t *testing.T) {
 	signer := NewTaskTokenSigner(secret.Value(""))
-	orgID, agentID := uuid.New(), uuid.New()
+	orgID, agentID, runID, taskID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 
-	if token := signer.Sign(orgID, agentID, time.Now().Add(time.Hour)); token != "" {
+	if token := signer.Sign(orgID, agentID, runID, taskID, time.Now().Add(time.Hour)); token != "" {
 		t.Fatalf("Sign() with unset secret = %q, want empty", token)
 	}
 
-	signed := NewTaskTokenSigner(secret.Value("other-secret")).Sign(orgID, agentID, time.Now().Add(time.Hour))
-	if _, err := signer.Verify(signed, agentID); err != ErrTaskTokenInvalid {
+	signed := NewTaskTokenSigner(secret.Value("other-secret")).Sign(orgID, agentID, runID, taskID, time.Now().Add(time.Hour))
+	if _, err := signer.Verify(signed, agentID, runID, taskID); err != ErrTaskTokenInvalid {
 		t.Fatalf("Verify() error = %v, want ErrTaskTokenInvalid", err)
 	}
 }
 
 func TestTaskTokenSigner_ExpiredRejected(t *testing.T) {
 	signer := NewTaskTokenSigner(secret.Value("test-secret"))
-	orgID, agentID := uuid.New(), uuid.New()
+	orgID, agentID, runID, taskID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 
-	token := signer.Sign(orgID, agentID, time.Now().Add(-time.Minute))
-	if _, err := signer.Verify(token, agentID); err != ErrTaskTokenInvalid {
+	token := signer.Sign(orgID, agentID, runID, taskID, time.Now().Add(-time.Minute))
+	if _, err := signer.Verify(token, agentID, runID, taskID); err != ErrTaskTokenInvalid {
 		t.Fatalf("Verify() error = %v, want ErrTaskTokenInvalid", err)
 	}
 }
 
 func TestTaskTokenSigner_TamperedRejected(t *testing.T) {
 	signer := NewTaskTokenSigner(secret.Value("test-secret"))
-	orgID, agentID := uuid.New(), uuid.New()
+	orgID, agentID, runID, taskID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 
-	token := signer.Sign(orgID, agentID, time.Now().Add(time.Hour))
+	token := signer.Sign(orgID, agentID, runID, taskID, time.Now().Add(time.Hour))
 	parts := strings.SplitN(token, ".", 2)
 	if len(parts) != 2 {
 		t.Fatalf("token has unexpected shape: %q", token)
@@ -72,7 +72,7 @@ func TestTaskTokenSigner_TamperedRejected(t *testing.T) {
 	sigBytes[0] ^= 0xFF
 	tampered := parts[0] + "." + base64.RawURLEncoding.EncodeToString(sigBytes)
 
-	if _, err := signer.Verify(tampered, agentID); err != ErrTaskTokenInvalid {
+	if _, err := signer.Verify(tampered, agentID, runID, taskID); err != ErrTaskTokenInvalid {
 		t.Fatalf("Verify() error = %v, want ErrTaskTokenInvalid", err)
 	}
 }
@@ -84,10 +84,29 @@ func TestTaskTokenSigner_TamperedRejected(t *testing.T) {
 // other agent entirely.
 func TestTaskTokenSigner_WrongAgentRejected(t *testing.T) {
 	signer := NewTaskTokenSigner(secret.Value("test-secret"))
-	orgID, agentA, agentB := uuid.New(), uuid.New(), uuid.New()
+	orgID, agentA, agentB, runID, taskID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 
-	token := signer.Sign(orgID, agentA, time.Now().Add(time.Hour))
-	if _, err := signer.Verify(token, agentB); err != ErrTaskTokenInvalid {
+	token := signer.Sign(orgID, agentA, runID, taskID, time.Now().Add(time.Hour))
+	if _, err := signer.Verify(token, agentB, runID, taskID); err != ErrTaskTokenInvalid {
 		t.Fatalf("Verify() against a different agent id error = %v, want ErrTaskTokenInvalid", err)
+	}
+}
+
+// A token authorizes one specific delegation: this agent, for this
+// dispatching run, creating this task id. Replaying it for any other run or
+// task must fail even though the signature, org and agent all match.
+func TestTaskTokenSigner_BoundToRunAndTask(t *testing.T) {
+	signer := NewTaskTokenSigner(secret.Value("test-secret"))
+	orgID, agentID, runID, taskID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	token := signer.Sign(orgID, agentID, runID, taskID, time.Now().Add(time.Hour))
+
+	if _, err := signer.Verify(token, agentID, uuid.New(), taskID); err != ErrTaskTokenInvalid {
+		t.Errorf("Verify() with another run id error = %v, want ErrTaskTokenInvalid", err)
+	}
+	if _, err := signer.Verify(token, agentID, runID, uuid.New()); err != ErrTaskTokenInvalid {
+		t.Errorf("Verify() with another task id error = %v, want ErrTaskTokenInvalid", err)
+	}
+	if got, err := signer.Verify(token, agentID, runID, taskID); err != nil || got != orgID {
+		t.Errorf("Verify() with the matching ids = (%v, %v), want (%v, nil)", got, err, orgID)
 	}
 }

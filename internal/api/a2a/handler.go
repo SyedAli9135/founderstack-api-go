@@ -41,6 +41,9 @@ func (h *Handler) RegisterTasksSend(rg *gin.RouterGroup) {
 	rg.POST("/a2a/agents/:agent_id/tasks/send", h.TasksSend)
 }
 
+// maxTaskInputLen caps what one delegated task can send to the model.
+const maxTaskInputLen = 100000
+
 func parseAgentID(c *gin.Context) (pgtype.UUID, uuid.UUID, bool) {
 	parsed, err := uuid.Parse(c.Param("agent_id"))
 	if err != nil {
@@ -121,13 +124,6 @@ func (h *Handler) TasksSend(c *gin.Context) {
 		respondRPCError(c, http.StatusUnauthorized, "", -32000, "Missing Authorization bearer token")
 		return
 	}
-	orgID, err := h.tokens.Verify(token, agentID)
-	if err != nil {
-		respondRPCError(c, http.StatusUnauthorized, "", -32000, "Invalid or expired task token")
-		return
-	}
-	orgPg := pgtype.UUID{Bytes: orgID, Valid: true}
-	agentPg := pgtype.UUID{Bytes: agentID, Valid: true}
 
 	var req corea2a.TaskSendRequest
 	if err := c.ShouldBindJSON(&req); err != nil || req.Method != "tasks/send" || req.Params.ID == "" || req.Params.SessionID == "" {
@@ -144,11 +140,41 @@ func (h *Handler) TasksSend(c *gin.Context) {
 		respondRPCError(c, http.StatusBadRequest, req.ID, -32602, "Invalid sessionId")
 		return
 	}
+	// The token is bound to this agent, this dispatching run and this task id,
+	// so it is checked against the request's own ids, not just the path.
+	orgID, err := h.tokens.Verify(token, agentID, parentRunID, taskID)
+	if err != nil {
+		respondRPCError(c, http.StatusUnauthorized, "", -32000, "Invalid or expired task token")
+		return
+	}
+	orgPg := pgtype.UUID{Bytes: orgID, Valid: true}
+	agentPg := pgtype.UUID{Bytes: agentID, Valid: true}
 	parentRunPg := pgtype.UUID{Bytes: parentRunID, Valid: true}
 
+	input := ""
+	for _, part := range req.Params.Message.Parts {
+		if part.Type == "text" {
+			input += part.Text
+		}
+	}
+	if len(input) > maxTaskInputLen {
+		respondRPCError(c, http.StatusRequestEntityTooLarge, req.ID, -32602, "Task input is too large")
+		return
+	}
+
+	// Honors the org kill switch and BYOK requirement, like starting a run.
+	if err := h.launcher.Preflight(c.Request.Context(), orgPg); err != nil {
+		var pe *graph.PreflightError
+		if errors.As(err, &pe) {
+			respondRPCError(c, http.StatusForbidden, req.ID, -32003, pe.Message)
+			return
+		}
+		respondRPCError(c, http.StatusInternalServerError, req.ID, -32603, "Could not check run preflight")
+		return
+	}
+
 	var childRun dbgen.InsertTeamWorkflowRunRow
-	var forbidden bool
-	var notFound bool
+	var forbidden, notFound, parentFinished bool
 	err = tenant.WithTx(c.Request.Context(), h.appPool, orgPg, func(ctx context.Context, q *dbgen.Queries) error {
 		teamAndWorkflow, err := q.GetRunTeamAndWorkflow(ctx, dbgen.GetRunTeamAndWorkflowParams{OrgID: orgPg, ID: parentRunPg})
 		if err != nil {
@@ -160,6 +186,15 @@ func (h *Handler) TasksSend(c *gin.Context) {
 		}
 		if !teamAndWorkflow.TeamID.Valid {
 			notFound = true
+			return nil
+		}
+		// A finished run can't delegate any more work.
+		parentStatus, err := q.GetRunStatus(ctx, dbgen.GetRunStatusParams{OrgID: orgPg, ID: parentRunPg})
+		if err != nil {
+			return err
+		}
+		if parentStatus != "pending" && parentStatus != "running" && parentStatus != "awaiting_approval" {
+			parentFinished = true
 			return nil
 		}
 
@@ -188,16 +223,13 @@ func (h *Handler) TasksSend(c *gin.Context) {
 		respondRPCError(c, http.StatusNotFound, req.ID, -32001, "Dispatching run not found or is not a team run")
 		return
 	}
+	if parentFinished {
+		respondRPCError(c, http.StatusConflict, req.ID, -32004, "The dispatching run has already finished")
+		return
+	}
 	if forbidden {
 		respondRPCError(c, http.StatusForbidden, req.ID, -32002, "Agent is not a member of this dispatching run's team")
 		return
-	}
-
-	input := ""
-	for _, part := range req.Params.Message.Parts {
-		if part.Type == "text" {
-			input += part.Text
-		}
 	}
 
 	output, runErr := h.launcher.RunSpecialist(c.Request.Context(), orgID, agentID, uuid.UUID(childRun.ID.Bytes), input)
