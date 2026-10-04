@@ -2592,6 +2592,35 @@ What makes that true, and what to keep true when adding to it:
 - **Prod checklist:** run migrations through 000027, and `ALTER ROLE app_user/app_system PASSWORD ...` (the
   migration passwords are dev-only; boot refuses them in production).
 
+### Hardening & operations (added 2026-10-04)
+
+- **Rate limits** (`middleware/ratelimit.go`, Redis fixed window, fails open): a global per-IP ceiling (3000/min,
+  webhooks exempt), a per-user ceiling (600/min) on every authenticated group, tighter per-route caps for routes
+  that spend money, call Clerk or send mail (`expensiveRoutes` in `main.go`), and 120/min per IP on public routes.
+  A new expensive route should get a row there.
+- **JWTs** are checked for `azp` against `CLERK_AUTHORIZED_PARTIES` (empty = no check). Per-IP limits and
+  client IPs rely on `TRUSTED_PROXIES`.
+- **Approval push buttons** send their token in the `X-Action-Token` header (query `?action_token=` is a legacy
+  fallback) so it stays out of proxy logs.
+- **`GET /health`** caches its probe result for 5s and returns generic errors; it no longer hits Pinecone per request.
+- **Streams** (`GET /runs/{id}/stream`) are capped at 10 per user and 50 per org (`runs/streamlimit.go`).
+- **Cron** schedules need a gap of at least 5 minutes (`pkg/cronutil`), same check for workflows and SOPs.
+- **Default models** come from `llm.DefaultModel(provider)`, never a hard-coded id.
+- **Access log** (`middleware.AccessLog`): one line per request with the route *template*, status, duration and
+  request id — never the raw path or query (they carry share tokens, OAuth codes, action tokens). Health is skipped.
+- **Error reporting** (`pkg/errreport`, Sentry): off unless `SENTRY_DSN` is set. Reports recovered panics (HTTP via
+  `Recovery`, jobs/goroutines via `safego`) and 5xx responses; never request bodies, headers, cookies, URLs or
+  user data (`BeforeSend` strips them; no `sentrygin`). A malformed DSN fails boot. Free tier is the plan — keep
+  volume low (no 4xx, no tracing, no logs).
+- **Container & CI.** `Dockerfile` builds `api` and `rotatekeys` into a distroless nonroot image (migrations run
+  separately before a release; `.env` is never copied). CI runs build, vet, gofmt, **staticcheck**
+  (`staticcheck.conf` disables a few style checks) and **govulncheck** before the coverage gate. Integration tests
+  also need `TEST_OWNER_DATABASE_URL` (the Postgres owner, from `DATABASE_URL`) because `audit_logs` is immutable
+  to the app roles; `make test-integration`/`coverage` and CI pass it.
+- **Where errors live:** there is no error-log table. Failed runs are `workflow_runs.status='failed'` with the
+  reason in `output`; per-step status is in `workflow_steps`; everything else is stdout logs plus Sentry.
+  `audit_logs` is the immutable who-did-what trail (tool calls, approvals, RAG searches, digests, reports).
+
 ### Dependency policy
 
 Go dependencies are added when code actually imports them, not pre-installed speculatively
@@ -2625,8 +2654,7 @@ scheduler is a plain `time.Ticker` per the plan's spec (see "Workflow Configurat
 above). `SherClockHolmes/webpush-go` was added in workflow 10, exactly when first used
 (`internal/core/notify/webpush.go`) — Brevo's transactional email API deliberately got no new
 dependency (plain `net/http`, same reasoning as Slack/Stripe), so this is the workflow's only
-addition to `go.mod`. `sentry-go` and `otel` are still planned but not yet in `go.mod` — add each
-when its workflow lands.
+addition to `go.mod`. `sentry-go` was added 2026-10-04 for `pkg/errreport`; `otel` is still planned.
 
 ### Comment Style
 
