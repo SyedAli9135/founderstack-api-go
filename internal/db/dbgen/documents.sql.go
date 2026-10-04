@@ -66,6 +66,54 @@ func (q *Queries) GetDocument(ctx context.Context, arg GetDocumentParams) (GetDo
 	return i, err
 }
 
+const getDocumentForUser = `-- name: GetDocumentForUser :one
+SELECT id, filename, category, processing_status, total_chunks, byte_size, created_at, indexed_at, error_detail, visibility, uploaded_by
+FROM documents
+WHERE org_id = $1 AND id = $2
+  AND (visibility = 'all_members' OR $3::bool)
+`
+
+type GetDocumentForUserParams struct {
+	OrgID            pgtype.UUID `json:"org_id"`
+	ID               pgtype.UUID `json:"id"`
+	IncludeOwnerOnly bool        `json:"include_owner_only"`
+}
+
+type GetDocumentForUserRow struct {
+	ID               pgtype.UUID        `json:"id"`
+	Filename         string             `json:"filename"`
+	Category         *string            `json:"category"`
+	ProcessingStatus *string            `json:"processing_status"`
+	TotalChunks      *int32             `json:"total_chunks"`
+	ByteSize         *int32             `json:"byte_size"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	IndexedAt        pgtype.Timestamptz `json:"indexed_at"`
+	ErrorDetail      *string            `json:"error_detail"`
+	Visibility       string             `json:"visibility"`
+	UploadedBy       pgtype.UUID        `json:"uploaded_by"`
+}
+
+// The API-facing lookup: an owner_only document doesn't exist as far as a
+// non-admin caller is concerned. The pipeline itself uses GetDocument.
+func (q *Queries) GetDocumentForUser(ctx context.Context, arg GetDocumentForUserParams) (GetDocumentForUserRow, error) {
+	row := q.db.QueryRow(ctx, getDocumentForUser, arg.OrgID, arg.ID, arg.IncludeOwnerOnly)
+	var i GetDocumentForUserRow
+	err := row.Scan(
+		&i.ID,
+		&i.Filename,
+		&i.Category,
+		&i.ProcessingStatus,
+		&i.TotalChunks,
+		&i.ByteSize,
+		&i.CreatedAt,
+		&i.IndexedAt,
+		&i.ErrorDetail,
+		&i.Visibility,
+		&i.UploadedBy,
+	)
+	return i, err
+}
+
 const getDocumentsByIDs = `-- name: GetDocumentsByIDs :many
 SELECT id, filename, category FROM documents
 WHERE org_id = $1 AND id = ANY($2::uuid[])
@@ -205,11 +253,17 @@ func (q *Queries) ListDocumentChunkPineconeIDs(ctx context.Context, docID pgtype
 }
 
 const listDocuments = `-- name: ListDocuments :many
-SELECT id, filename, category, processing_status, total_chunks, byte_size, created_at, indexed_at, visibility
+SELECT id, filename, category, processing_status, total_chunks, byte_size, created_at, indexed_at, visibility, uploaded_by
 FROM documents
 WHERE org_id = $1 AND processing_status != 'deleting'
+  AND (visibility = 'all_members' OR $2::bool)
 ORDER BY created_at DESC
 `
+
+type ListDocumentsParams struct {
+	OrgID            pgtype.UUID `json:"org_id"`
+	IncludeOwnerOnly bool        `json:"include_owner_only"`
+}
 
 type ListDocumentsRow struct {
 	ID               pgtype.UUID        `json:"id"`
@@ -221,14 +275,17 @@ type ListDocumentsRow struct {
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	IndexedAt        pgtype.Timestamptz `json:"indexed_at"`
 	Visibility       string             `json:"visibility"`
+	UploadedBy       pgtype.UUID        `json:"uploaded_by"`
 }
 
 // Excludes 'deleting': once DELETE .../{id} has been called, the
 // document shouldn't reappear in a normal list view while
 // purgeDocumentJob finishes removing it (the row itself is only ever
 // hard-deleted after that succeeds — see HardDeleteDocument).
-func (q *Queries) ListDocuments(ctx context.Context, orgID pgtype.UUID) ([]ListDocumentsRow, error) {
-	rows, err := q.db.Query(ctx, listDocuments, orgID)
+// include_owner_only is the caller's own owner/admin check, same as search:
+// an owner_only document's name and status are hidden from everyone else.
+func (q *Queries) ListDocuments(ctx context.Context, arg ListDocumentsParams) ([]ListDocumentsRow, error) {
+	rows, err := q.db.Query(ctx, listDocuments, arg.OrgID, arg.IncludeOwnerOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -246,6 +303,7 @@ func (q *Queries) ListDocuments(ctx context.Context, orgID pgtype.UUID) ([]ListD
 			&i.CreatedAt,
 			&i.IndexedAt,
 			&i.Visibility,
+			&i.UploadedBy,
 		); err != nil {
 			return nil, err
 		}

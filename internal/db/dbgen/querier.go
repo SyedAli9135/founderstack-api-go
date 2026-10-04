@@ -175,6 +175,9 @@ type Querier interface {
 	// as "no top agent", not an error.
 	GetDigestTopAgent(ctx context.Context, arg GetDigestTopAgentParams) (GetDigestTopAgentRow, error)
 	GetDocument(ctx context.Context, arg GetDocumentParams) (GetDocumentRow, error)
+	// The API-facing lookup: an owner_only document doesn't exist as far as a
+	// non-admin caller is concerned. The pipeline itself uses GetDocument.
+	GetDocumentForUser(ctx context.Context, arg GetDocumentForUserParams) (GetDocumentForUserRow, error)
 	// Batch-hydrates a page of search results' filename/category — Pinecone's
 	// own vector metadata only carries doc_id/chunk_index/text (see
 	// processor.go), not display fields.
@@ -457,7 +460,9 @@ type Querier interface {
 	// document shouldn't reappear in a normal list view while
 	// purgeDocumentJob finishes removing it (the row itself is only ever
 	// hard-deleted after that succeeds — see HardDeleteDocument).
-	ListDocuments(ctx context.Context, orgID pgtype.UUID) ([]ListDocumentsRow, error)
+	// include_owner_only is the caller's own owner/admin check, same as search:
+	// an owner_only document's name and status are hidden from everyone else.
+	ListDocuments(ctx context.Context, arg ListDocumentsParams) ([]ListDocumentsRow, error)
 	// Background scheduler (internal/core/workflows/scheduler.go) — app_system,
 	// never tenant.WithTx; see the file-level comment above.
 	// The org join keeps a deactivated org (e.g. a removed client workspace)

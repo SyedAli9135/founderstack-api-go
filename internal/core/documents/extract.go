@@ -11,6 +11,16 @@ import (
 	"github.com/ledongthuc/pdf"
 )
 
+// Upload size is capped at the API, but a compressed file can expand far
+// beyond it (a DOCX's XML deflates ~1000:1), so extraction bounds its own
+// output. Vars so tests can shrink them.
+var (
+	maxDocXMLBytes      int64 = 100 << 20
+	maxExtractedTextLen int64 = 20 << 20
+)
+
+var ErrTooMuchText = fmt.Errorf("documents: file contains too much text to index")
+
 // ErrUnsupportedFileType: checked earlier in internal/api/documents too,
 // but kept here so ExtractText never silently returns empty text for a
 // file type it doesn't understand.
@@ -19,16 +29,25 @@ var ErrUnsupportedFileType = fmt.Errorf("documents: unsupported file type")
 // ExtractText pulls plain text out of data, dispatching on filename's
 // extension. PDF and DOCX need real parsing; TXT/MD are read as-is.
 func ExtractText(filename string, data []byte) (string, error) {
+	var text string
+	var err error
 	switch {
 	case hasSuffixFold(filename, ".pdf"):
-		return extractPDF(data)
+		text, err = extractPDF(data)
 	case hasSuffixFold(filename, ".docx"):
-		return extractDOCX(data)
+		text, err = extractDOCX(data)
 	case hasSuffixFold(filename, ".txt"), hasSuffixFold(filename, ".md"):
-		return string(data), nil
+		text = string(data)
 	default:
 		return "", ErrUnsupportedFileType
 	}
+	if err != nil {
+		return "", err
+	}
+	if int64(len(text)) > maxExtractedTextLen {
+		return "", ErrTooMuchText
+	}
+	return text, nil
 }
 
 func hasSuffixFold(s, suffix string) bool {
@@ -44,7 +63,7 @@ func extractPDF(data []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("documents: extract pdf text: %w", err)
 	}
-	text, err := io.ReadAll(textReader)
+	text, err := io.ReadAll(io.LimitReader(textReader, maxExtractedTextLen+1))
 	if err != nil {
 		return "", fmt.Errorf("documents: read pdf text: %w", err)
 	}
@@ -73,18 +92,26 @@ func extractDOCX(data []byte) (string, error) {
 		return "", fmt.Errorf("documents: docx has no word/document.xml")
 	}
 
+	if int64(docXML.UncompressedSize64) > maxDocXMLBytes {
+		return "", ErrTooMuchText
+	}
 	rc, err := docXML.Open()
 	if err != nil {
 		return "", fmt.Errorf("documents: open word/document.xml: %w", err)
 	}
 	defer rc.Close()
 
+	// The declared size is attacker-controlled, so the read is bounded too.
+	limited := &io.LimitedReader{R: rc, N: maxDocXMLBytes + 1}
 	var out, para strings.Builder
-	dec := xml.NewDecoder(rc)
+	dec := xml.NewDecoder(limited)
 	for {
 		tok, err := dec.Token()
 		if err == io.EOF {
 			break
+		}
+		if limited.N <= 0 || int64(out.Len()) > maxExtractedTextLen {
+			return "", ErrTooMuchText
 		}
 		if err != nil {
 			return "", fmt.Errorf("documents: parse docx xml: %w", err)

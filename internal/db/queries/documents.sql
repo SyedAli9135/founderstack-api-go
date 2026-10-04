@@ -19,15 +19,26 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9);
 -- document shouldn't reappear in a normal list view while
 -- purgeDocumentJob finishes removing it (the row itself is only ever
 -- hard-deleted after that succeeds — see HardDeleteDocument).
-SELECT id, filename, category, processing_status, total_chunks, byte_size, created_at, indexed_at, visibility
+-- include_owner_only is the caller's own owner/admin check, same as search:
+-- an owner_only document's name and status are hidden from everyone else.
+SELECT id, filename, category, processing_status, total_chunks, byte_size, created_at, indexed_at, visibility, uploaded_by
 FROM documents
-WHERE org_id = $1 AND processing_status != 'deleting'
+WHERE org_id = sqlc.arg(org_id) AND processing_status != 'deleting'
+  AND (visibility = 'all_members' OR sqlc.arg(include_owner_only)::bool)
 ORDER BY created_at DESC;
 
 -- name: GetDocument :one
 SELECT id, filename, s3_path, mime_type, byte_size, category, processing_status, total_chunks, indexed_at, error_detail, created_at, visibility
 FROM documents
 WHERE org_id = $1 AND id = $2;
+
+-- name: GetDocumentForUser :one
+-- The API-facing lookup: an owner_only document doesn't exist as far as a
+-- non-admin caller is concerned. The pipeline itself uses GetDocument.
+SELECT id, filename, category, processing_status, total_chunks, byte_size, created_at, indexed_at, error_detail, visibility, uploaded_by
+FROM documents
+WHERE org_id = sqlc.arg(org_id) AND id = sqlc.arg(id)
+  AND (visibility = 'all_members' OR sqlc.arg(include_owner_only)::bool);
 
 -- Workflow 12 (RAG search). ListSearchableDocumentIDs is the ACL + category
 -- filter, resolved *before* any embedding/Pinecone call so a query that

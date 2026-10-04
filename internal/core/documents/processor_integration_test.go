@@ -445,3 +445,35 @@ func TestProcessor_Reindex_ReplacesChunks(t *testing.T) {
 		t.Fatalf("chunk count after reindex = %d, want %d (same content, same chunking)", len(secondPineconeIDs), len(firstPineconeIDs))
 	}
 }
+
+type panickingEmbedder struct{}
+
+func (panickingEmbedder) Embed(ctx context.Context, texts []string) ([][]float64, error) {
+	panic("synthetic parser panic")
+}
+func (panickingEmbedder) EmbedOne(ctx context.Context, text string, mode EmbedMode) ([]float64, error) {
+	panic("synthetic parser panic")
+}
+
+// Process runs on bare goroutines, so a panic must become a failed document,
+// not a dead process.
+func TestProcessor_Process_PanicMarksDocumentFailed(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	orgID := testOrg(t, systemPool)
+	uploadedBy := testUploader(t, systemPool, orgID)
+
+	docID := insertPendingDocument(t, appPool, orgID, uploadedBy, "notes.txt")
+	store := newFakeStore()
+	store.objects["documents/"+orgID.String()+"/"+docID.String()+"/notes.txt"] = []byte("some content")
+
+	p := NewProcessor(appPool, store, panickingEmbedder{}, newFakeVectorIndex())
+	if err := p.Process(context.Background(), orgID, docID); err == nil {
+		t.Fatal("Process() error = nil, want the panic reported as a failure")
+	}
+
+	doc := getDocument(t, appPool, orgID, docID)
+	if doc.ProcessingStatus == nil || *doc.ProcessingStatus != "failed" {
+		t.Fatalf("processing_status = %v, want failed", doc.ProcessingStatus)
+	}
+}

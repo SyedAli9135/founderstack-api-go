@@ -1012,3 +1012,192 @@ func TestDocumentsHandler_UploadRespectsPlanStorage(t *testing.T) {
 		t.Fatalf("upload after raising the limit: %d %s", rec.Code, rec.Body)
 	}
 }
+
+// addUserToOrg adds another member with role to orgID, returning their Clerk id.
+func addUserToOrg(t *testing.T, systemPool *pgxpool.Pool, orgID pgtype.UUID, role string) string {
+	t.Helper()
+	clerkID := "user_documents_test_" + randSuffix(t)
+	if _, err := systemPool.Exec(context.Background(),
+		`insert into users (org_id, clerk_user_id, email, role) values ($1, $2, 'documents-acl@example.com', $3)`,
+		orgID, clerkID, role); err != nil {
+		t.Fatalf("add %s: %v", role, err)
+	}
+	return clerkID
+}
+
+func TestDocumentsHandler_AccessControl(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	rdb := newTestRedis(t)
+
+	orgID, admin := testOrgAndUserWithRole(t, systemPool, "admin")
+	member := addUserToOrg(t, systemPool, orgID, "member")
+	viewer := addUserToOrg(t, systemPool, orgID, "viewer")
+
+	store := newFakeBlobStore()
+	processor := coredocs.NewProcessor(appPool, store, fakeEmbedder{}, fakeVectorIndex{})
+	router := testSearchRouter(t, systemPool, appPool, cfg, store, processor, nil, rdb, fakeChatClientResolver(nil, errNoKeyConfigured))
+
+	do := func(user, method, path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, authedRequest(t, cfg, user, method, path, nil, ""))
+		return rec
+	}
+	upload := func(user, filename string) *httptest.ResponseRecorder {
+		body, ct := multipartUploadBody(t, filename, "", []byte("some text"))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, authedRequest(t, cfg, user, http.MethodPost, "/api/v1/documents/upload", body, ct))
+		return rec
+	}
+	listNames := func(user string) map[string]bool {
+		rec := do(user, http.MethodGet, "/api/v1/documents")
+		var env struct {
+			Data []struct {
+				Filename string `json:"filename"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatal(err)
+		}
+		names := map[string]bool{}
+		for _, d := range env.Data {
+			names[d.Filename] = true
+		}
+		return names
+	}
+
+	shared := insertIndexedDocument(t, appPool, orgID, "shared.txt", "general", "all_members")
+	secret := insertIndexedDocument(t, appPool, orgID, "board-only.txt", "general", "owner_only")
+
+	t.Run("the list says which documents the caller can manage", func(t *testing.T) {
+		manage := func(user string) map[string]bool {
+			rec := do(user, http.MethodGet, "/api/v1/documents")
+			var env struct {
+				Data []struct {
+					Filename  string `json:"filename"`
+					CanManage bool   `json:"can_manage"`
+				} `json:"data"`
+			}
+			_ = json.Unmarshal(rec.Body.Bytes(), &env)
+			m := map[string]bool{}
+			for _, d := range env.Data {
+				m[d.Filename] = d.CanManage
+			}
+			return m
+		}
+		if m := manage(admin); !m["shared.txt"] || !m["board-only.txt"] {
+			t.Fatalf("admin can_manage = %v, want true for both", m)
+		}
+		if m := manage(member); m["shared.txt"] {
+			t.Fatalf("member can_manage = %v, want false for someone else's document", m)
+		}
+		if m := manage(viewer); m["shared.txt"] {
+			t.Fatalf("viewer can_manage = %v, want false", m)
+		}
+	})
+
+	t.Run("a viewer can't upload", func(t *testing.T) {
+		if rec := upload(viewer, "notes.txt"); rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("an over-long file name is refused", func(t *testing.T) {
+		long := make([]byte, 300)
+		for i := range long {
+			long[i] = 'a'
+		}
+		if rec := upload(admin, string(long)+".txt"); rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("owner_only documents are invisible to non-admins", func(t *testing.T) {
+		if names := listNames(member); !names["shared.txt"] || names["board-only.txt"] {
+			t.Fatalf("member sees %v, want shared.txt only", names)
+		}
+		if names := listNames(viewer); names["board-only.txt"] {
+			t.Fatalf("viewer sees %v, want no owner_only document", names)
+		}
+		if names := listNames(admin); !names["shared.txt"] || !names["board-only.txt"] {
+			t.Fatalf("admin sees %v, want both", names)
+		}
+		if rec := do(member, http.MethodGet, "/api/v1/documents/"+secret.String()); rec.Code != http.StatusNotFound {
+			t.Fatalf("member GET owner_only = %d, want 404", rec.Code)
+		}
+		if rec := do(admin, http.MethodGet, "/api/v1/documents/"+secret.String()); rec.Code != http.StatusOK {
+			t.Fatalf("admin GET owner_only = %d, want 200", rec.Code)
+		}
+	})
+
+	t.Run("a member can't delete or reindex what they can't see, or what isn't theirs", func(t *testing.T) {
+		for _, tc := range []struct {
+			method, path string
+			want         int
+		}{
+			{http.MethodDelete, "/api/v1/documents/" + secret.String(), http.StatusNotFound},
+			{http.MethodPost, "/api/v1/documents/" + secret.String() + "/reindex", http.StatusNotFound},
+			{http.MethodDelete, "/api/v1/documents/" + shared.String(), http.StatusForbidden},
+			{http.MethodPost, "/api/v1/documents/" + shared.String() + "/reindex", http.StatusForbidden},
+		} {
+			if rec := do(member, tc.method, tc.path); rec.Code != tc.want {
+				t.Fatalf("member %s %s = %d, want %d; body = %s", tc.method, tc.path, rec.Code, tc.want, rec.Body.String())
+			}
+		}
+		if rec := do(viewer, http.MethodDelete, "/api/v1/documents/"+shared.String()); rec.Code != http.StatusForbidden {
+			t.Fatalf("viewer DELETE = %d, want 403", rec.Code)
+		}
+		if names := listNames(admin); !names["shared.txt"] || !names["board-only.txt"] {
+			t.Fatalf("documents were changed by a refused request: %v", names)
+		}
+	})
+
+	t.Run("a member can delete their own upload, and an admin can delete anything", func(t *testing.T) {
+		rec := upload(member, "mine.txt")
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("member upload = %d, want 202; body = %s", rec.Code, rec.Body.String())
+		}
+		var env struct {
+			Data struct {
+				DocID string `json:"doc_id"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &env)
+		if rec := do(member, http.MethodDelete, "/api/v1/documents/"+env.Data.DocID); rec.Code != http.StatusNoContent {
+			t.Fatalf("member deleting own upload = %d, want 204", rec.Code)
+		}
+		if rec := do(admin, http.MethodDelete, "/api/v1/documents/"+secret.String()); rec.Code != http.StatusNoContent {
+			t.Fatalf("admin delete = %d, want 204", rec.Code)
+		}
+	})
+
+	t.Run("deleting a document clears this org's cached searches only", func(t *testing.T) {
+		ctx := context.Background()
+		mine := "cache:rag:" + orgID.String() + ":aaaa"
+		other := "cache:rag:" + uuid.NewString() + ":bbbb"
+		if err := rdb.Set(ctx, mine, "[]", time.Minute).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rdb.Set(ctx, other, "[]", time.Minute).Err(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { rdb.Del(ctx, mine, other) })
+		if rec := do(admin, http.MethodDelete, "/api/v1/documents/"+shared.String()); rec.Code != http.StatusNoContent {
+			t.Fatalf("admin delete = %d, want 204", rec.Code)
+		}
+		if n, _ := rdb.Exists(ctx, mine).Result(); n != 0 {
+			t.Fatal("this org's cached search survived a delete")
+		}
+		if n, _ := rdb.Exists(ctx, other).Result(); n != 1 {
+			t.Fatal("another org's cached search was cleared")
+		}
+	})
+
+	t.Run("an over-long search query is refused", func(t *testing.T) {
+		status, _ := doSearch(t, router, cfg, admin, map[string]any{"query": string(make([]byte, maxSearchQueryBytes+1))})
+		if status != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", status)
+		}
+	})
+}

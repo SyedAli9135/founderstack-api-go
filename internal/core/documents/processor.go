@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
+	"runtime/debug"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -65,7 +67,7 @@ func (p *Processor) Process(ctx context.Context, orgID, docID pgtype.UUID) error
 		return fmt.Errorf("documents: load document %s: %w", docID.String(), err)
 	}
 
-	if procErr := p.run(ctx, orgID, docID, doc); procErr != nil {
+	if procErr := p.runContained(ctx, orgID, docID, doc); procErr != nil {
 		detail := procErr.Error()
 		if markErr := tenant.WithTx(ctx, p.appPool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
 			return q.MarkDocumentFailed(ctx, dbgen.MarkDocumentFailedParams{OrgID: orgID, ID: docID, ErrorDetail: &detail})
@@ -75,6 +77,20 @@ func (p *Processor) Process(ctx context.Context, orgID, docID pgtype.UUID) error
 		return procErr
 	}
 	return nil
+}
+
+// runContained turns a panic in the file parsers (they read attacker-supplied
+// bytes) into an ordinary failure. These jobs run on bare goroutines, where an
+// unrecovered panic would kill the whole process — and RecoverStuckJobs would
+// then re-run the same document after every restart.
+func (p *Processor) runContained(ctx context.Context, orgID, docID pgtype.UUID, doc dbgen.GetDocumentRow) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("documents: panic while processing", "doc_id", docID.String(), "panic", r, "stack", string(debug.Stack()))
+			err = fmt.Errorf("the file could not be processed")
+		}
+	}()
+	return p.run(ctx, orgID, docID, doc)
 }
 
 func (p *Processor) run(ctx context.Context, orgID, docID pgtype.UUID, doc dbgen.GetDocumentRow) error {

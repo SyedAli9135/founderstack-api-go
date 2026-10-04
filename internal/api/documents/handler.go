@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -88,9 +89,18 @@ func (h *Handler) Upload(c *gin.Context) {
 		return
 	}
 
+	if user.Role == "viewer" {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Viewers can't upload documents")
+		return
+	}
+
 	fileHeader, err := c.FormFile("file")
 	if err != nil {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "file is required")
+		return
+	}
+	if !validFilename(fileHeader.Filename) {
+		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "Invalid file name")
 		return
 	}
 	if fileHeader.Size > maxUploadBytes {
@@ -193,6 +203,9 @@ type documentSummary struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	IndexedAt        *time.Time `json:"indexed_at,omitempty"`
 	Visibility       string     `json:"visibility"`
+	// CanManage is whether the caller may delete or reindex it, so the UI only
+	// offers what the API will accept.
+	CanManage bool `json:"can_manage"`
 }
 
 func (h *Handler) List(c *gin.Context) {
@@ -204,7 +217,7 @@ func (h *Handler) List(c *gin.Context) {
 
 	var docs []documentSummary
 	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
-		rows, err := q.ListDocuments(ctx, user.OrgID)
+		rows, err := q.ListDocuments(ctx, dbgen.ListDocumentsParams{OrgID: user.OrgID, IncludeOwnerOnly: canSeeOwnerOnly(user)})
 		if err != nil {
 			return err
 		}
@@ -220,6 +233,7 @@ func (h *Handler) List(c *gin.Context) {
 				CreatedAt:        row.CreatedAt.Time,
 				IndexedAt:        timestamptzPtr(row.IndexedAt),
 				Visibility:       row.Visibility,
+				CanManage:        mayManage(user, row.UploadedBy),
 			})
 		}
 		return nil
@@ -252,7 +266,7 @@ func (h *Handler) Get(c *gin.Context) {
 
 	var doc documentDetail
 	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
-		row, err := q.GetDocument(ctx, dbgen.GetDocumentParams{OrgID: user.OrgID, ID: docID})
+		row, err := q.GetDocumentForUser(ctx, dbgen.GetDocumentForUserParams{OrgID: user.OrgID, ID: docID, IncludeOwnerOnly: canSeeOwnerOnly(user)})
 		if err != nil {
 			return err
 		}
@@ -267,6 +281,7 @@ func (h *Handler) Get(c *gin.Context) {
 				CreatedAt:        row.CreatedAt.Time,
 				IndexedAt:        timestamptzPtr(row.IndexedAt),
 				Visibility:       row.Visibility,
+				CanManage:        mayManage(user, row.UploadedBy),
 			},
 			ErrorDetail: row.ErrorDetail,
 		}
@@ -298,6 +313,9 @@ func (h *Handler) Delete(c *gin.Context) {
 		return
 	}
 
+	if !h.loadManageable(c, user, docID) {
+		return
+	}
 	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		return q.SoftDeleteDocument(ctx, dbgen.SoftDeleteDocumentParams{OrgID: user.OrgID, ID: docID})
 	})
@@ -305,6 +323,7 @@ func (h *Handler) Delete(c *gin.Context) {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not delete document")
 		return
 	}
+	h.invalidateSearchCache(c.Request.Context(), user.OrgID)
 
 	orgID := user.OrgID
 	go func() {
@@ -328,19 +347,11 @@ func (h *Handler) Reindex(c *gin.Context) {
 		return
 	}
 
-	// Confirm existence before 202 — an unknown id should 404, not silently no-op.
-	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
-		_, err := q.GetDocument(ctx, dbgen.GetDocumentParams{OrgID: user.OrgID, ID: docID})
-		return err
-	})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			response.Fail(c, http.StatusNotFound, "DOCUMENT_NOT_FOUND", "Document not found")
-			return
-		}
-		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not fetch document")
+	// An unknown (or hidden) id should 404 before the 202, not silently no-op.
+	if !h.loadManageable(c, user, docID) {
 		return
 	}
+	h.invalidateSearchCache(c.Request.Context(), user.OrgID)
 
 	orgID := user.OrgID
 	go func() {
@@ -350,6 +361,71 @@ func (h *Handler) Reindex(c *gin.Context) {
 	}()
 
 	response.OK(c, http.StatusAccepted, "Reindexing started", gin.H{"doc_id": docID.String(), "status": "processing"})
+}
+
+// validFilename matches documents.filename's varchar(255) and keeps control
+// characters out of a name that ends up in an S3 key and in responses.
+func validFilename(name string) bool {
+	if name == "" || len(name) > 255 {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// canSeeOwnerOnly is the one rule for owner_only documents: only an owner or
+// admin knows they exist (list, get, search, delete, reindex alike).
+func canSeeOwnerOnly(user authctx.User) bool { return user.IsOwnerOrAdmin() }
+
+// mayManage: an owner or admin, or the member who uploaded it. Never a viewer.
+func mayManage(user authctx.User, uploadedBy pgtype.UUID) bool {
+	if user.Role == "viewer" {
+		return false
+	}
+	return user.IsOwnerOrAdmin() || uploadedBy == user.ID
+}
+
+// loadManageable finds a document the caller may change: visible to them, and
+// theirs or an owner/admin's to manage. It writes the error response itself.
+func (h *Handler) loadManageable(c *gin.Context, user authctx.User, docID pgtype.UUID) bool {
+	var doc dbgen.GetDocumentForUserRow
+	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		var err error
+		doc, err = q.GetDocumentForUser(ctx, dbgen.GetDocumentForUserParams{OrgID: user.OrgID, ID: docID, IncludeOwnerOnly: canSeeOwnerOnly(user)})
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			response.Fail(c, http.StatusNotFound, "DOCUMENT_NOT_FOUND", "Document not found")
+			return false
+		}
+		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not fetch document")
+		return false
+	}
+	if !mayManage(user, doc.UploadedBy) {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Only an owner, an admin or the uploader can change this document")
+		return false
+	}
+	return true
+}
+
+// invalidateSearchCache drops the org's cached search results so a deleted or
+// re-indexed document's text can't be served from cache for the rest of its TTL.
+func (h *Handler) invalidateSearchCache(ctx context.Context, orgID pgtype.UUID) {
+	if h.redis == nil {
+		return
+	}
+	iter := h.redis.Scan(ctx, 0, "cache:rag:"+orgID.String()+":*", 200).Iterator()
+	for iter.Next(ctx) {
+		_ = h.redis.Del(ctx, iter.Val()).Err()
+	}
+	if err := iter.Err(); err != nil {
+		slog.Warn("documents: could not clear search cache", "error", err)
+	}
 }
 
 func parseDocID(c *gin.Context) (pgtype.UUID, bool) {
@@ -469,7 +545,9 @@ type searchResult struct {
 const (
 	defaultSearchTopK = 5
 	maxSearchTopK     = 20
-	searchCacheTTL    = time.Hour
+	// Each search embeds the query (and a HyDE passage), so its size is its cost.
+	maxSearchQueryBytes = 4000
+	searchCacheTTL      = time.Hour
 )
 
 // searchCacheKey follows WORKFLOW_PLAN_GO.md's own convention
@@ -506,14 +584,18 @@ func (h *Handler) Search(c *gin.Context) {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "query is required")
 		return
 	}
+	if len(req.Query) > maxSearchQueryBytes {
+		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "query is too long")
+		return
+	}
 	topK := defaultSearchTopK
 	if req.TopK != nil && *req.TopK > 0 && *req.TopK <= maxSearchTopK {
 		topK = *req.TopK
 	}
 
 	ctx := c.Request.Context()
-	canSeeOwnerOnly := user.Role == "owner" || user.Role == "admin"
-	cacheKey := searchCacheKey(user.OrgID, canSeeOwnerOnly, req.Query, req.Category)
+	includeOwnerOnly := canSeeOwnerOnly(user)
+	cacheKey := searchCacheKey(user.OrgID, includeOwnerOnly, req.Query, req.Category)
 
 	if h.redis != nil {
 		if cached, err := h.redis.Get(ctx, cacheKey).Bytes(); err == nil {
@@ -530,7 +612,7 @@ func (h *Handler) Search(c *gin.Context) {
 	err := tenant.WithTx(ctx, h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		var err error
 		allowedIDs, err = q.ListSearchableDocumentIDs(ctx, dbgen.ListSearchableDocumentIDsParams{
-			OrgID: user.OrgID, IncludeOwnerOnly: canSeeOwnerOnly, Category: req.Category,
+			OrgID: user.OrgID, IncludeOwnerOnly: includeOwnerOnly, Category: req.Category,
 		})
 		return err
 	})
