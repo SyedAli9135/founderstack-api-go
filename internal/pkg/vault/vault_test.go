@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
@@ -133,5 +134,57 @@ func TestDecrypt_NotBase64Fails(t *testing.T) {
 func TestEncrypt_RejectsWrongKeySize(t *testing.T) {
 	if _, err := Encrypt("x", make([]byte, 16)); !errors.Is(err, ErrInvalidKeySize) {
 		t.Errorf("Encrypt() with a 16-byte key error = %v, want ErrInvalidKeySize", err)
+	}
+}
+
+func ringOf(t *testing.T, keys ...[]byte) []byte {
+	t.Helper()
+	var ring []byte
+	for _, k := range keys {
+		ring = append(ring, k...)
+	}
+	return ring
+}
+
+func TestKeyring_ReadsOlderKeysButWritesWithTheCurrentOne(t *testing.T) {
+	oldKey, newKey := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)
+	legacy, err := Encrypt("secret", oldKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ring := ringOf(t, newKey, oldKey)
+
+	if got, err := Decrypt(legacy, ring); err != nil || got != "secret" {
+		t.Fatalf("keyring could not read a value written under the previous key: %q, %v", got, err)
+	}
+	if UsesCurrentKey(legacy, ring) {
+		t.Fatal("a value under the previous key must report as needing rotation")
+	}
+	fresh, err := Encrypt("secret", ring)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !UsesCurrentKey(fresh, ring) {
+		t.Fatal("Encrypt with a keyring must use the current (first) key")
+	}
+	if _, err := Decrypt(fresh, oldKey); err == nil {
+		t.Fatal("a value written after rotation must not open under the retired key")
+	}
+	if _, err := Decrypt(legacy, ringOf(t, newKey)); err == nil {
+		t.Fatal("without the previous key the old value must not decrypt")
+	}
+}
+
+func TestDecodeKeyring_ParsesCurrentAndPrevious(t *testing.T) {
+	enc := func(b byte) string { return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{b}, 32)) }
+	ring, err := DecodeKeyring(enc(2), enc(1)+", ,"+enc(3))
+	if err != nil || len(ring) != 96 || ring[0] != 2 || ring[32] != 1 || ring[64] != 3 {
+		t.Fatalf("ring = %d bytes, err %v", len(ring), err)
+	}
+	if r, err := DecodeKeyring(enc(2), ""); err != nil || len(r) != 32 {
+		t.Fatalf("no previous keys: %d, %v", len(r), err)
+	}
+	if _, err := DecodeKeyring(enc(2), "AAAA"); err == nil {
+		t.Fatal("a malformed previous key must fail boot")
 	}
 }

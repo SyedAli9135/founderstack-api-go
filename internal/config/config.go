@@ -69,8 +69,11 @@ type Config struct {
 	AWSS3EndpointURL string `mapstructure:"AWS_S3_ENDPOINT_URL"`
 
 	// Security
-	EncryptionKey    secret.Value `mapstructure:"ENCRYPTION_KEY"`
-	OAuthStateSecret secret.Value `mapstructure:"OAUTH_STATE_SECRET"`
+	EncryptionKey secret.Value `mapstructure:"ENCRYPTION_KEY"`
+	// EncryptionKeyPrevious: retired keys (comma-separated, newest first) still
+	// accepted for decryption while cmd/rotatekeys re-encrypts stored values.
+	EncryptionKeyPrevious secret.Value `mapstructure:"ENCRYPTION_KEY_PREVIOUS"`
+	OAuthStateSecret      secret.Value `mapstructure:"OAUTH_STATE_SECRET"`
 	// APIKeyMockPrefix short-circuits BYOK key validation to success without
 	// a network call, for local dev/tests — one prefix shared across all 5
 	// llm.Catalog providers rather than one env var each.
@@ -290,44 +293,45 @@ func Load() (*Config, error) {
 	v.AutomaticEnv()
 
 	defaults := map[string]any{
-		"APP_ENV":                "development",
-		"APP_BASE_URL":           "http://localhost:8000",
-		"FRONTEND_URL":           "http://localhost:3000",
-		"DATABASE_URL":           "",
-		"APP_DATABASE_URL":       "",
-		"SYSTEM_DATABASE_URL":    "",
-		"DATABASE_POOL_SIZE":     20,
-		"CLERK_SECRET_KEY":       "",
-		"CLERK_PUBLISHABLE_KEY":  "",
-		"CLERK_WEBHOOK_SECRET":   "",
-		"LOCALSTACK_AUTH_TOKEN":  "",
-		"SLACK_CLIENT_ID":        "",
-		"SLACK_CLIENT_SECRET":    "",
-		"DISCORD_CLIENT_ID":      "",
-		"DISCORD_CLIENT_SECRET":  "",
-		"NOTION_CLIENT_ID":       "",
-		"NOTION_CLIENT_SECRET":   "",
-		"GOOGLE_CLIENT_ID":       "",
-		"GOOGLE_CLIENT_SECRET":   "",
-		"LINKEDIN_CLIENT_ID":     "",
-		"LINKEDIN_CLIENT_SECRET": "",
-		"PINECONE_API_KEY":       "",
-		"PINECONE_INDEX_RAG":     "founderstack-rag",
-		"PINECONE_INDEX_TOOLS":   "founderstack-tools",
-		"UPSTASH_REDIS_URL":      "",
-		"UPSTASH_REDIS_TOKEN":    "",
-		"NANGO_SECRET_KEY":       "",
-		"COHERE_API_KEY":         "",
-		"AWS_REGION":             "us-east-1",
-		"S3_BUCKET_DOCUMENTS":    "founderstack-documents",
-		"AWS_ACCESS_KEY_ID":      "test",
-		"AWS_SECRET_ACCESS_KEY":  "test",
-		"AWS_S3_ENDPOINT_URL":    "",
-		"ENCRYPTION_KEY":         "",
-		"OAUTH_STATE_SECRET":     "",
-		"API_KEY_MOCK_PREFIX":    "mock-test-key-",
-		"DEV_TOKEN_SECRET":       "",
-		"MOCK_LLM_MODE":          false,
+		"APP_ENV":                 "development",
+		"APP_BASE_URL":            "http://localhost:8000",
+		"FRONTEND_URL":            "http://localhost:3000",
+		"DATABASE_URL":            "",
+		"APP_DATABASE_URL":        "",
+		"SYSTEM_DATABASE_URL":     "",
+		"DATABASE_POOL_SIZE":      20,
+		"CLERK_SECRET_KEY":        "",
+		"CLERK_PUBLISHABLE_KEY":   "",
+		"CLERK_WEBHOOK_SECRET":    "",
+		"LOCALSTACK_AUTH_TOKEN":   "",
+		"SLACK_CLIENT_ID":         "",
+		"SLACK_CLIENT_SECRET":     "",
+		"DISCORD_CLIENT_ID":       "",
+		"DISCORD_CLIENT_SECRET":   "",
+		"NOTION_CLIENT_ID":        "",
+		"NOTION_CLIENT_SECRET":    "",
+		"GOOGLE_CLIENT_ID":        "",
+		"GOOGLE_CLIENT_SECRET":    "",
+		"LINKEDIN_CLIENT_ID":      "",
+		"LINKEDIN_CLIENT_SECRET":  "",
+		"PINECONE_API_KEY":        "",
+		"PINECONE_INDEX_RAG":      "founderstack-rag",
+		"PINECONE_INDEX_TOOLS":    "founderstack-tools",
+		"UPSTASH_REDIS_URL":       "",
+		"UPSTASH_REDIS_TOKEN":     "",
+		"NANGO_SECRET_KEY":        "",
+		"COHERE_API_KEY":          "",
+		"AWS_REGION":              "us-east-1",
+		"S3_BUCKET_DOCUMENTS":     "founderstack-documents",
+		"AWS_ACCESS_KEY_ID":       "test",
+		"AWS_SECRET_ACCESS_KEY":   "test",
+		"AWS_S3_ENDPOINT_URL":     "",
+		"ENCRYPTION_KEY":          "",
+		"ENCRYPTION_KEY_PREVIOUS": "",
+		"OAUTH_STATE_SECRET":      "",
+		"API_KEY_MOCK_PREFIX":     "mock-test-key-",
+		"DEV_TOKEN_SECRET":        "",
+		"MOCK_LLM_MODE":           false,
 
 		"BREVO_API_KEY":             "",
 		"BREVO_FROM_EMAIL":          "",

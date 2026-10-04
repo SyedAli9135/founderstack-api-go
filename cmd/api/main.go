@@ -84,7 +84,7 @@ func run() error {
 
 	// Decoded once at startup so a misconfigured ENCRYPTION_KEY fails the
 	// process at boot, not silently on a founder's first BYOK submission.
-	encryptionKey, err := vault.DecodeKey(cfg.EncryptionKey.Expose())
+	encryptionKey, err := vault.DecodeKeyring(cfg.EncryptionKey.Expose(), cfg.EncryptionKeyPrevious.Expose())
 	if err != nil {
 		return fmt.Errorf("decode ENCRYPTION_KEY: %w", err)
 	}

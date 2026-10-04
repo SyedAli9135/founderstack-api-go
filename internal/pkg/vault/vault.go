@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // ErrInvalidKeySize is returned by DecodeKey when ENCRYPTION_KEY doesn't
@@ -35,10 +36,51 @@ func DecodeKey(base64Key string) ([]byte, error) {
 	return key, nil
 }
 
-// Encrypt seals plaintext with AES-256-GCM under key (from DecodeKey) and
-// returns base64(nonce || ciphertext || auth tag) — everything needed to
-// decrypt, in one opaque string safe to store in a text column.
+const keySize = 32
+
+// DecodeKeyring parses the current ENCRYPTION_KEY plus any retired keys
+// (comma-separated, newest first) into one value Encrypt/Decrypt accept: keys
+// laid end to end, current first. Encrypt only ever uses the current key;
+// Decrypt tries each in turn, so values written before a rotation stay
+// readable until cmd/rotatekeys has re-encrypted them. Keeping the ciphertext
+// format unchanged is what makes rotation a config change plus one command
+// instead of a data migration.
+func DecodeKeyring(current, previousCSV string) ([]byte, error) {
+	ring, err := DecodeKey(current)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range strings.Split(previousCSV, ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		old, err := DecodeKey(p)
+		if err != nil {
+			return nil, fmt.Errorf("vault: ENCRYPTION_KEY_PREVIOUS: %w", err)
+		}
+		ring = append(ring, old...)
+	}
+	return ring, nil
+}
+
+// UsesCurrentKey reports whether ciphertext opens under the current key alone
+// (the first key of a keyring), i.e. whether it still needs rotating.
+func UsesCurrentKey(ciphertext string, keyring []byte) bool {
+	if len(keyring) < keySize {
+		return false
+	}
+	_, err := Decrypt(ciphertext, keyring[:keySize])
+	return err == nil
+}
+
+// Encrypt seals plaintext with AES-256-GCM under key (from DecodeKey, or the
+// current key of a DecodeKeyring) and returns
+// base64(nonce || ciphertext || auth tag) — everything needed to decrypt, in
+// one opaque string safe to store in a text column.
 func Encrypt(plaintext string, key []byte) (string, error) {
+	if len(key) > keySize && len(key)%keySize == 0 {
+		key = key[:keySize]
+	}
 	gcm, err := newGCM(key)
 	if err != nil {
 		return "", err
@@ -58,6 +100,17 @@ func Encrypt(plaintext string, key []byte) (string, error) {
 // under a different key — GCM's authentication tag makes all three
 // detectable rather than silently producing wrong output.
 func Decrypt(ciphertext string, key []byte) (string, error) {
+	if len(key) > keySize && len(key)%keySize == 0 {
+		var lastErr error
+		for i := 0; i < len(key); i += keySize {
+			plaintext, err := Decrypt(ciphertext, key[i:i+keySize])
+			if err == nil {
+				return plaintext, nil
+			}
+			lastErr = err
+		}
+		return "", lastErr
+	}
 	gcm, err := newGCM(key)
 	if err != nil {
 		return "", err
