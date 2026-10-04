@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -20,6 +21,16 @@ import (
 )
 
 const rfc3339 = "2006-01-02T15:04:05Z07:00"
+
+// A team's roster fans out as parallel dispatches, and its text lands in LLM
+// prompts and varchar columns, so all of it is bounded.
+const (
+	maxTeamMembers     = 10
+	maxTeamNameLen     = 255
+	maxTeamDescLen     = 2000
+	maxTeamRoleLen     = 100
+	maxTeamRunInputLen = 20000
+)
 
 func formatTimestamptz(t pgtype.Timestamptz) *string {
 	if !t.Valid {
@@ -145,6 +156,18 @@ func (h *Handler) Create(c *gin.Context) {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "Invalid orchestrator_agent_id")
 		return
 	}
+	if strings.TrimSpace(req.Name) == "" || len(req.Name) > maxTeamNameLen {
+		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "name is required (max 255 characters)")
+		return
+	}
+	if req.Description != nil && len(*req.Description) > maxTeamDescLen {
+		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "description can be at most 2000 characters")
+		return
+	}
+	if len(req.Members) > maxTeamMembers {
+		response.Fail(c, http.StatusBadRequest, "TOO_MANY_TEAM_MEMBERS", "A team can have at most 10 specialist members")
+		return
+	}
 	roleSeen := make(map[string]bool, len(req.Members))
 	for _, m := range req.Members {
 		if _, err := uuid.Parse(m.AgentID); err != nil {
@@ -152,8 +175,8 @@ func (h *Handler) Create(c *gin.Context) {
 			return
 		}
 		role := strings.TrimSpace(m.Role)
-		if role == "" {
-			response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "Every member needs a non-empty role")
+		if role == "" || len(role) > maxTeamRoleLen {
+			response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "Every member needs a role of at most 100 characters")
 			return
 		}
 		if roleSeen[role] {
@@ -351,8 +374,12 @@ func (h *Handler) Run(c *gin.Context) {
 		return
 	}
 	var req runTeamRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Input) == "" {
 		response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST_BODY", "input is required")
+		return
+	}
+	if len(req.Input) > maxTeamRunInputLen {
+		response.Fail(c, http.StatusBadRequest, "INPUT_TOO_LONG", "input can be at most 20000 characters")
 		return
 	}
 
@@ -369,7 +396,8 @@ func (h *Handler) Run(c *gin.Context) {
 	var run dbgen.InsertTeamWorkflowRunRow
 	var orchestratorAgentID uuid.UUID
 	var members []graph.TeamMember
-	var notFound bool
+	var notFound, tooManyRuns bool
+	var inactiveAgent string
 	err := tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		team, err := q.GetAgentTeam(ctx, dbgen.GetAgentTeamParams{OrgID: user.OrgID, ID: id})
 		if err != nil {
@@ -389,6 +417,24 @@ func (h *Handler) Run(c *gin.Context) {
 		}
 		if len(memberRows) == 0 {
 			return errNoMembers
+		}
+		// A deleted agent must not keep running just because it's still on a roster.
+		for _, agentID := range append([]pgtype.UUID{team.OrchestratorAgentID}, memberAgentIDs(memberRows)...) {
+			if _, err := q.ValidateAgentForTeamMembership(ctx, dbgen.ValidateAgentForTeamMembershipParams{OrgID: user.OrgID, ID: agentID}); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					inactiveAgent = uuid.UUID(agentID.Bytes).String()
+					return nil
+				}
+				return err
+			}
+		}
+		active, err := q.CountActiveRuns(ctx, user.OrgID)
+		if err != nil {
+			return err
+		}
+		if active >= graph.MaxActiveRunsPerOrg {
+			tooManyRuns = true
+			return nil
 		}
 		for _, m := range memberRows {
 			members = append(members, graph.TeamMember{
@@ -412,6 +458,15 @@ func (h *Handler) Run(c *gin.Context) {
 	}
 	if notFound {
 		response.Fail(c, http.StatusNotFound, "TEAM_NOT_FOUND", "Team not found")
+		return
+	}
+	if inactiveAgent != "" {
+		response.Fail(c, http.StatusConflict, "AGENT_INACTIVE", "Agent "+inactiveAgent+" on this team has been deleted — remove it from the team or recreate the team")
+		return
+	}
+	if tooManyRuns {
+		response.Fail(c, http.StatusTooManyRequests, "TOO_MANY_ACTIVE_RUNS",
+			fmt.Sprintf("Your workspace already has %d runs in progress; wait for one to finish", graph.MaxActiveRunsPerOrg))
 		return
 	}
 
@@ -511,18 +566,16 @@ func (h *Handler) ListRuns(c *gin.Context) {
 
 // Trace is GET /teams/{id}/runs/{run_id} — the orchestrator's own run
 // detail plus every specialist sub-run it dispatched, for the multi-agent
-// pipeline UI's collapsible per-specialist sub-timelines. Doesn't confirm
-// run_id actually belongs to team id (ListChildRuns/GetRunDetail are
-// already org-scoped, which is the real tenant boundary here) — id is
-// used only to keep the URL shape symmetric with the rest of this
-// package's team-scoped routes.
+// pipeline UI's collapsible per-specialist sub-timelines. The run must belong
+// to the team named in the URL; org scoping is the tenant boundary.
 func (h *Handler) Trace(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
 		return
 	}
-	if _, ok := parseTeamID(c); !ok {
+	teamID, ok := parseTeamID(c)
+	if !ok {
 		return
 	}
 	runID, err := uuid.Parse(c.Param("run_id"))
@@ -544,6 +597,12 @@ func (h *Handler) Trace(c *gin.Context) {
 				return nil
 			}
 			return err
+		}
+		// Only this team's own runs: the URL names a team, so another run's
+		// detail isn't served through it.
+		if !run.TeamID.Valid || run.TeamID != teamID {
+			notFound = true
+			return nil
 		}
 		children, err = q.ListChildRuns(ctx, dbgen.ListChildRunsParams{OrgID: user.OrgID, ParentRunID: runPg})
 		return err
@@ -572,6 +631,14 @@ func (h *Handler) Trace(c *gin.Context) {
 		StartedAt: formatTimestamptz(run.StartedAt), CompletedAt: formatTimestamptz(run.CompletedAt), DurationMs: run.DurationMs,
 		CreatedAt: run.CreatedAt.Time.Format(rfc3339), Specialists: specialists,
 	})
+}
+
+func memberAgentIDs(rows []dbgen.ListAgentTeamMembersRow) []pgtype.UUID {
+	ids := make([]pgtype.UUID, len(rows))
+	for i, r := range rows {
+		ids[i] = r.AgentID
+	}
+	return ids
 }
 
 func boolOr(p *bool, def bool) bool {

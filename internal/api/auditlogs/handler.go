@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -64,6 +65,12 @@ func optString(raw string) *string {
 		return nil
 	}
 	return &raw
+}
+
+// escapeLike makes a user-typed prefix match literally: the query appends '%'
+// itself, so a '%' or '_' typed by the caller must not act as a wildcard.
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
 func optTimestamptz(raw string) (pgtype.Timestamptz, error) {
@@ -135,7 +142,7 @@ func (h *Handler) List(c *gin.Context) {
 	err = tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		var err error
 		rows, err = q.ListAuditLogsPage(ctx, dbgen.ListAuditLogsPageParams{
-			OrgID: user.OrgID, ActorType: optString(c.Query("actor_type")), ActionPrefix: optString(c.Query("action")),
+			OrgID: user.OrgID, ActorType: optString(c.Query("actor_type")), ActionPrefix: optString(escapeLike(c.Query("action"))),
 			Status: optString(c.Query("status")), DateFrom: dateFrom, DateTo: dateTo,
 			CursorCreatedAt: cursorCreatedAt, CursorID: cursorID, PageLimit: limit,
 		})
@@ -166,7 +173,9 @@ func (h *Handler) List(c *gin.Context) {
 	var next *cursor
 	if len(rows) == int(limit) {
 		last := rows[len(rows)-1]
-		next = &cursor{CreatedAt: last.CreatedAt.Time.Format(time.RFC3339), ID: last.ID.String()}
+		// Full precision: created_at has microseconds, and a cursor rounded to the
+		// second would make the next page skip every row between the two.
+		next = &cursor{CreatedAt: last.CreatedAt.Time.Format(time.RFC3339Nano), ID: last.ID.String()}
 	}
 
 	response.OK(c, http.StatusOK, "", auditLogsResponse{Entries: entries, NextCursor: next})

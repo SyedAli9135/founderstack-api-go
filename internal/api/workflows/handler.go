@@ -26,11 +26,10 @@ import (
 )
 
 const (
-	maxNameLen           = 255
-	maxDescriptionLen    = 2000
-	maxTaskTemplateLen   = 20000
-	maxManualMinutes     = int32(100000)
-	maxConcurrentRunsOrg = 10
+	maxNameLen         = 255
+	maxDescriptionLen  = 2000
+	maxTaskTemplateLen = 20000
+	maxManualMinutes   = int32(100000)
 )
 
 // validateFields checks the free-form fields shared by create and update; nil
@@ -544,7 +543,7 @@ func (h *Handler) Run(c *gin.Context) {
 		if err != nil {
 			return err
 		}
-		if active >= maxConcurrentRunsOrg {
+		if active >= graph.MaxActiveRunsPerOrg {
 			tooManyRuns = true
 			return nil
 		}
@@ -578,7 +577,7 @@ func (h *Handler) Run(c *gin.Context) {
 		return
 	case tooManyRuns:
 		response.Fail(c, http.StatusTooManyRequests, "TOO_MANY_ACTIVE_RUNS",
-			fmt.Sprintf("Your workspace already has %d runs in progress; wait for one to finish", maxConcurrentRunsOrg))
+			fmt.Sprintf("Your workspace already has %d runs in progress; wait for one to finish", graph.MaxActiveRunsPerOrg))
 		return
 	}
 

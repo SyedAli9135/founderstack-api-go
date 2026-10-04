@@ -260,6 +260,63 @@ func TestAuditLogsHandler_Pagination(t *testing.T) {
 	}
 }
 
+// Agents write audit rows in bursts, many within one second. A cursor that
+// drops sub-second precision makes the next page skip every row between the
+// truncated time and the real one.
+func TestAuditLogsHandler_PaginationDoesNotSkipRowsWithinOneSecond(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg)
+
+	orgID, clerkUserID, userID, _ := testOrgAndUserWithRole(t, systemPool, "admin")
+	base := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+	for i := 0; i < 6; i++ {
+		insertAuditLog(t, systemPool, orgID, userID, "user", "burst.action", "success", base.Add(time.Duration(i)*100*time.Millisecond))
+	}
+
+	seen := map[string]bool{}
+	path := "/api/v1/audit-logs?limit=2"
+	for pages := 0; pages < 10; pages++ {
+		page := decodeList(t, authedGet(t, router, cfg, clerkUserID, path))
+		for _, e := range page.Entries {
+			if seen[e.ID] {
+				t.Fatalf("entry %s returned twice", e.ID)
+			}
+			seen[e.ID] = true
+		}
+		if page.NextCursor == nil {
+			break
+		}
+		path = "/api/v1/audit-logs?limit=2&" + cursorQuery(page.NextCursor)
+	}
+	if len(seen) != 6 {
+		t.Fatalf("pagination returned %d of 6 entries — rows sharing a second with a page boundary were skipped", len(seen))
+	}
+}
+
+func TestAuditLogsHandler_ActionFilterIsALiteralPrefix(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg)
+
+	orgID, clerkUserID, userID, _ := testOrgAndUserWithRole(t, systemPool, "admin")
+	now := time.Now().UTC()
+	insertAuditLog(t, systemPool, orgID, userID, "user", "tool_executed", "success", now)
+	insertAuditLog(t, systemPool, orgID, userID, "user", "toolXexecuted", "success", now.Add(time.Second))
+
+	for _, tc := range []struct {
+		prefix string
+		want   int
+	}{{"tool_", 1}, {"tool", 2}, {"%", 0}, {"t%", 0}} {
+		got := decodeList(t, authedGet(t, router, cfg, clerkUserID, "/api/v1/audit-logs?action="+url.QueryEscape(tc.prefix)))
+		if len(got.Entries) != tc.want {
+			t.Fatalf("action=%q matched %d entries, want %d (wildcards must be literal)", tc.prefix, len(got.Entries), tc.want)
+		}
+	}
+}
+
 // cursorQuery URL-encodes a cursor's fields — CreatedAt is RFC3339, whose
 // timezone offset contains a literal '+' that Go's query-string parser
 // otherwise decodes as a space (application/x-www-form-urlencoded

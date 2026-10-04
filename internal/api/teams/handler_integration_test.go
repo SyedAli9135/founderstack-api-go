@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -564,5 +565,149 @@ func mustUnmarshalData(t *testing.T, body []byte, v any) {
 	}
 	if err := json.Unmarshal(env.Data, v); err != nil {
 		t.Fatalf("unmarshal data: %v (body=%s)", err, body)
+	}
+}
+
+func postTeam(t *testing.T, server *httptest.Server, cfg *config.Config, user string, req createTeamRequest) (int, string) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	server.Config.Handler.ServeHTTP(w, authedRequest(t, cfg, user, http.MethodPost, "/api/v1/teams", req))
+	var env apiEnvelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	var created struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(env.Data, &created)
+	if w.Code == http.StatusCreated {
+		return w.Code, created.ID
+	}
+	var e apiError
+	_ = json.Unmarshal(w.Body.Bytes(), &e)
+	return w.Code, e.Error.Code
+}
+
+func TestTeamsHandler_CreateBoundsTheTeamSize(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	fx := newTeamTestFixture(t, systemPool)
+	server, _ := buildTeamTestServer(t, appPool, systemPool, cfg, nil)
+
+	member := func(role string) createTeamMemberRequest {
+		return createTeamMemberRequest{AgentID: fx.financeID.String(), Role: role}
+	}
+	many := make([]createTeamMemberRequest, 0, 40)
+	for i := 0; i < 40; i++ {
+		many = append(many, member(fmt.Sprintf("role-%d", i)))
+	}
+	long := func(n int) string { return strings.Repeat("a", n) }
+	desc := long(2001)
+
+	for name, req := range map[string]createTeamRequest{
+		"too many members": {Name: "T", OrchestratorAgentID: fx.orchestratorID.String(), Members: many},
+		"name too long":    {Name: long(256), OrchestratorAgentID: fx.orchestratorID.String(), Members: []createTeamMemberRequest{member("a")}},
+		"role too long":    {Name: "T", OrchestratorAgentID: fx.orchestratorID.String(), Members: []createTeamMemberRequest{member(long(101))}},
+		"description long": {Name: "T", Description: &desc, OrchestratorAgentID: fx.orchestratorID.String(), Members: []createTeamMemberRequest{member("a")}},
+	} {
+		if code, _ := postTeam(t, server, cfg, fx.userClerkID, req); code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", name, code)
+		}
+	}
+	if code, _ := postTeam(t, server, cfg, fx.userClerkID, createTeamRequest{
+		Name: "Fine", OrchestratorAgentID: fx.orchestratorID.String(), Members: []createTeamMemberRequest{member("a"), member("b")},
+	}); code != http.StatusCreated {
+		t.Fatalf("a normal team = %d, want 201", code)
+	}
+}
+
+func TestTeamsHandler_RunGuards(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	fx := newTeamTestFixture(t, systemPool)
+	server, _ := buildTeamTestServer(t, appPool, systemPool, cfg, nil)
+
+	code, teamID := postTeam(t, server, cfg, fx.userClerkID, createTeamRequest{
+		Name: "Guarded", OrchestratorAgentID: fx.orchestratorID.String(),
+		Members: []createTeamMemberRequest{{AgentID: fx.financeID.String(), Role: "finance"}},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create team = %d", code)
+	}
+	run := func(input string) (int, string) {
+		w := httptest.NewRecorder()
+		server.Config.Handler.ServeHTTP(w, authedRequest(t, cfg, fx.userClerkID, http.MethodPost, "/api/v1/teams/"+teamID+"/run", map[string]string{"input": input}))
+		var e apiError
+		_ = json.Unmarshal(w.Body.Bytes(), &e)
+		return w.Code, e.Error.Code
+	}
+
+	t.Run("an over-long input is refused", func(t *testing.T) {
+		if code, errCode := run(strings.Repeat("x", 20001)); code != http.StatusBadRequest || errCode != "INPUT_TOO_LONG" {
+			t.Fatalf("got (%d, %s), want (400, INPUT_TOO_LONG)", code, errCode)
+		}
+	})
+
+	t.Run("a deleted specialist or orchestrator blocks the run", func(t *testing.T) {
+		for _, agent := range []pgtype.UUID{fx.financeID, fx.orchestratorID} {
+			if _, err := systemPool.Exec(context.Background(), "update agents set is_active = false where id = $1", agent); err != nil {
+				t.Fatal(err)
+			}
+			if code, errCode := run("do the thing"); code != http.StatusConflict || errCode != "AGENT_INACTIVE" {
+				t.Fatalf("got (%d, %s), want (409, AGENT_INACTIVE)", code, errCode)
+			}
+			if _, err := systemPool.Exec(context.Background(), "update agents set is_active = true where id = $1", agent); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+
+	t.Run("the workspace's concurrent-run cap applies to team runs too", func(t *testing.T) {
+		var workflowID pgtype.UUID
+		if err := systemPool.QueryRow(context.Background(), "select id from workflows where team_id = $1", teamID).Scan(&workflowID); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < graph.MaxActiveRunsPerOrg; i++ {
+			if _, err := systemPool.Exec(context.Background(),
+				"insert into workflow_runs (workflow_id, org_id, status) values ($1, $2, 'running')", workflowID, fx.orgPg); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if code, errCode := run("one more"); code != http.StatusTooManyRequests || errCode != "TOO_MANY_ACTIVE_RUNS" {
+			t.Fatalf("got (%d, %s), want (429, TOO_MANY_ACTIVE_RUNS)", code, errCode)
+		}
+	})
+}
+
+func TestTeamsHandler_TraceOnlyServesTheTeamsOwnRuns(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	fx := newTeamTestFixture(t, systemPool)
+	server, _ := buildTeamTestServer(t, appPool, systemPool, cfg, nil)
+
+	mk := func(name string) string {
+		_, id := postTeam(t, server, cfg, fx.userClerkID, createTeamRequest{
+			Name: name, OrchestratorAgentID: fx.orchestratorID.String(),
+			Members: []createTeamMemberRequest{{AgentID: fx.financeID.String(), Role: "finance"}},
+		})
+		return id
+	}
+	teamA, teamB := mk("A"), mk("B")
+	var runID string
+	if err := systemPool.QueryRow(context.Background(),
+		`insert into workflow_runs (workflow_id, org_id, status) select id, org_id, 'completed' from workflows where team_id = $1 returning id::text`, teamA).Scan(&runID); err != nil {
+		t.Fatal(err)
+	}
+	get := func(team string) int {
+		w := httptest.NewRecorder()
+		server.Config.Handler.ServeHTTP(w, authedRequest(t, cfg, fx.userClerkID, http.MethodGet, "/api/v1/teams/"+team+"/runs/"+runID, nil))
+		return w.Code
+	}
+	if c := get(teamA); c != http.StatusOK {
+		t.Fatalf("its own team's trace = %d, want 200", c)
+	}
+	if c := get(teamB); c != http.StatusNotFound {
+		t.Fatalf("another team's id for the same run = %d, want 404", c)
 	}
 }

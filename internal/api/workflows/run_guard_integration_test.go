@@ -4,6 +4,7 @@ package workflows
 
 import (
 	"context"
+	"github.com/founderstack/api/internal/core/graph"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -72,7 +73,7 @@ func TestWorkflowsHandler_Run_CapsConcurrentRunsPerOrg(t *testing.T) {
 	testBYOKKey(t, systemPool, orgID)
 	wfID := createTestWorkflow(t, cfg, router, clerkUserID, agentID)
 
-	for i := 0; i < maxConcurrentRunsOrg; i++ {
+	for i := 0; i < graph.MaxActiveRunsPerOrg; i++ {
 		if _, err := systemPool.Exec(context.Background(),
 			"insert into workflow_runs (workflow_id, org_id, triggered_by, status) values ($1, $2, $3, 'running')", wfID, orgID, userID); err != nil {
 			t.Fatal(err)
@@ -86,8 +87,8 @@ func TestWorkflowsHandler_Run_CapsConcurrentRunsPerOrg(t *testing.T) {
 	if rec := run(); rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "TOO_MANY_ACTIVE_RUNS") {
 		t.Fatalf("at the cap: got (%d, %s), want 429 TOO_MANY_ACTIVE_RUNS", rec.Code, rec.Body.String())
 	}
-	if n := runCount(t, systemPool, wfID); n != maxConcurrentRunsOrg {
-		t.Fatalf("run rows = %d, want %d (the refused run must not be queued)", n, maxConcurrentRunsOrg)
+	if n := runCount(t, systemPool, wfID); n != graph.MaxActiveRunsPerOrg {
+		t.Fatalf("run rows = %d, want %d (the refused run must not be queued)", n, graph.MaxActiveRunsPerOrg)
 	}
 
 	if _, err := systemPool.Exec(context.Background(),
