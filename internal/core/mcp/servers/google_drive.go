@@ -119,6 +119,9 @@ func driveReadFile(ctx context.Context, req *gomcp.CallToolRequest, in driveRead
 	if in.FileID == "" {
 		return nil, driveReadFileOutput{}, fmt.Errorf("google_drive: file_id is required")
 	}
+	if err := pathSegment("file_id", in.FileID); err != nil {
+		return nil, driveReadFileOutput{}, fmt.Errorf("google_drive: %w", err)
+	}
 
 	// alt=media returns raw bytes, not JSON, so this can't go through
 	// doAndDecode. Always a GET, so unlike doAndDecode's isWrite guard,

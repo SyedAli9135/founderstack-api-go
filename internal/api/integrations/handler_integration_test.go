@@ -121,7 +121,7 @@ func testOrgAndUser(t *testing.T, systemPool *pgxpool.Pool) (orgID pgtype.UUID, 
 		t.Fatalf("insert test org: %v", err)
 	}
 	_, err = systemPool.Exec(ctx,
-		`insert into users (org_id, clerk_user_id, email) values ($1, $2, 'workflow4-test@example.com')`,
+		`insert into users (org_id, clerk_user_id, email, role, can_manage_integrations) values ($1, $2, 'workflow4-test@example.com', 'admin', true)`,
 		orgID, clerkUserID,
 	)
 	if err != nil {
@@ -474,5 +474,80 @@ func TestIntegrationsHandler_CrossOrgIsolation(t *testing.T) {
 	}
 	if got.Data.Status != "not_connected" {
 		t.Fatalf("org B saw status = %s, want not_connected — cross-tenant leak", got.Data.Status)
+	}
+}
+
+func TestIntegrationsHandler_ConnectAndDisconnectNeedTheManageFlag(t *testing.T) {
+	systemPool := testSystemPool(t)
+	appPool := testAppPool(t)
+	rdb := testRedis(t)
+	cfg := testConfig(t)
+	encKey := testEncryptionKey(t)
+
+	_, admin := testOrgAndUser(t, systemPool)
+	orgID, viewer := testOrgAndUser(t, systemPool)
+	// Move the second user into the first user's org as a plain viewer.
+	if _, err := systemPool.Exec(context.Background(),
+		"update users set org_id = (select org_id from users where clerk_user_id = $1), role = 'viewer', can_manage_integrations = false where clerk_user_id = $2",
+		admin, viewer); err != nil {
+		t.Fatalf("make viewer: %v", err)
+	}
+	_ = orgID
+
+	registry := integrations.NewRegistry(&fakeOAuthProvider{name: "slack"}, &fakeKeyProvider{name: "stripe"})
+	router := testRouter(t, systemPool, appPool, rdb, cfg, encKey, registry, "http://localhost:3000")
+	do := func(user, method, path string, body any) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, authedRequest(t, cfg, user, method, path, body))
+		return rec
+	}
+
+	if rec := do(admin, http.MethodPost, "/api/v1/integrations/stripe/connect", map[string]string{"key": "sk_test_fixture"}); rec.Code != http.StatusOK {
+		t.Fatalf("admin connect: status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	t.Run("a viewer can't connect", func(t *testing.T) {
+		if rec := do(viewer, http.MethodPost, "/api/v1/integrations/slack/connect", nil); rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+		}
+		if rec := do(viewer, http.MethodPost, "/api/v1/integrations/stripe/connect", map[string]string{"key": "sk_test_other"}); rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("a viewer can't disconnect, and the connection survives", func(t *testing.T) {
+		if rec := do(viewer, http.MethodDelete, "/api/v1/integrations/stripe", nil); rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+		}
+		rec := do(admin, http.MethodGet, "/api/v1/integrations/stripe/status", nil)
+		var got struct {
+			Data statusResponse `json:"data"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &got)
+		if got.Data.Status != "connected" {
+			t.Fatalf("status after a refused disconnect = %q, want connected", got.Data.Status)
+		}
+	})
+
+	t.Run("a viewer can still read status", func(t *testing.T) {
+		if rec := do(viewer, http.MethodGet, "/api/v1/integrations", nil); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+	})
+}
+
+func TestIntegrationsHandler_CallbackRefusesUnknownServiceBeforeRedirecting(t *testing.T) {
+	systemPool := testSystemPool(t)
+	appPool := testAppPool(t)
+	rdb := testRedis(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, rdb, cfg, testEncryptionKey(t), integrations.NewRegistry(), "http://localhost:3000")
+
+	for _, svc := range []string{"nope", "slack%26connected=stripe", "x%23y"} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/integrations/"+svc+"/callback?error=access_denied", nil))
+		if rec.Code != http.StatusNotFound || rec.Header().Get("Location") != "" {
+			t.Fatalf("service %q: status = %d, Location = %q; want 404 and no redirect", svc, rec.Code, rec.Header().Get("Location"))
+		}
 	}
 }

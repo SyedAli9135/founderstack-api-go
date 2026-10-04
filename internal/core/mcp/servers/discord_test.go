@@ -41,6 +41,9 @@ func TestDiscord_SendMessage(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"msg123"}`))
 	}))
 	defer srv.Close()
+	orig := checkDiscordWebhookURL
+	checkDiscordWebhookURL = func(string) error { return nil }
+	t.Cleanup(func() { checkDiscordWebhookURL = orig })
 
 	session := connectDiscordServer(t)
 	result, err := session.CallTool(context.Background(), &gomcp.CallToolParams{

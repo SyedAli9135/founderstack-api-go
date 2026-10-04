@@ -83,6 +83,9 @@ func notionReadPage(ctx context.Context, req *gomcp.CallToolRequest, in notionRe
 	if in.PageID == "" {
 		return nil, notionReadPageOutput{}, fmt.Errorf("notion: page_id is required")
 	}
+	if err := pathSegment("page_id", in.PageID); err != nil {
+		return nil, notionReadPageOutput{}, fmt.Errorf("notion: %w", err)
+	}
 
 	var page notionPageResponse
 	if err := doNotion(ctx, "GET", notionAPIBase+"/pages/"+in.PageID, token, nil, &page); err != nil {

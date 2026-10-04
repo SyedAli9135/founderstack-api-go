@@ -113,6 +113,11 @@ func (h *Handler) Connect(c *gin.Context) {
 		return
 	}
 
+	if !user.CanManageIntegrations {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "You don't have permission to manage integrations")
+		return
+	}
+
 	service := c.Param("service")
 	meta, known := integrations.Catalog[service]
 	if !known {
@@ -171,6 +176,10 @@ func (h *Handler) Callback(c *gin.Context) {
 	service := c.Param("service")
 	code := c.Query("code")
 	state := c.Query("state")
+	if _, known := integrations.Catalog[service]; !known {
+		response.Fail(c, http.StatusNotFound, "UNKNOWN_SERVICE", "No such integration")
+		return
+	}
 	if providerErr := c.Query("error"); providerErr != "" {
 		c.Redirect(http.StatusFound, h.frontendURL+"/integrations?error="+service)
 		return
@@ -232,6 +241,11 @@ func (h *Handler) Disconnect(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
+		return
+	}
+
+	if !user.CanManageIntegrations {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "You don't have permission to manage integrations")
 		return
 	}
 

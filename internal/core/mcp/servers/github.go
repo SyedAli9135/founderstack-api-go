@@ -2,6 +2,7 @@ package servers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 
@@ -87,6 +88,9 @@ func githubReviewPR(ctx context.Context, req *gomcp.CallToolRequest, in githubRe
 	}
 	if in.Owner == "" || in.Repo == "" || in.Number == 0 {
 		return nil, githubReviewPROutput{}, fmt.Errorf("github: owner, repo, and number are required")
+	}
+	if err := errors.Join(pathSegment("owner", in.Owner), pathSegment("repo", in.Repo)); err != nil {
+		return nil, githubReviewPROutput{}, fmt.Errorf("github: %w", err)
 	}
 
 	var pr githubPRResponse
@@ -185,6 +189,9 @@ func githubCreateIssue(ctx context.Context, req *gomcp.CallToolRequest, in githu
 	}
 	if in.Owner == "" || in.Repo == "" || in.Title == "" {
 		return nil, githubCreateIssueOutput{}, fmt.Errorf("github: owner, repo, and title are required")
+	}
+	if err := errors.Join(pathSegment("owner", in.Owner), pathSegment("repo", in.Repo)); err != nil {
+		return nil, githubCreateIssueOutput{}, fmt.Errorf("github: %w", err)
 	}
 
 	body := map[string]string{"title": in.Title}

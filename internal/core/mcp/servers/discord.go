@@ -44,6 +44,9 @@ func discordSendMessage(ctx context.Context, req *gomcp.CallToolRequest, in disc
 	if !ok || webhookURL == "" {
 		return nil, discordSendMessageOutput{}, fmt.Errorf("discord: no incoming webhook on file for this connection — reconnect Discord to grant one")
 	}
+	if err := checkDiscordWebhookURL(webhookURL); err != nil {
+		return nil, discordSendMessageOutput{}, err
+	}
 	if in.Content == "" {
 		return nil, discordSendMessageOutput{}, fmt.Errorf("discord: content is required")
 	}
