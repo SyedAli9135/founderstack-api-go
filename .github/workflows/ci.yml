@@ -62,6 +62,16 @@ jobs:
             -database "postgresql://postgres:password@localhost:5432/founderstack?sslmode=disable" \
             up
 
+      - name: Static analysis
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
+      - name: Known vulnerabilities (reachable only)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
       - name: Test with coverage (fails below the threshold in the Makefile)
         run: >
           make coverage

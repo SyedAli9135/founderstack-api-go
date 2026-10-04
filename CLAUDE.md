@@ -2659,7 +2659,7 @@ See `.env.example` for the full list with inline notes on Go-specific deviations
 Python `.env.example` (DSN scheme, `sslmode=disable`, AES-256-GCM key note). Required (Load
 fails listing all that are missing, not just the first): `DATABASE_URL`, `APP_DATABASE_URL`,
 `SYSTEM_DATABASE_URL`, `CLERK_SECRET_KEY`, `CLERK_PUBLISHABLE_KEY`, `CLERK_WEBHOOK_SECRET`,
-`LOCALSTACK_AUTH_TOKEN`, `PINECONE_API_KEY`, `ENCRYPTION_KEY`, `OAUTH_STATE_SECRET`. The three
+`PINECONE_API_KEY`, `ENCRYPTION_KEY`, `OAUTH_STATE_SECRET`. The three
 `*_DATABASE_URL` vars connect as three different Postgres roles for three different trust
 boundaries — see "Row-Level Security" above before adding a fourth use case to any of them.
 

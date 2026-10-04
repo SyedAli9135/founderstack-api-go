@@ -364,6 +364,7 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 		_ = router.SetTrustedProxies(nil)
 	}
 	router.Use(middleware.RequestID())
+	router.Use(middleware.AccessLog(slog.Default()))
 	router.Use(middleware.Recovery(cfg))
 	router.Use(middleware.SecurityHeaders(cfg))
 	router.Use(middleware.LimitBody(maxRequestBody))

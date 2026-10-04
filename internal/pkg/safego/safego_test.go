@@ -25,6 +25,7 @@ func TestDoErr_PassesErrorsThroughAndContainsPanics(t *testing.T) {
 		t.Fatalf("got %v, want the original error", got)
 	}
 	var pe *PanicError
+	//lint:ignore SA5000 the panic is the point
 	if err := DoErr("job", func() error { var m map[string]int; m["x"] = 1; return nil }); !errors.As(err, &pe) {
 		t.Fatalf("err = %v, want a *PanicError for a nil-map write", err)
 	}
