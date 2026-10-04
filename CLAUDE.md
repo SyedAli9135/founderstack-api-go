@@ -2379,6 +2379,14 @@ event just re-applies the same write harmlessly. Covered by
 `clerk_integration_test.go`: replaying `organization.created` produces the same single row,
 not a duplicate.
 
+**Ordering (added 2026-10-04):** Clerk documents that events aren't guaranteed to arrive in order and are retried, so
+UPSERT idempotency alone isn't enough — a retried `created` after a `deleted` would re-activate a removed member, and a
+stale `updated` would revert a role. Each `users` row therefore keeps `clerk_event_at` (migration `000023`), the envelope
+`timestamp` of the newest event applied; `UpsertUserForMembership`, `SoftDeleteMembership` and
+`SoftDeleteUserByClerkUserID` ignore any event older than that. A payload without a timestamp (and rows written by
+workspace creation) carries no ordering information and applies as before. The body is read through `readLimited`
+(1 MiB) since the endpoint is unauthenticated until the signature is checked.
+
 `organizationMembership.created` arriving before its org's `organization.created` (a real
 possibility — Clerk doesn't guarantee delivery order) returns `422 ORG_NOT_FOUND_YET`, which
 tells Clerk/Svix to retry with backoff; this self-heals once the org event lands. Covered by

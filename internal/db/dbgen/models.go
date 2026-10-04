@@ -332,6 +332,7 @@ type User struct {
 	CanApproveWorkflows   *bool              `json:"can_approve_workflows"`
 	IsActive              *bool              `json:"is_active"`
 	LastLoginAt           pgtype.Timestamptz `json:"last_login_at"`
+	ClerkEventAt          pgtype.Timestamptz `json:"clerk_event_at"`
 }
 
 type VectorNamespace struct {

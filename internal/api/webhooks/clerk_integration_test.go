@@ -27,6 +27,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -747,4 +748,121 @@ func TestClerkWebhook_OrgsWithoutSlugs(t *testing.T) {
 			t.Fatalf("org = (%q, %q), want the stored slug kept and the name updated", slug, name)
 		}
 	})
+}
+
+// Clerk doesn't guarantee order and retries failed deliveries, so an old event
+// can arrive after a newer one. It must not re-activate a removed member,
+// undo a removal that came after it, or revert a role.
+func TestClerkWebhook_StaleEventsCannotUndoNewerOnes(t *testing.T) {
+	pool := testPool(t)
+	secret, secretBytes := testSecret(t)
+	router := testRouter(t, pool, secret)
+
+	suffix := response.NewID()[:12]
+	orgClerkID := "org_stale_" + suffix
+	userClerkID := "user_stale_" + suffix
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_, _ = pool.Exec(ctx, "delete from users where clerk_user_id = $1", userClerkID)
+		_, _ = pool.Exec(ctx, "delete from organizations where clerk_org_id = $1", orgClerkID)
+	})
+	if rec := postWebhook(t, router, secretBytes, map[string]any{
+		"type": "organization.created",
+		"data": map[string]any{"id": orgClerkID, "name": "Stale Org", "slug": "stale-" + suffix},
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("org create = %d", rec.Code)
+	}
+
+	base := time.Now().UnixMilli()
+	membership := func(typ, role string, offsetMs int64) *httptest.ResponseRecorder {
+		return postWebhook(t, router, secretBytes, map[string]any{
+			"type": typ, "timestamp": base + offsetMs,
+			"data": map[string]any{
+				"organization":     map[string]any{"id": orgClerkID, "name": "Stale Org", "slug": "stale-" + suffix},
+				"public_user_data": map[string]any{"user_id": userClerkID, "identifier": "stale@example.com"},
+				"role":             role,
+			},
+		})
+	}
+	state := func() (active bool, role string) {
+		if err := pool.QueryRow(context.Background(), "select is_active, role from users where clerk_user_id = $1", userClerkID).Scan(&active, &role); err != nil {
+			t.Fatalf("query user: %v", err)
+		}
+		return
+	}
+
+	if rec := membership("organizationMembership.created", "org:member", 1000); rec.Code != http.StatusOK {
+		t.Fatalf("created = %d", rec.Code)
+	}
+	if rec := membership("organizationMembership.deleted", "org:member", 3000); rec.Code != http.StatusOK {
+		t.Fatalf("deleted = %d", rec.Code)
+	}
+
+	t.Run("a stale created event can't re-activate a removed member", func(t *testing.T) {
+		if rec := membership("organizationMembership.created", "org:admin", 2000); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (ack it, change nothing)", rec.Code)
+		}
+		if active, role := state(); active || role != "member" {
+			t.Fatalf("after a stale created: active=%v role=%q, want inactive member", active, role)
+		}
+	})
+
+	t.Run("a genuinely newer created event (a re-invite) is applied", func(t *testing.T) {
+		membership("organizationMembership.created", "org:member", 4000)
+		if active, _ := state(); !active {
+			t.Fatal("a newer created event should re-activate the member")
+		}
+	})
+
+	t.Run("a stale deleted event can't remove a newer membership", func(t *testing.T) {
+		membership("organizationMembership.deleted", "org:member", 3500)
+		if active, _ := state(); !active {
+			t.Fatal("a deleted event older than the re-invite must not deactivate it")
+		}
+	})
+
+	t.Run("a stale updated event can't revert a role", func(t *testing.T) {
+		membership("organizationMembership.updated", "org:admin", 3600)
+		if _, role := state(); role != "member" {
+			t.Fatalf("role = %q after a stale updated, want member", role)
+		}
+		membership("organizationMembership.updated", "org:admin", 5000)
+		if _, role := state(); role != "admin" {
+			t.Fatalf("role = %q after a newer updated, want admin", role)
+		}
+	})
+
+	t.Run("a stale user.deleted can't deactivate a newer membership, a fresh one can", func(t *testing.T) {
+		userDeleted := func(offsetMs int64) {
+			postWebhook(t, router, secretBytes, map[string]any{
+				"type": "user.deleted", "timestamp": base + offsetMs, "data": map[string]any{"id": userClerkID},
+			})
+		}
+		userDeleted(100)
+		if active, _ := state(); !active {
+			t.Fatal("a user.deleted older than the membership must not deactivate it")
+		}
+		userDeleted(9000)
+		if active, _ := state(); active {
+			t.Fatal("a newer user.deleted should deactivate")
+		}
+	})
+}
+
+func TestClerkWebhook_RejectsAnOversizedBodyBeforeDoingAnyWork(t *testing.T) {
+	pool := testPool(t)
+	secret, secretBytes := testSecret(t)
+	router := testRouter(t, pool, secret)
+
+	body := bytes.Repeat([]byte("a"), maxClerkPayload+1024)
+	id, ts := "msg_big", strconv.FormatInt(time.Now().Unix(), 10)
+	req := httptest.NewRequest(http.MethodPost, "/api/webhooks/clerk", bytes.NewReader(body))
+	req.Header.Set("svix-id", id)
+	req.Header.Set("svix-timestamp", ts)
+	req.Header.Set("svix-signature", sign(t, secretBytes, id, ts, body))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "INVALID_BODY") {
+		t.Fatalf("got (%d, %s), want 400 INVALID_BODY for a body over %d bytes", rec.Code, rec.Body.String(), maxClerkPayload)
+	}
 }

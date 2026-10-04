@@ -618,7 +618,7 @@ type Querier interface {
 	SoftDeleteMembership(ctx context.Context, arg SoftDeleteMembershipParams) (int64, error)
 	SoftDeleteOrganizationByClerkOrgID(ctx context.Context, clerkOrgID string) (int64, error)
 	// A full Clerk account deletion (user.deleted): every membership goes.
-	SoftDeleteUserByClerkUserID(ctx context.Context, clerkUserID string) (int64, error)
+	SoftDeleteUserByClerkUserID(ctx context.Context, arg SoftDeleteUserByClerkUserIDParams) (int64, error)
 	// Overwrites every SOP-controlled field. Returns no row if the client has
 	// since removed the agent, which the handler reports as a broken deployment.
 	SyncSopAgent(ctx context.Context, arg SyncSopAgentParams) (pgtype.UUID, error)
@@ -720,7 +720,11 @@ type Querier interface {
 	// branch never touched these 3 columns at all, so ANY re-sync (including
 	// a brand-new membership) silently carried forward whatever a completely
 	// unrelated, already-terminated membership had left behind.
-	UpsertUserForMembership(ctx context.Context, arg UpsertUserForMembershipParams) error
+	// event_at is the Clerk event's own timestamp (NULL when unknown, e.g. a row
+	// written by workspace creation): an event older than the newest one already
+	// applied to this membership changes nothing, so a retried "created" can't
+	// undo a later removal and a stale "updated" can't revert a role.
+	UpsertUserForMembership(ctx context.Context, arg UpsertUserForMembershipParams) (int64, error)
 	// Queries backing workflow 8 (workflow config CRUD + scheduling). Most are
 	// tenant-scoped through app_user via tenant.WithTx, like every other
 	// feature area in this file set. The 3 queries under "background

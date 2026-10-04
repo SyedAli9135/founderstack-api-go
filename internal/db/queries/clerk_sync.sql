@@ -33,15 +33,21 @@ SELECT id FROM organizations WHERE clerk_org_id = $1;
 -- branch never touched these 3 columns at all, so ANY re-sync (including
 -- a brand-new membership) silently carried forward whatever a completely
 -- unrelated, already-terminated membership had left behind.
--- name: UpsertUserForMembership :exec
-INSERT INTO users (org_id, clerk_user_id, email, full_name, role, can_approve_workflows, can_manage_api_keys, can_manage_integrations, is_active)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+-- name: UpsertUserForMembership :execrows
+-- event_at is the Clerk event's own timestamp (NULL when unknown, e.g. a row
+-- written by workspace creation): an event older than the newest one already
+-- applied to this membership changes nothing, so a retried "created" can't
+-- undo a later removal and a stale "updated" can't revert a role.
+INSERT INTO users (org_id, clerk_user_id, email, full_name, role, can_approve_workflows, can_manage_api_keys, can_manage_integrations, is_active, clerk_event_at)
+VALUES (sqlc.arg(org_id), sqlc.arg(clerk_user_id), sqlc.arg(email), sqlc.arg(full_name), sqlc.arg(role), sqlc.arg(can_approve_workflows), sqlc.arg(can_manage_api_keys), sqlc.arg(can_manage_integrations), true, sqlc.narg(event_at)::timestamptz)
 ON CONFLICT (org_id, clerk_user_id) DO UPDATE SET
     role = EXCLUDED.role,
     is_active = true,
     can_approve_workflows = CASE WHEN users.is_active THEN users.can_approve_workflows ELSE EXCLUDED.can_approve_workflows END,
     can_manage_api_keys = CASE WHEN users.is_active THEN users.can_manage_api_keys ELSE EXCLUDED.can_manage_api_keys END,
-    can_manage_integrations = CASE WHEN users.is_active THEN users.can_manage_integrations ELSE EXCLUDED.can_manage_integrations END;
+    can_manage_integrations = CASE WHEN users.is_active THEN users.can_manage_integrations ELSE EXCLUDED.can_manage_integrations END,
+    clerk_event_at = GREATEST(users.clerk_event_at, EXCLUDED.clerk_event_at)
+WHERE users.clerk_event_at IS NULL OR EXCLUDED.clerk_event_at IS NULL OR EXCLUDED.clerk_event_at >= users.clerk_event_at;
 
 -- name: UpdateUserProfile :execrows
 -- Profile fields are per-person, so this deliberately updates every
@@ -53,11 +59,14 @@ UPDATE organizations SET is_active = false WHERE clerk_org_id = $1;
 
 -- name: SoftDeleteUserByClerkUserID :execrows
 -- A full Clerk account deletion (user.deleted): every membership goes.
-UPDATE users SET is_active = false WHERE clerk_user_id = $1;
+UPDATE users SET is_active = false, clerk_event_at = GREATEST(clerk_event_at, sqlc.narg(event_at)::timestamptz)
+WHERE clerk_user_id = sqlc.arg(clerk_user_id)
+  AND (clerk_event_at IS NULL OR sqlc.narg(event_at)::timestamptz IS NULL OR sqlc.narg(event_at)::timestamptz >= clerk_event_at);
 
 -- name: SoftDeleteMembership :execrows
 -- A single membership removal: only this org's row, never the person's
 -- memberships elsewhere.
-UPDATE users SET is_active = false
-WHERE clerk_user_id = $1
-  AND org_id = (SELECT id FROM organizations WHERE clerk_org_id = $2);
+UPDATE users SET is_active = false, clerk_event_at = GREATEST(clerk_event_at, sqlc.narg(event_at)::timestamptz)
+WHERE clerk_user_id = sqlc.arg(clerk_user_id)
+  AND org_id = (SELECT id FROM organizations WHERE clerk_org_id = sqlc.arg(clerk_org_id))
+  AND (clerk_event_at IS NULL OR sqlc.narg(event_at)::timestamptz IS NULL OR sqlc.narg(event_at)::timestamptz >= clerk_event_at);

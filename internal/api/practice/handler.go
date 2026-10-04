@@ -359,10 +359,11 @@ func (h *Handler) CreateClientWorkspace(c *gin.Context) {
 		// Same values the webhook will write (Clerk makes the creator an
 		// admin), so its later arrival is a no-op.
 		isAdmin := true
-		return q.UpsertUserForMembership(ctx, dbgen.UpsertUserForMembershipParams{
+		_, err = q.UpsertUserForMembership(ctx, dbgen.UpsertUserForMembershipParams{
 			OrgID: orgID, ClerkUserID: user.ClerkUserID, Email: profile.Email, FullName: profile.FullName,
 			Role: "admin", CanApproveWorkflows: &isAdmin, CanManageApiKeys: &isAdmin, CanManageIntegrations: &isAdmin,
 		})
+		return err
 	})
 	if err != nil {
 		h.rollbackProvisioning(ctx, clerkOrgID)

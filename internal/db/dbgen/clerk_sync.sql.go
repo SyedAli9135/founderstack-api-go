@@ -23,20 +23,22 @@ func (q *Queries) GetOrganizationIDByClerkOrgID(ctx context.Context, clerkOrgID 
 }
 
 const softDeleteMembership = `-- name: SoftDeleteMembership :execrows
-UPDATE users SET is_active = false
-WHERE clerk_user_id = $1
-  AND org_id = (SELECT id FROM organizations WHERE clerk_org_id = $2)
+UPDATE users SET is_active = false, clerk_event_at = GREATEST(clerk_event_at, $1::timestamptz)
+WHERE clerk_user_id = $2
+  AND org_id = (SELECT id FROM organizations WHERE clerk_org_id = $3)
+  AND (clerk_event_at IS NULL OR $1::timestamptz IS NULL OR $1::timestamptz >= clerk_event_at)
 `
 
 type SoftDeleteMembershipParams struct {
-	ClerkUserID string `json:"clerk_user_id"`
-	ClerkOrgID  string `json:"clerk_org_id"`
+	EventAt     pgtype.Timestamptz `json:"event_at"`
+	ClerkUserID string             `json:"clerk_user_id"`
+	ClerkOrgID  string             `json:"clerk_org_id"`
 }
 
 // A single membership removal: only this org's row, never the person's
 // memberships elsewhere.
 func (q *Queries) SoftDeleteMembership(ctx context.Context, arg SoftDeleteMembershipParams) (int64, error) {
-	result, err := q.db.Exec(ctx, softDeleteMembership, arg.ClerkUserID, arg.ClerkOrgID)
+	result, err := q.db.Exec(ctx, softDeleteMembership, arg.EventAt, arg.ClerkUserID, arg.ClerkOrgID)
 	if err != nil {
 		return 0, err
 	}
@@ -56,12 +58,19 @@ func (q *Queries) SoftDeleteOrganizationByClerkOrgID(ctx context.Context, clerkO
 }
 
 const softDeleteUserByClerkUserID = `-- name: SoftDeleteUserByClerkUserID :execrows
-UPDATE users SET is_active = false WHERE clerk_user_id = $1
+UPDATE users SET is_active = false, clerk_event_at = GREATEST(clerk_event_at, $1::timestamptz)
+WHERE clerk_user_id = $2
+  AND (clerk_event_at IS NULL OR $1::timestamptz IS NULL OR $1::timestamptz >= clerk_event_at)
 `
 
+type SoftDeleteUserByClerkUserIDParams struct {
+	EventAt     pgtype.Timestamptz `json:"event_at"`
+	ClerkUserID string             `json:"clerk_user_id"`
+}
+
 // A full Clerk account deletion (user.deleted): every membership goes.
-func (q *Queries) SoftDeleteUserByClerkUserID(ctx context.Context, clerkUserID string) (int64, error) {
-	result, err := q.db.Exec(ctx, softDeleteUserByClerkUserID, clerkUserID)
+func (q *Queries) SoftDeleteUserByClerkUserID(ctx context.Context, arg SoftDeleteUserByClerkUserIDParams) (int64, error) {
+	result, err := q.db.Exec(ctx, softDeleteUserByClerkUserID, arg.EventAt, arg.ClerkUserID)
 	if err != nil {
 		return 0, err
 	}
@@ -126,26 +135,29 @@ func (q *Queries) UpsertOrganization(ctx context.Context, arg UpsertOrganization
 	return id, err
 }
 
-const upsertUserForMembership = `-- name: UpsertUserForMembership :exec
-INSERT INTO users (org_id, clerk_user_id, email, full_name, role, can_approve_workflows, can_manage_api_keys, can_manage_integrations, is_active)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+const upsertUserForMembership = `-- name: UpsertUserForMembership :execrows
+INSERT INTO users (org_id, clerk_user_id, email, full_name, role, can_approve_workflows, can_manage_api_keys, can_manage_integrations, is_active, clerk_event_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9::timestamptz)
 ON CONFLICT (org_id, clerk_user_id) DO UPDATE SET
     role = EXCLUDED.role,
     is_active = true,
     can_approve_workflows = CASE WHEN users.is_active THEN users.can_approve_workflows ELSE EXCLUDED.can_approve_workflows END,
     can_manage_api_keys = CASE WHEN users.is_active THEN users.can_manage_api_keys ELSE EXCLUDED.can_manage_api_keys END,
-    can_manage_integrations = CASE WHEN users.is_active THEN users.can_manage_integrations ELSE EXCLUDED.can_manage_integrations END
+    can_manage_integrations = CASE WHEN users.is_active THEN users.can_manage_integrations ELSE EXCLUDED.can_manage_integrations END,
+    clerk_event_at = GREATEST(users.clerk_event_at, EXCLUDED.clerk_event_at)
+WHERE users.clerk_event_at IS NULL OR EXCLUDED.clerk_event_at IS NULL OR EXCLUDED.clerk_event_at >= users.clerk_event_at
 `
 
 type UpsertUserForMembershipParams struct {
-	OrgID                 pgtype.UUID `json:"org_id"`
-	ClerkUserID           string      `json:"clerk_user_id"`
-	Email                 string      `json:"email"`
-	FullName              *string     `json:"full_name"`
-	Role                  string      `json:"role"`
-	CanApproveWorkflows   *bool       `json:"can_approve_workflows"`
-	CanManageApiKeys      *bool       `json:"can_manage_api_keys"`
-	CanManageIntegrations *bool       `json:"can_manage_integrations"`
+	OrgID                 pgtype.UUID        `json:"org_id"`
+	ClerkUserID           string             `json:"clerk_user_id"`
+	Email                 string             `json:"email"`
+	FullName              *string            `json:"full_name"`
+	Role                  string             `json:"role"`
+	CanApproveWorkflows   *bool              `json:"can_approve_workflows"`
+	CanManageApiKeys      *bool              `json:"can_manage_api_keys"`
+	CanManageIntegrations *bool              `json:"can_manage_integrations"`
+	EventAt               pgtype.Timestamptz `json:"event_at"`
 }
 
 // can_approve_workflows/can_manage_api_keys/can_manage_integrations are
@@ -162,8 +174,12 @@ type UpsertUserForMembershipParams struct {
 // branch never touched these 3 columns at all, so ANY re-sync (including
 // a brand-new membership) silently carried forward whatever a completely
 // unrelated, already-terminated membership had left behind.
-func (q *Queries) UpsertUserForMembership(ctx context.Context, arg UpsertUserForMembershipParams) error {
-	_, err := q.db.Exec(ctx, upsertUserForMembership,
+// event_at is the Clerk event's own timestamp (NULL when unknown, e.g. a row
+// written by workspace creation): an event older than the newest one already
+// applied to this membership changes nothing, so a retried "created" can't
+// undo a later removal and a stale "updated" can't revert a role.
+func (q *Queries) UpsertUserForMembership(ctx context.Context, arg UpsertUserForMembershipParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertUserForMembership,
 		arg.OrgID,
 		arg.ClerkUserID,
 		arg.Email,
@@ -172,6 +188,10 @@ func (q *Queries) UpsertUserForMembership(ctx context.Context, arg UpsertUserFor
 		arg.CanApproveWorkflows,
 		arg.CanManageApiKeys,
 		arg.CanManageIntegrations,
+		arg.EventAt,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/founderstack/api/internal/api/response"
@@ -37,10 +38,34 @@ func (h *ClerkHandler) Register(rg *gin.RouterGroup) {
 
 const handlerTimeout = 10 * time.Second
 
+// Clerk events are a few KB. The endpoint is unauthenticated until the
+// signature is checked, so the body is bounded well below the router's cap.
+const maxClerkPayload = 1 << 20
+
+// maxClockSkew bounds how far in the future an event's timestamp may sit
+// before it's clamped, so one bad value can't make every real event look stale.
+const maxClockSkew = 5 * time.Minute
+
 // Clerk's outer webhook shape: {"type": "...", "data": {...}}.
 type envelope struct {
 	Type string          `json:"type"`
 	Data json.RawMessage `json:"data"`
+	// Timestamp is when the event happened, in milliseconds. Clerk doesn't
+	// guarantee delivery order, so it decides whether an event is stale.
+	Timestamp int64 `json:"timestamp"`
+}
+
+// eventAt is the event's own time, or invalid (no ordering information) when
+// the payload carries none.
+func (e envelope) eventAt(now time.Time) pgtype.Timestamptz {
+	if e.Timestamp <= 0 {
+		return pgtype.Timestamptz{}
+	}
+	t := time.UnixMilli(e.Timestamp)
+	if limit := now.Add(maxClockSkew); t.After(limit) {
+		t = limit
+	}
+	return pgtype.Timestamptz{Time: t, Valid: true}
 }
 
 func (h *ClerkHandler) Handle(c *gin.Context) {
@@ -51,7 +76,7 @@ func (h *ClerkHandler) Handle(c *gin.Context) {
 		return
 	}
 
-	body, err := c.GetRawData()
+	body, err := readLimited(c, maxClerkPayload)
 	if err != nil {
 		response.Fail(c, http.StatusBadRequest, "INVALID_BODY", "Could not read request body")
 		return
@@ -80,20 +105,21 @@ func (h *ClerkHandler) Handle(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), handlerTimeout)
 	defer cancel()
 
+	at := evt.eventAt(time.Now())
 	var handleErr error
 	switch evt.Type {
 	case "organization.created", "organization.updated":
 		handleErr = h.upsertOrganization(ctx, evt.Data)
 	case "organizationMembership.created", "organizationMembership.updated":
-		handleErr = h.upsertMembership(ctx, evt.Data)
+		handleErr = h.upsertMembership(ctx, evt.Data, at)
 	case "user.updated":
 		handleErr = h.updateUserProfile(ctx, evt.Data)
 	case "organization.deleted":
 		handleErr = h.softDeleteOrganization(ctx, evt.Data)
 	case "organizationMembership.deleted":
-		handleErr = h.softDeleteMembership(ctx, evt.Data)
+		handleErr = h.softDeleteMembership(ctx, evt.Data, at)
 	case "user.deleted":
-		handleErr = h.softDeleteUser(ctx, evt.Data)
+		handleErr = h.softDeleteUser(ctx, evt.Data, at)
 	default:
 		// Deliberately unhandled: session.* has no reader here; organizationInvitation.*
 		// is superseded by the membership.created event an accepted invite already fires;
@@ -165,7 +191,7 @@ type membershipPayload struct {
 	Role string `json:"role"`
 }
 
-func (h *ClerkHandler) upsertMembership(ctx context.Context, raw json.RawMessage) error {
+func (h *ClerkHandler) upsertMembership(ctx context.Context, raw json.RawMessage, at pgtype.Timestamptz) error {
 	var data membershipPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return fmt.Errorf("decode membership payload: %w", err)
@@ -185,7 +211,7 @@ func (h *ClerkHandler) upsertMembership(ctx context.Context, raw json.RawMessage
 	// access from the moment their membership syncs; workflow 13's PATCH
 	// .../role endpoint is the only other place that ever changes these.
 	isOrgAdmin := canApproveByDefault(role)
-	if err := h.db.UpsertUserForMembership(ctx, dbgen.UpsertUserForMembershipParams{
+	applied, err := h.db.UpsertUserForMembership(ctx, dbgen.UpsertUserForMembershipParams{
 		OrgID:                 orgID,
 		ClerkUserID:           data.PublicUserData.UserID,
 		Email:                 data.PublicUserData.Identifier,
@@ -194,8 +220,13 @@ func (h *ClerkHandler) upsertMembership(ctx context.Context, raw json.RawMessage
 		CanApproveWorkflows:   &isOrgAdmin,
 		CanManageApiKeys:      &isOrgAdmin,
 		CanManageIntegrations: &isOrgAdmin,
-	}); err != nil {
+		EventAt:               at,
+	})
+	if err != nil {
 		return fmt.Errorf("upsert user: %w", err)
+	}
+	if applied == 0 {
+		slog.Info("ignoring stale clerk membership event", "org", data.Organization.ID, "user", data.PublicUserData.UserID)
 	}
 	return nil
 }
@@ -248,7 +279,7 @@ func (h *ClerkHandler) softDeleteOrganization(ctx context.Context, raw json.RawM
 
 // Scoped to the one (org, person) pair: a person can hold memberships in many orgs
 // (a practice plus its client workspaces), and leaving one must not touch the others.
-func (h *ClerkHandler) softDeleteMembership(ctx context.Context, raw json.RawMessage) error {
+func (h *ClerkHandler) softDeleteMembership(ctx context.Context, raw json.RawMessage, at pgtype.Timestamptz) error {
 	var data membershipPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return fmt.Errorf("decode membership payload: %w", err)
@@ -256,6 +287,7 @@ func (h *ClerkHandler) softDeleteMembership(ctx context.Context, raw json.RawMes
 	if _, err := h.db.SoftDeleteMembership(ctx, dbgen.SoftDeleteMembershipParams{
 		ClerkUserID: data.PublicUserData.UserID,
 		ClerkOrgID:  data.Organization.ID,
+		EventAt:     at,
 	}); err != nil {
 		return fmt.Errorf("soft-delete user: %w", err)
 	}
@@ -263,12 +295,12 @@ func (h *ClerkHandler) softDeleteMembership(ctx context.Context, raw json.RawMes
 }
 
 // A whole Clerk account is gone, so every membership row the person holds goes with it.
-func (h *ClerkHandler) softDeleteUser(ctx context.Context, raw json.RawMessage) error {
+func (h *ClerkHandler) softDeleteUser(ctx context.Context, raw json.RawMessage, at pgtype.Timestamptz) error {
 	var data userPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return fmt.Errorf("decode user payload: %w", err)
 	}
-	if _, err := h.db.SoftDeleteUserByClerkUserID(ctx, data.ID); err != nil {
+	if _, err := h.db.SoftDeleteUserByClerkUserID(ctx, dbgen.SoftDeleteUserByClerkUserIDParams{ClerkUserID: data.ID, EventAt: at}); err != nil {
 		return fmt.Errorf("soft-delete user: %w", err)
 	}
 	return nil
