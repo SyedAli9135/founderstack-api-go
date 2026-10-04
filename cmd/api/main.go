@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/founderstack/api/internal/core/lifecycle"
 	dbpkg "github.com/founderstack/api/internal/db"
+	"github.com/founderstack/api/internal/pkg/errreport"
 	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"net/http"
@@ -155,6 +156,12 @@ func run() error {
 	// design.
 	mcpGateway := coremcp.NewGateway(dbPool, encryptionKey, mcpRegistry, redisClient)
 	mcpGateway.SetIntegrationRegistry(integrationsRegistry)
+	flushErrors, err := errreport.Init(cfg.SentryDSN.Expose(), cfg.AppEnv, "")
+	if err != nil {
+		return err
+	}
+	defer flushErrors()
+
 	graphEngine := graph.NewEngine(dbPool)
 	// A run executes on one instance but its viewers (and a cancel request) can
 	// reach any: relay events and cancels between instances through Redis.

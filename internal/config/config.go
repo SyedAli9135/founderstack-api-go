@@ -143,6 +143,9 @@ type Config struct {
 	// ShutdownGraceSeconds is how long a stopping instance lets in-flight runs
 	// and jobs finish before cancelling them. Keep it below the platform's
 	// own kill timeout (30s on most) minus the 10s HTTP drain.
+	// SentryDSN enables error reporting when set; empty leaves it off.
+	SentryDSN secret.Value `mapstructure:"SENTRY_DSN"`
+
 	ShutdownGraceSeconds int `mapstructure:"SHUTDOWN_GRACE_SECONDS"`
 
 	// Retention, in days. Audit and cost history keep two years by default
@@ -357,6 +360,7 @@ func Load() (*Config, error) {
 		"DOCS_SEARCHES_PER_MINUTE":     120,
 		"MAX_ACTIVE_RUNS_PER_ORG":      10,
 		"SHUTDOWN_GRACE_SECONDS":       15,
+		"SENTRY_DSN":                   "",
 		"RETENTION_AUDIT_DAYS":         730,
 		"RETENTION_COST_DAYS":          730,
 		"RETENTION_STEPS_DAYS":         180,

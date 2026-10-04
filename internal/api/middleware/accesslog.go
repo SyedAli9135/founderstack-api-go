@@ -2,9 +2,12 @@ package middleware
 
 import (
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/founderstack/api/internal/pkg/errreport"
 )
 
 // AccessLog writes one structured line per request. It logs the route
@@ -26,6 +29,9 @@ func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 		level := slog.LevelInfo
 		if c.Writer.Status() >= 500 {
 			level = slog.LevelError
+			if _, done := c.Get(reportedKey); !done { // a recovered panic was already reported with its stack
+				errreport.Message("http", "server error "+c.Request.Method+" "+route, map[string]string{"route": route, "status": strconv.Itoa(c.Writer.Status()), "request_id": c.Writer.Header().Get(requestIDHeader)})
+			}
 		}
 		logger.Log(c.Request.Context(), level, "request",
 			"method", c.Request.Method,

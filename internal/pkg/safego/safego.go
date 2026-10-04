@@ -8,6 +8,7 @@ package safego
 import (
 	"context"
 	"fmt"
+	"github.com/founderstack/api/internal/pkg/errreport"
 	"log/slog"
 	"runtime/debug"
 	"sync/atomic"
@@ -32,6 +33,7 @@ func Do(name string, fn func()) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("recovered panic", "where", name, "panic", r, "stack", string(debug.Stack()))
+			errreport.Panic(name, r, nil)
 			err = &PanicError{Name: name, Value: r}
 		}
 	}()
@@ -44,6 +46,7 @@ func DoErr(name string, fn func() error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("recovered panic", "where", name, "panic", r, "stack", string(debug.Stack()))
+			errreport.Panic(name, r, nil)
 			err = &PanicError{Name: name, Value: r}
 		}
 	}()

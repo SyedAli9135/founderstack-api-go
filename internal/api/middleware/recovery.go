@@ -10,7 +10,10 @@ import (
 
 	"github.com/founderstack/api/internal/api/response"
 	"github.com/founderstack/api/internal/config"
+	"github.com/founderstack/api/internal/pkg/errreport"
 )
+
+const reportedKey = "error_reported"
 
 // Recovery catches panics so a single bad request can't take the process
 // down, reporting them through the same envelope every other error uses.
@@ -23,6 +26,8 @@ func Recovery(cfg *config.Config) gin.HandlerFunc {
 					"request_id", response.RequestID(c),
 					"stack", string(debug.Stack()),
 				)
+				errreport.Panic("http", r, map[string]string{"request_id": response.RequestID(c), "route": c.FullPath()})
+				c.Set(reportedKey, true)
 				message := "An unexpected internal server error occurred. Please contact support with the Request ID."
 				if !cfg.IsProduction() {
 					message = fmt.Sprintf("%v", r)
