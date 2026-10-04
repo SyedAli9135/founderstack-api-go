@@ -19,7 +19,14 @@ type Gateway struct {
 	encryptionKey []byte
 	registry      *Registry
 	rdb           *redis.Client
+	// integrations lets a tool call refresh an expiring OAuth token first;
+	// nil falls back to using the stored token as is.
+	integrations *integrations.Registry
 }
+
+// SetIntegrationRegistry enables refreshing an expiring token at the moment a
+// tool needs it, instead of waiting for the background job's next scan.
+func (g *Gateway) SetIntegrationRegistry(r *integrations.Registry) { g.integrations = r }
 
 // NewGateway builds a Gateway. appPool must be the app_user (RLS-enforced) pool.
 func NewGateway(appPool *pgxpool.Pool, encryptionKey []byte, registry *Registry, rdb *redis.Client) *Gateway {
@@ -40,7 +47,12 @@ func (g *Gateway) ExecuteTool(ctx context.Context, orgID pgtype.UUID, service, t
 		return nil, err
 	}
 
-	tok, err := integrations.GetIntegrationToken(ctx, g.appPool, g.encryptionKey, orgID, service)
+	var tok integrations.Token
+	if g.integrations != nil {
+		tok, err = integrations.GetFreshIntegrationToken(ctx, g.appPool, g.encryptionKey, g.integrations, orgID, service)
+	} else {
+		tok, err = integrations.GetIntegrationToken(ctx, g.appPool, g.encryptionKey, orgID, service)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("mcp: fetch %s token: %w", service, err)
 	}

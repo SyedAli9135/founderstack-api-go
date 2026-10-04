@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"runtime/debug"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -54,17 +55,29 @@ func namespaceForOrg(orgID pgtype.UUID) string {
 // something to look at.
 func (p *Processor) Process(ctx context.Context, orgID, docID pgtype.UUID) error {
 	var doc dbgen.GetDocumentRow
+	var claimed bool
 	err := tenant.WithTx(ctx, p.appPool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
-		row, err := q.GetDocument(ctx, dbgen.GetDocumentParams{OrgID: orgID, ID: docID})
+		n, err := q.ClaimDocumentForProcessing(ctx, dbgen.ClaimDocumentForProcessingParams{
+			OrgID: orgID, ID: docID, StaleBefore: pgtype.Timestamptz{Time: time.Now().Add(-stuckThreshold), Valid: true},
+		})
 		if err != nil {
 			return err
 		}
-		doc = row
-		status := "processing"
-		return q.UpdateDocumentProcessing(ctx, dbgen.UpdateDocumentProcessingParams{OrgID: orgID, ID: docID, ProcessingStatus: &status})
+		if n == 0 {
+			return nil
+		}
+		claimed = true
+		doc, err = q.GetDocument(ctx, dbgen.GetDocumentParams{OrgID: orgID, ID: docID})
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("documents: load document %s: %w", docID.String(), err)
+	}
+	if !claimed {
+		// Someone else is processing it (another instance, or a recovery
+		// sweep racing the original), or it has been deleted or finished.
+		slog.Info("documents: not processing a document that is already claimed", "doc_id", docID.String())
+		return nil
 	}
 
 	if procErr := p.runContained(ctx, orgID, docID, doc); procErr != nil {
@@ -174,6 +187,10 @@ func (p *Processor) run(ctx context.Context, orgID, docID pgtype.UUID, doc dbgen
 		}
 
 		total += len(batch)
+		// Heartbeat: a slow document (rate-limited embeds) must not look dead.
+		_ = tenant.WithTx(ctx, p.appPool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
+			return q.TouchDocument(ctx, dbgen.TouchDocumentParams{OrgID: orgID, ID: docID})
+		})
 	}
 
 	totalChunks := int32(total)

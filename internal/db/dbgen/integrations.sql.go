@@ -54,6 +54,43 @@ func (q *Queries) GetConnectionByOrgService(ctx context.Context, arg GetConnecti
 	return i, err
 }
 
+const getConnectionByOrgServiceForUpdate = `-- name: GetConnectionByOrgServiceForUpdate :one
+SELECT id, service_name, encrypted_credentials, oauth_scopes, oauth_status, is_active
+FROM mcp_connections
+WHERE org_id = $1 AND service_name = $2
+FOR UPDATE
+`
+
+type GetConnectionByOrgServiceForUpdateParams struct {
+	OrgID       pgtype.UUID `json:"org_id"`
+	ServiceName string      `json:"service_name"`
+}
+
+type GetConnectionByOrgServiceForUpdateRow struct {
+	ID                   pgtype.UUID `json:"id"`
+	ServiceName          string      `json:"service_name"`
+	EncryptedCredentials *string     `json:"encrypted_credentials"`
+	OauthScopes          []byte      `json:"oauth_scopes"`
+	OauthStatus          *string     `json:"oauth_status"`
+	IsActive             *bool       `json:"is_active"`
+}
+
+// The on-demand refresh path: concurrent tool calls needing the same expired
+// token queue on this lock, and the ones after the first find it fresh.
+func (q *Queries) GetConnectionByOrgServiceForUpdate(ctx context.Context, arg GetConnectionByOrgServiceForUpdateParams) (GetConnectionByOrgServiceForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, getConnectionByOrgServiceForUpdate, arg.OrgID, arg.ServiceName)
+	var i GetConnectionByOrgServiceForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.ServiceName,
+		&i.EncryptedCredentials,
+		&i.OauthScopes,
+		&i.OauthStatus,
+		&i.IsActive,
+	)
+	return i, err
+}
+
 const listConnectionsByOrg = `-- name: ListConnectionsByOrg :many
 SELECT service_name, oauth_status, oauth_scopes, is_active, created_at
 FROM mcp_connections
@@ -95,12 +132,13 @@ func (q *Queries) ListConnectionsByOrg(ctx context.Context, orgID pgtype.UUID) (
 }
 
 const listExpiringConnectionsSystem = `-- name: ListExpiringConnectionsSystem :many
-SELECT id, org_id, service_name, encrypted_credentials
-FROM mcp_connections
-WHERE is_active = true
-  AND oauth_status = 'connected'
-  AND token_expires_at IS NOT NULL
-  AND token_expires_at < $1
+SELECT c.id, c.org_id, c.service_name, c.encrypted_credentials
+FROM mcp_connections c
+JOIN organizations o ON o.id = c.org_id AND o.is_active = true
+WHERE c.is_active = true
+  AND c.oauth_status = 'connected'
+  AND c.token_expires_at IS NOT NULL
+  AND c.token_expires_at < $1
 `
 
 type ListExpiringConnectionsSystemRow struct {
@@ -111,8 +149,9 @@ type ListExpiringConnectionsSystemRow struct {
 }
 
 // Used only by the background refresh job (app_system pool). Scoped to
-// oauth_status = 'connected' so a already-expired or revoked connection
-// isn't retried every 30 minutes forever.
+// oauth_status = 'connected' so an already-expired or revoked connection
+// isn't retried every tick forever, and to active orgs so a deleted
+// workspace's tokens aren't kept alive.
 func (q *Queries) ListExpiringConnectionsSystem(ctx context.Context, tokenExpiresAt pgtype.Timestamptz) ([]ListExpiringConnectionsSystemRow, error) {
 	rows, err := q.db.Query(ctx, listExpiringConnectionsSystem, tokenExpiresAt)
 	if err != nil {
@@ -136,6 +175,45 @@ func (q *Queries) ListExpiringConnectionsSystem(ctx context.Context, tokenExpire
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockConnectionForRefreshSystem = `-- name: LockConnectionForRefreshSystem :one
+SELECT id, org_id, service_name, encrypted_credentials
+FROM mcp_connections
+WHERE id = $1
+  AND is_active = true
+  AND oauth_status = 'connected'
+  AND token_expires_at IS NOT NULL
+  AND token_expires_at < $2
+FOR UPDATE SKIP LOCKED
+`
+
+type LockConnectionForRefreshSystemParams struct {
+	ID             pgtype.UUID        `json:"id"`
+	TokenExpiresAt pgtype.Timestamptz `json:"token_expires_at"`
+}
+
+type LockConnectionForRefreshSystemRow struct {
+	ID                   pgtype.UUID `json:"id"`
+	OrgID                pgtype.UUID `json:"org_id"`
+	ServiceName          string      `json:"service_name"`
+	EncryptedCredentials *string     `json:"encrypted_credentials"`
+}
+
+// Claims one expiring connection for this caller: SKIP LOCKED means another
+// instance already refreshing it (or one that finished and pushed the expiry
+// out of the window) yields no row. Must run inside the transaction that does
+// the refresh — the lock lasts until it ends.
+func (q *Queries) LockConnectionForRefreshSystem(ctx context.Context, arg LockConnectionForRefreshSystemParams) (LockConnectionForRefreshSystemRow, error) {
+	row := q.db.QueryRow(ctx, lockConnectionForRefreshSystem, arg.ID, arg.TokenExpiresAt)
+	var i LockConnectionForRefreshSystemRow
+	err := row.Scan(
+		&i.ID,
+		&i.OrgID,
+		&i.ServiceName,
+		&i.EncryptedCredentials,
+	)
+	return i, err
 }
 
 const markConnectionExpired = `-- name: MarkConnectionExpired :execrows

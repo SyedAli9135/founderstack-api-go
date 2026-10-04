@@ -11,6 +11,32 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const claimDocumentForProcessing = `-- name: ClaimDocumentForProcessing :execrows
+UPDATE documents SET processing_status = 'processing'
+WHERE org_id = $1 AND id = $2
+  AND (processing_status = 'pending'
+       OR (processing_status = 'processing' AND updated_at < $3))
+`
+
+type ClaimDocumentForProcessingParams struct {
+	OrgID       pgtype.UUID        `json:"org_id"`
+	ID          pgtype.UUID        `json:"id"`
+	StaleBefore pgtype.Timestamptz `json:"stale_before"`
+}
+
+// Takes a document for processing: either it is waiting ('pending'), or it
+// says 'processing' but hasn't been touched since stale_before — its worker
+// died. A document another instance is actively working on (fresh
+// 'processing') yields no row, so the boot-time recovery sweep on a second
+// instance can't start it a second time and pay to embed it twice.
+func (q *Queries) ClaimDocumentForProcessing(ctx context.Context, arg ClaimDocumentForProcessingParams) (int64, error) {
+	result, err := q.db.Exec(ctx, claimDocumentForProcessing, arg.OrgID, arg.ID, arg.StaleBefore)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteDocumentChunks = `-- name: DeleteDocumentChunks :exec
 DELETE FROM document_chunks WHERE doc_id = $1
 `
@@ -437,6 +463,22 @@ type SoftDeleteDocumentParams struct {
 
 func (q *Queries) SoftDeleteDocument(ctx context.Context, arg SoftDeleteDocumentParams) error {
 	_, err := q.db.Exec(ctx, softDeleteDocument, arg.OrgID, arg.ID)
+	return err
+}
+
+const touchDocument = `-- name: TouchDocument :exec
+UPDATE documents SET processing_status = processing_status WHERE org_id = $1 AND id = $2
+`
+
+type TouchDocumentParams struct {
+	OrgID pgtype.UUID `json:"org_id"`
+	ID    pgtype.UUID `json:"id"`
+}
+
+// A heartbeat while a long document is processed, so it isn't mistaken for a
+// dead job (the updated_at trigger does the work).
+func (q *Queries) TouchDocument(ctx context.Context, arg TouchDocumentParams) error {
+	_, err := q.db.Exec(ctx, touchDocument, arg.OrgID, arg.ID)
 	return err
 }
 

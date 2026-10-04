@@ -40,6 +40,22 @@ WHERE digest_enabled = true
     WHERE wr.org_id = organizations.id AND wr.created_at >= now() - interval '7 days'
   );
 
+-- name: ClaimDigestSend :execrows
+-- Atomically takes today's digest for an org, so when several API instances
+-- run the scheduler only the one that gets 1 row back sends it. The same
+-- "not yet sent today, in the org's own timezone" test as ListOrgsDueForDigest.
+UPDATE organizations SET digest_last_sent_at = now()
+WHERE id = $1 AND digest_enabled = true AND is_active = true
+  AND (
+    digest_last_sent_at IS NULL
+    OR (digest_last_sent_at AT TIME ZONE digest_timezone)::date < (now() AT TIME ZONE digest_timezone)::date
+  );
+
+-- name: ReleaseDigestClaim :exec
+-- Undoes a claim when the send itself failed, so the org isn't marked as
+-- having received a digest it never got.
+UPDATE organizations SET digest_last_sent_at = NULL WHERE id = $1;
+
 -- name: MarkDigestSent :exec
 UPDATE organizations SET digest_last_sent_at = now() WHERE id = $1;
 

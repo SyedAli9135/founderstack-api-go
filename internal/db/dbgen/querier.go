@@ -15,6 +15,16 @@ type Querier interface {
 	// The row lock this UPDATE takes serializes concurrent edits, and
 	// sop_playbook_versions' UNIQUE(sop_playbook_id, version) backs it up.
 	BumpSopPlaybookVersion(ctx context.Context, arg BumpSopPlaybookVersionParams) (int32, error)
+	// Atomically takes today's digest for an org, so when several API instances
+	// run the scheduler only the one that gets 1 row back sends it. The same
+	// "not yet sent today, in the org's own timezone" test as ListOrgsDueForDigest.
+	ClaimDigestSend(ctx context.Context, id pgtype.UUID) (int64, error)
+	// Takes a document for processing: either it is waiting ('pending'), or it
+	// says 'processing' but hasn't been touched since stale_before — its worker
+	// died. A document another instance is actively working on (fresh
+	// 'processing') yields no row, so the boot-time recovery sweep on a second
+	// instance can't start it a second time and pay to embed it twice.
+	ClaimDocumentForProcessing(ctx context.Context, arg ClaimDocumentForProcessingParams) (int64, error)
 	// Re-checks "still due" under a row lock inside the firing transaction.
 	// SKIP LOCKED means that if several API processes tick at once, each due
 	// workflow is claimed by exactly one of them; the others get no row and
@@ -153,6 +163,9 @@ type Querier interface {
 	GetClientReportForUser(ctx context.Context, arg GetClientReportForUserParams) (GetClientReportForUserRow, error)
 	GetClientWorkspaceForCaller(ctx context.Context, arg GetClientWorkspaceForCallerParams) (GetClientWorkspaceForCallerRow, error)
 	GetConnectionByOrgService(ctx context.Context, arg GetConnectionByOrgServiceParams) (GetConnectionByOrgServiceRow, error)
+	// The on-demand refresh path: concurrent tool calls needing the same expired
+	// token queue on this lock, and the ones after the first find it fresh.
+	GetConnectionByOrgServiceForUpdate(ctx context.Context, arg GetConnectionByOrgServiceForUpdateParams) (GetConnectionByOrgServiceForUpdateRow, error)
 	// Workflow 14 (token usage & analytics). All read-only, all against
 	// app_user/tenant.WithTx like every other tenant-scoped query in this
 	// codebase — RLS already scopes these by org, the explicit org_id
@@ -477,8 +490,9 @@ type Querier interface {
 	// as internal/core/integrations/refresh.go's RunRefreshJob.
 	ListExpiredPendingApprovals(ctx context.Context) ([]ListExpiredPendingApprovalsRow, error)
 	// Used only by the background refresh job (app_system pool). Scoped to
-	// oauth_status = 'connected' so a already-expired or revoked connection
-	// isn't retried every 30 minutes forever.
+	// oauth_status = 'connected' so an already-expired or revoked connection
+	// isn't retried every tick forever, and to active orgs so a deleted
+	// workspace's tokens aren't kept alive.
 	ListExpiringConnectionsSystem(ctx context.Context, tokenExpiresAt pgtype.Timestamptz) ([]ListExpiringConnectionsSystemRow, error)
 	// Every provider the org has ever submitted a key for (valid or not),
 	// annotated with whether it's the org's *currently active* provider —
@@ -584,6 +598,11 @@ type Querier interface {
 	// without that join.
 	// Backs the workspace switcher: every active org the person belongs to.
 	ListWorkspacesForClerkUser(ctx context.Context, clerkUserID string) ([]ListWorkspacesForClerkUserRow, error)
+	// Claims one expiring connection for this caller: SKIP LOCKED means another
+	// instance already refreshing it (or one that finished and pushed the expiry
+	// out of the window) yields no row. Must run inside the transaction that does
+	// the refresh — the lock lasts until it ends.
+	LockConnectionForRefreshSystem(ctx context.Context, arg LockConnectionForRefreshSystemParams) (LockConnectionForRefreshSystemRow, error)
 	// Serializes concurrent webhook deliveries for one org, so "which
 	// subscription is current" is decided against the latest row.
 	LockOrgSubscription(ctx context.Context, id pgtype.UUID) (LockOrgSubscriptionRow, error)
@@ -610,6 +629,9 @@ type Querier interface {
 	RecordClientReportView(ctx context.Context, id pgtype.UUID) error
 	// Returns no row when the event was already processed (a redelivery).
 	RecordStripeEvent(ctx context.Context, arg RecordStripeEventParams) (string, error)
+	// Undoes a claim when the send itself failed, so the org isn't marked as
+	// having received a digest it never got.
+	ReleaseDigestClaim(ctx context.Context, id pgtype.UUID) error
 	RestoreClientWorkspace(ctx context.Context, arg RestoreClientWorkspaceParams) (int64, error)
 	RevokeClientReport(ctx context.Context, arg RevokeClientReportParams) (int64, error)
 	RevokeConnection(ctx context.Context, arg RevokeConnectionParams) (int64, error)
@@ -637,6 +659,9 @@ type Querier interface {
 	// per-request user/org session to run InsertWorkflowRun's tenant.WithTx
 	// variant under.
 	SystemInsertWorkflowRun(ctx context.Context, arg SystemInsertWorkflowRunParams) (pgtype.UUID, error)
+	// A heartbeat while a long document is processed, so it isn't mistaken for a
+	// dead job (the updated_at trigger does the work).
+	TouchDocument(ctx context.Context, arg TouchDocumentParams) error
 	// Best-effort, fire-and-forget from RequireAuth — the WHERE guard keeps
 	// this to one write per user per 5 minutes, not one per request.
 	TouchLastLogin(ctx context.Context, id pgtype.UUID) error

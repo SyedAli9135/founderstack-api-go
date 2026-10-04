@@ -6,8 +6,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"github.com/founderstack/api/internal/core/notify"
+	"github.com/founderstack/api/internal/pkg/secret"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -264,5 +268,92 @@ func TestListOrgsDueForDigest_GuardsAgainstDoubleSendAndGhostEmails(t *testing.T
 	}
 	if findsOrg(t) {
 		t.Error("org with digest_enabled=false: expected NOT due, was found")
+	}
+}
+
+type countingEmail struct {
+	mu   sync.Mutex
+	sent map[string]int
+}
+
+func (c *countingEmail) Send(ctx context.Context, to, subject, textBody, htmlBody string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sent == nil {
+		c.sent = map[string]int{}
+	}
+	c.sent[to]++
+	return nil
+}
+
+func (c *countingEmail) to(addr string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sent[addr]
+}
+
+// Several API instances run this scheduler. Each lists the org as due before
+// any has marked it, so claiming must come before sending.
+func TestSendIfClaimed_SeveralInstancesSendOneDigest(t *testing.T) {
+	systemPool := testSystemPool(t)
+	q := dbgen.New(systemPool)
+	ctx := context.Background()
+	orgID, workflowID, orgName := testOrgAgentWorkflow(t, systemPool)
+	insertRun(t, systemPool, orgID, workflowID, "completed", 1, time.Now())
+	if _, err := systemPool.Exec(ctx, `update organizations set digest_enabled = true, digest_timezone = 'UTC', digest_last_sent_at = NULL where id = $1`, orgID); err != nil {
+		t.Fatal(err)
+	}
+	signer := notify.NewDigestTokenSigner(secret.Value("digest-test-secret-of-sufficient-length"))
+	email := &countingEmail{}
+
+	var wg sync.WaitGroup
+	var won atomic.Int32
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if sendIfClaimed(ctx, q, email, signer, "http://api.test", orgID, orgName, "UTC") {
+				won.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := email.to("digest-owner-test@example.com"); won.Load() != 1 || got != 1 {
+		t.Fatalf("8 concurrent instances: %d claimed, %d emails sent — want exactly 1 of each", won.Load(), got)
+	}
+	// And a later pass the same day does nothing.
+	if sendIfClaimed(ctx, q, email, signer, "http://api.test", orgID, orgName, "UTC") || email.to("digest-owner-test@example.com") != 1 {
+		t.Fatal("a second pass the same day sent again")
+	}
+}
+
+// A claim can be given back, e.g. when the send fails outright, so the org
+// isn't left marked as having received a digest it never got.
+func TestClaimDigestSend_ReleasingMakesItClaimableAgain(t *testing.T) {
+	systemPool := testSystemPool(t)
+	q := dbgen.New(systemPool)
+	ctx := context.Background()
+	orgID, _, _ := testOrgAgentWorkflow(t, systemPool)
+	if _, err := systemPool.Exec(ctx, `update organizations set digest_enabled = true, digest_timezone = 'UTC', digest_last_sent_at = NULL where id = $1`, orgID); err != nil {
+		t.Fatal(err)
+	}
+	claim := func() int64 {
+		n, err := q.ClaimDigestSend(ctx, orgID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if claim() != 1 {
+		t.Fatal("first claim should win")
+	}
+	if claim() != 0 {
+		t.Fatal("a second claim the same day should lose")
+	}
+	if err := q.ReleaseDigestClaim(ctx, orgID); err != nil {
+		t.Fatal(err)
+	}
+	if claim() != 1 {
+		t.Fatal("after a release the org should be claimable again")
 	}
 }

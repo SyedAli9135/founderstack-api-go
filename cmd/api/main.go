@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	dbpkg "github.com/founderstack/api/internal/db"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"net/http"
 	"os"
@@ -152,7 +153,12 @@ func run() error {
 	// this process starts — its EventBus/cancel map are process-wide by
 	// design.
 	mcpGateway := coremcp.NewGateway(dbPool, encryptionKey, mcpRegistry, redisClient)
+	mcpGateway.SetIntegrationRegistry(integrationsRegistry)
 	graphEngine := graph.NewEngine(dbPool)
+	// A run executes on one instance but its viewers (and a cancel request) can
+	// reach any: relay events and cancels between instances through Redis.
+	graphEngine.Bus.EnableRedis(ctx, redisClient)
+	safego.Go("graph: cancel listener", func() { graphEngine.ListenForCancels(ctx) })
 
 	// Each notify channel degrades to a logged no-op when its config is
 	// unset, so notifier is never nil and safe to use without a further
@@ -241,6 +247,10 @@ func run() error {
 		IdleTimeout: 120 * time.Second,
 	}
 
+	// An open run stream never ends on its own, so Shutdown would wait out its
+	// whole timeout for it; closing the streams first lets it finish promptly.
+	srv.RegisterOnShutdown(graphEngine.Bus.CloseAll)
+
 	serveErr := make(chan error, 1)
 	go func() {
 		logger.Info("starting FounderStack API", "addr", srv.Addr, "env", cfg.AppEnv)
@@ -263,7 +273,30 @@ func run() error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("graceful shutdown: %w", err)
 	}
+	drainInFlight(logger, graphEngine, time.Duration(cfg.ShutdownGraceSeconds)*time.Second)
 	return nil
+}
+
+// drainInFlight gives runs, document jobs and notifications still executing on
+// this process up to grace to finish, then cancels any run that hasn't, so it
+// ends as 'cancelled' rather than sitting 'running' until the stale-run reaper
+// notices an hour later. No new work can start: the server has stopped
+// accepting requests.
+func drainInFlight(logger *slog.Logger, engine *graph.Engine, grace time.Duration) {
+	if safego.InFlight() == 0 && engine.InFlight() == 0 {
+		return
+	}
+	logger.Info("waiting for in-flight work", "jobs", safego.InFlight(), "runs", engine.InFlight(), "grace", grace)
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	if err := safego.Wait(ctx); err == nil {
+		return
+	}
+	n := engine.CancelAll()
+	logger.Warn("grace period over; cancelling runs still in flight", "runs", n, "jobs", safego.InFlight())
+	final, cancelFinal := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFinal()
+	_ = safego.Wait(final)
 }
 
 // maxRequestBody caps any request body at the router. Document uploads are

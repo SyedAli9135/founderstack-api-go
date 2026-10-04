@@ -36,7 +36,14 @@ func RunApprovalExpiryJob(ctx context.Context, systemPool *pgxpool.Pool, launche
 	}
 }
 
-func expireApprovals(ctx context.Context, systemPool *pgxpool.Pool, launcher *graph.Launcher) {
+// resumer is the one thing the sweep needs from the launcher.
+type resumer interface {
+	Resume(orgID, runID uuid.UUID, approved bool, reason string)
+}
+
+const expiryReason = "Approval expired after 24h with no decision"
+
+func expireApprovals(ctx context.Context, systemPool *pgxpool.Pool, launcher resumer) {
 	q := dbgen.New(systemPool)
 
 	expired, err := q.ListExpiredPendingApprovals(ctx)
@@ -44,26 +51,37 @@ func expireApprovals(ctx context.Context, systemPool *pgxpool.Pool, launcher *gr
 		slog.Error("workflows: list expired pending approvals", "error", err)
 		return
 	}
-	if len(expired) == 0 {
-		return
-	}
-
-	const reason = "Approval expired after 24h with no decision"
-	status := "expired"
+	done := 0
 	for _, approval := range expired {
-		if _, err := q.UpdateApprovalStatus(ctx, dbgen.UpdateApprovalStatusParams{
-			OrgID: approval.OrgID, ID: approval.ID, Status: &status,
-		}); err != nil {
-			slog.Error("workflows: expire approval", "approval_id", approval.ID.String(), "error", err)
-			continue
+		if expireOne(ctx, q, launcher, approval) {
+			done++
 		}
-		reasonCopy := reason
-		if err := q.InsertApprovalDecision(ctx, dbgen.InsertApprovalDecisionParams{
-			ApprovalID: approval.ID, UserID: pgtype.UUID{}, Decision: status, Reason: &reasonCopy,
-		}); err != nil {
-			slog.Error("workflows: insert expiry decision", "approval_id", approval.ID.String(), "error", err)
-		}
-		launcher.Resume(uuid.UUID(approval.OrgID.Bytes), uuid.UUID(approval.RunID.Bytes), false, reason)
 	}
-	slog.Info("workflows: expired pending approvals", "count", len(expired))
+	if done > 0 {
+		slog.Info("workflows: expired pending approvals", "count", done)
+	}
+}
+
+// expireOne expires one approval and resumes its run, only if this call is the
+// one that flipped it out of 'pending'. The row was listed a moment ago; a
+// person may have decided it since, or another instance's sweep may have got
+// there first — resuming the run again then would drive it twice.
+func expireOne(ctx context.Context, q *dbgen.Queries, launcher resumer, approval dbgen.ListExpiredPendingApprovalsRow) bool {
+	status := "expired"
+	n, err := q.UpdateApprovalStatus(ctx, dbgen.UpdateApprovalStatusParams{OrgID: approval.OrgID, ID: approval.ID, Status: &status})
+	if err != nil {
+		slog.Error("workflows: expire approval", "approval_id", approval.ID.String(), "error", err)
+		return false
+	}
+	if n == 0 {
+		return false
+	}
+	reason := expiryReason
+	if err := q.InsertApprovalDecision(ctx, dbgen.InsertApprovalDecisionParams{
+		ApprovalID: approval.ID, UserID: pgtype.UUID{}, Decision: status, Reason: &reason,
+	}); err != nil {
+		slog.Error("workflows: insert expiry decision", "approval_id", approval.ID.String(), "error", err)
+	}
+	launcher.Resume(uuid.UUID(approval.OrgID.Bytes), uuid.UUID(approval.RunID.Bytes), false, expiryReason)
+	return true
 }

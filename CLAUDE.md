@@ -2540,6 +2540,36 @@ machine — CI runs the authoritative version of the same check regardless.
 (Workflow 15 is deliberately deferred — see that section's own scope note. Everything else in
 `WORKFLOW_PLAN_GO.md` — workflow 24 onward — is unbuilt. Add rows here as routers land.)
 
+### Running more than one instance (added 2026-10-04)
+
+The API is safe to run as several processes behind a load balancer, sharing one Postgres and one Redis.
+What makes that true, and what to keep true when adding to it:
+
+- **Live runs cross instances.** A run executes on one process, but its SSE viewers and a cancel request
+  can reach any. `graph.EventBus.EnableRedis` relays published events over Redis pub/sub
+  (`founderstack:run-events:{run_id}`; an instance ignores its own echoes, and the relay is best effort and
+  never blocks a run), team-run specialist events are mirrored onto the orchestrator's viewers even when the
+  specialist ran elsewhere, and `Engine.PublishCancel`/`ListenForCancels` carry cancels
+  (`founderstack:run-cancel`). Without Redis everything still works in-process.
+- **Background work is claimed, not assumed.** Every sweep acts only on rows it actually flipped or locked:
+  the workflow scheduler (`FOR UPDATE SKIP LOCKED`), approval expiry (rows-affected), the digest
+  (`ClaimDigestSend` before sending), token refresh (`LockConnectionForRefreshSystem`, SKIP LOCKED — a second
+  instance would present an already-used refresh token), and document processing
+  (`ClaimDocumentForProcessing`, with a `TouchDocument` heartbeat so a slow document isn't taken for dead).
+  A new job must do the same.
+- **Tokens refresh on demand** (`integrations.GetFreshIntegrationToken`, used by `mcp.Gateway`), not only on the
+  5-minute background tick; only a *permanent* refresh error (`IsPermanentRefreshError`) marks a connection
+  expired — a timeout or 5xx never forces a reconnect.
+- **Deploys drain.** On SIGTERM the server stops accepting requests, closes run streams, and waits up to
+  `SHUTDOWN_GRACE_SECONDS` for in-flight runs and jobs (`safego.Wait`); runs still going are then cancelled
+  (`Engine.CancelAll`) so they end `cancelled`, not `running`.
+- **Database limits are on the roles** (migration `000026`: statement, lock and idle-in-transaction timeouts),
+  and each instance's pool is capped by `DATABASE_POOL_SIZE`. Production refuses to boot if `app_user` or
+  `app_system` still accept the dev passwords from the migrations (`db.RefuseDevCredentials`).
+- **Per-IP limits need `TRUSTED_PROXIES`** (production boot requires it), or every client shares the load
+  balancer's address. Team runs call back to `APP_BASE_URL` through the load balancer, which is why the relay
+  above matters.
+
 ### Dependency policy
 
 Go dependencies are added when code actually imports them, not pre-installed speculatively

@@ -55,17 +55,33 @@ func tick(ctx context.Context, systemPool *pgxpool.Pool, email notify.EmailSende
 
 	sent := 0
 	for _, org := range due {
-		if err := sendDigest(ctx, q, email, tokens, appBaseURL, org.ID, org.Name, org.DigestTimezone); err != nil {
-			slog.Error("digest: send failed", "org_id", org.ID.String(), "error", err)
-			continue
+		if sendIfClaimed(ctx, q, email, tokens, appBaseURL, org.ID, org.Name, org.DigestTimezone) {
+			sent++
 		}
-		if err := q.MarkDigestSent(ctx, org.ID); err != nil {
-			slog.Error("digest: mark sent failed", "org_id", org.ID.String(), "error", err)
-			continue
-		}
-		sent++
 	}
 	slog.Info("digest: sent daily digests", "due", len(due), "sent", sent)
+}
+
+// sendIfClaimed sends one org's digest only if this caller wins the claim on
+// it. The claim comes first: sending and then marking would let two instances
+// both send, since each lists the org as due before either has marked it.
+func sendIfClaimed(ctx context.Context, q *dbgen.Queries, email notify.EmailSender, tokens *notify.DigestTokenSigner, appBaseURL string, orgID pgtype.UUID, orgName, tz string) bool {
+	claimed, err := q.ClaimDigestSend(ctx, orgID)
+	if err != nil {
+		slog.Error("digest: claim failed", "org_id", orgID.String(), "error", err)
+		return false
+	}
+	if claimed == 0 {
+		return false // another instance has it, or it was sent already today
+	}
+	if err := sendDigest(ctx, q, email, tokens, appBaseURL, orgID, orgName, tz); err != nil {
+		slog.Error("digest: send failed", "org_id", orgID.String(), "error", err)
+		if relErr := q.ReleaseDigestClaim(ctx, orgID); relErr != nil {
+			slog.Error("digest: release claim failed", "org_id", orgID.String(), "error", relErr)
+		}
+		return false
+	}
+	return true
 }
 
 func sendDigest(ctx context.Context, q *dbgen.Queries, email notify.EmailSender, tokens *notify.DigestTokenSigner, appBaseURL string, orgID pgtype.UUID, orgName, tz string) error {

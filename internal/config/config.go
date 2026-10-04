@@ -137,6 +137,11 @@ type Config struct {
 	DocsSearchesPerMinute int `mapstructure:"DOCS_SEARCHES_PER_MINUTE"`
 	MaxActiveRunsPerOrg   int `mapstructure:"MAX_ACTIVE_RUNS_PER_ORG"`
 
+	// ShutdownGraceSeconds is how long a stopping instance lets in-flight runs
+	// and jobs finish before cancelling them. Keep it below the platform's
+	// own kill timeout (30s on most) minus the 10s HTTP drain.
+	ShutdownGraceSeconds int `mapstructure:"SHUTDOWN_GRACE_SECONDS"`
+
 	// ClerkAuthorizedParties lists the browser origins whose Clerk session
 	// tokens are accepted (the token's "azp" claim). Empty means: any origin in
 	// development, and FRONTEND_URL's origin in production.
@@ -339,6 +344,7 @@ func Load() (*Config, error) {
 		"DOCS_REINDEXES_PER_HOUR":   20,
 		"DOCS_SEARCHES_PER_MINUTE":  120,
 		"MAX_ACTIVE_RUNS_PER_ORG":   10,
+		"SHUTDOWN_GRACE_SECONDS":    15,
 		"STRIPE_SECRET_KEY":         "",
 		"STRIPE_WEBHOOK_SECRET":     "",
 	}

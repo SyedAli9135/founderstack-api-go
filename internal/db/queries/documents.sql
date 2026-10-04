@@ -64,6 +64,22 @@ WHERE org_id = $1 AND id = ANY(sqlc.arg(doc_ids)::uuid[]);
 -- name: UpdateDocumentProcessing :exec
 UPDATE documents SET processing_status = $3 WHERE org_id = $1 AND id = $2;
 
+-- name: ClaimDocumentForProcessing :execrows
+-- Takes a document for processing: either it is waiting ('pending'), or it
+-- says 'processing' but hasn't been touched since stale_before — its worker
+-- died. A document another instance is actively working on (fresh
+-- 'processing') yields no row, so the boot-time recovery sweep on a second
+-- instance can't start it a second time and pay to embed it twice.
+UPDATE documents SET processing_status = 'processing'
+WHERE org_id = sqlc.arg(org_id) AND id = sqlc.arg(id)
+  AND (processing_status = 'pending'
+       OR (processing_status = 'processing' AND updated_at < sqlc.arg(stale_before)));
+
+-- name: TouchDocument :exec
+-- A heartbeat while a long document is processed, so it isn't mistaken for a
+-- dead job (the updated_at trigger does the work).
+UPDATE documents SET processing_status = processing_status WHERE org_id = $1 AND id = $2;
+
 -- name: MarkDocumentIndexed :exec
 UPDATE documents
 SET processing_status = 'indexed', total_chunks = $3, indexed_at = now(), error_detail = NULL

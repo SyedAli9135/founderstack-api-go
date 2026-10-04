@@ -11,6 +11,26 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const claimDigestSend = `-- name: ClaimDigestSend :execrows
+UPDATE organizations SET digest_last_sent_at = now()
+WHERE id = $1 AND digest_enabled = true AND is_active = true
+  AND (
+    digest_last_sent_at IS NULL
+    OR (digest_last_sent_at AT TIME ZONE digest_timezone)::date < (now() AT TIME ZONE digest_timezone)::date
+  )
+`
+
+// Atomically takes today's digest for an org, so when several API instances
+// run the scheduler only the one that gets 1 row back sends it. The same
+// "not yet sent today, in the org's own timezone" test as ListOrgsDueForDigest.
+func (q *Queries) ClaimDigestSend(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, claimDigestSend, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const disableDigestForOrg = `-- name: DisableDigestForOrg :exec
 UPDATE organizations SET digest_enabled = false WHERE id = $1
 `
@@ -261,6 +281,17 @@ UPDATE organizations SET digest_last_sent_at = now() WHERE id = $1
 
 func (q *Queries) MarkDigestSent(ctx context.Context, id pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, markDigestSent, id)
+	return err
+}
+
+const releaseDigestClaim = `-- name: ReleaseDigestClaim :exec
+UPDATE organizations SET digest_last_sent_at = NULL WHERE id = $1
+`
+
+// Undoes a claim when the send itself failed, so the org isn't marked as
+// having received a digest it never got.
+func (q *Queries) ReleaseDigestClaim(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, releaseDigestClaim, id)
 	return err
 }
 

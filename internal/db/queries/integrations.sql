@@ -52,14 +52,38 @@ WHERE org_id = $1 AND service_name = $2;
 
 -- name: ListExpiringConnectionsSystem :many
 -- Used only by the background refresh job (app_system pool). Scoped to
--- oauth_status = 'connected' so a already-expired or revoked connection
--- isn't retried every 30 minutes forever.
+-- oauth_status = 'connected' so an already-expired or revoked connection
+-- isn't retried every tick forever, and to active orgs so a deleted
+-- workspace's tokens aren't kept alive.
+SELECT c.id, c.org_id, c.service_name, c.encrypted_credentials
+FROM mcp_connections c
+JOIN organizations o ON o.id = c.org_id AND o.is_active = true
+WHERE c.is_active = true
+  AND c.oauth_status = 'connected'
+  AND c.token_expires_at IS NOT NULL
+  AND c.token_expires_at < $1;
+
+-- name: LockConnectionForRefreshSystem :one
+-- Claims one expiring connection for this caller: SKIP LOCKED means another
+-- instance already refreshing it (or one that finished and pushed the expiry
+-- out of the window) yields no row. Must run inside the transaction that does
+-- the refresh — the lock lasts until it ends.
 SELECT id, org_id, service_name, encrypted_credentials
 FROM mcp_connections
-WHERE is_active = true
+WHERE id = $1
+  AND is_active = true
   AND oauth_status = 'connected'
   AND token_expires_at IS NOT NULL
-  AND token_expires_at < $1;
+  AND token_expires_at < $2
+FOR UPDATE SKIP LOCKED;
+
+-- name: GetConnectionByOrgServiceForUpdate :one
+-- The on-demand refresh path: concurrent tool calls needing the same expired
+-- token queue on this lock, and the ones after the first find it fresh.
+SELECT id, service_name, encrypted_credentials, oauth_scopes, oauth_status, is_active
+FROM mcp_connections
+WHERE org_id = $1 AND service_name = $2
+FOR UPDATE;
 
 -- name: UpdateConnectionTokensByIDSystem :execrows
 -- Used only by the background refresh job (app_system pool) — targets a

@@ -6,10 +6,18 @@
 package safego
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sync/atomic"
+	"time"
 )
+
+// inflight counts goroutines started by Go that haven't finished, so shutdown
+// can wait for them (runs, document jobs, notifications) instead of cutting
+// them off mid-work.
+var inflight atomic.Int64
 
 // PanicError is what a contained panic turns into.
 type PanicError struct {
@@ -44,5 +52,26 @@ func DoErr(name string, fn func() error) (err error) {
 
 // Go runs fn on a new goroutine with a panic contained.
 func Go(name string, fn func()) {
-	go func() { _ = Do(name, fn) }()
+	inflight.Add(1)
+	go func() {
+		defer inflight.Add(-1)
+		_ = Do(name, fn)
+	}()
+}
+
+// InFlight is how many Go goroutines are still running.
+func InFlight() int { return int(inflight.Load()) }
+
+// Wait blocks until every goroutine started by Go has finished, or ctx ends
+// (returning its error). The always-running ones — job loops and listeners that
+// end when the process context is cancelled — finish promptly once it is.
+func Wait(ctx context.Context) error {
+	for inflight.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return nil
 }

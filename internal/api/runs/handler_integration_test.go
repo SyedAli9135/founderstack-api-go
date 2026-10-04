@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"github.com/redis/go-redis/v9"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -652,5 +654,82 @@ func TestRunsHandler_Stream_NotFoundForUnknownRun(t *testing.T) {
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+// Behind a load balancer the cancel request usually lands on a different
+// instance from the one running the run.
+func TestRunsHandler_Cancel_ReachesARunOnAnotherInstance(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		t.Skip("redis not reachable: ", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+
+	running := graph.NewEngine(appPool)   // executes the run
+	receiving := graph.NewEngine(appPool) // serves the cancel request
+	running.Bus.EnableRedis(ctx, rdb)
+	receiving.Bus.EnableRedis(ctx, rdb)
+	go running.ListenForCancels(ctx)
+	time.Sleep(200 * time.Millisecond)
+	router := testRouter(t, systemPool, appPool, cfg, receiving)
+
+	_, clerkUserID, runID := testOrgUserAgentWorkflowRun(t, systemPool, "running")
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		orgUUID := uuid.UUID(pgtypeOrgID(t, systemPool, runID).Bytes)
+		done <- running.Run(context.Background(), graph.Nodes{
+			"executor": func(ctx context.Context, s *graph.RunState) (graph.NodeName, error) {
+				close(started)
+				<-ctx.Done()
+				return "", ctx.Err()
+			},
+		}, &graph.RunState{OrgID: orgUUID, WorkflowRunID: uuid.UUID(runID.Bytes)}, "executor")
+	}()
+	<-started
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/runs/"+runID.String()+"/cancel"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cancel via the other instance = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run ended with %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the run on the other instance was never cancelled")
+	}
+}
+
+// A run waiting on an approval isn't executing anywhere, so there's nothing to
+// interrupt — publishing a cancel for it would just claim success falsely.
+func TestRunsHandler_Cancel_AwaitingApprovalIsNotInFlight(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		t.Skip("redis not reachable: ", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	engine := graph.NewEngine(appPool)
+	engine.Bus.EnableRedis(ctx, rdb)
+	router := testRouter(t, systemPool, appPool, cfg, engine)
+
+	_, clerkUserID, runID := testOrgUserAgentWorkflowRun(t, systemPool, "awaiting_approval")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/runs/"+runID.String()+"/cancel"))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("cancel of a run awaiting approval = %d, want 409", rec.Code)
 	}
 }

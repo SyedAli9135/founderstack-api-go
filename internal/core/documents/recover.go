@@ -16,7 +16,7 @@ import (
 // pending/processing/deleting before RecoverStuckJobs assumes its
 // goroutine was lost (process restart) rather than genuinely still
 // running — generous enough to never falsely re-kick an active job.
-const stuckThreshold = 10 * time.Minute
+var stuckThreshold = 10 * time.Minute
 
 // RecoverStuckJobs runs once at startup and re-dispatches any document
 // whose processing/purge job was abandoned by a process restart — the

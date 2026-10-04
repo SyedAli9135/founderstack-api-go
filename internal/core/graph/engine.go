@@ -74,6 +74,26 @@ func (e *Engine) Cancel(runID uuid.UUID) bool {
 	return true
 }
 
+// InFlight is how many runs are executing on this process.
+func (e *Engine) InFlight() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.cancels)
+}
+
+// CancelAll cancels every run executing on this process and returns how many.
+// Used at shutdown, once the grace period for runs to finish on their own is up:
+// a cancelled run checkpoints as such, where one cut off by the process exiting
+// would sit "running" until the stale-run reaper noticed an hour later.
+func (e *Engine) CancelAll() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, cancel := range e.cancels {
+		cancel()
+	}
+	return len(e.cancels)
+}
+
 // Checkpoint lets a node persist state mid-node (executorNode's inner
 // tool-calling loop checkpoints after every tool call, not just at
 // node transitions).

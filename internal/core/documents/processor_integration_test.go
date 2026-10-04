@@ -11,7 +11,9 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -475,5 +477,87 @@ func TestProcessor_Process_PanicMarksDocumentFailed(t *testing.T) {
 	doc := getDocument(t, appPool, orgID, docID)
 	if doc.ProcessingStatus == nil || *doc.ProcessingStatus != "failed" {
 		t.Fatalf("processing_status = %v, want failed", doc.ProcessingStatus)
+	}
+}
+
+type countingEmbedder struct {
+	fakeEmbedder
+	batches atomic.Int32
+}
+
+func (c *countingEmbedder) Embed(ctx context.Context, texts []string) ([][]float64, error) {
+	c.batches.Add(1)
+	time.Sleep(100 * time.Millisecond) // wide enough that unsynchronised workers overlap
+	return c.fakeEmbedder.Embed(ctx, texts)
+}
+
+// The recovery sweep runs on every instance at boot, so several can find the
+// same stuck document at once. Embedding it twice costs money twice.
+func TestProcessor_Process_ConcurrentWorkersEmbedADocumentOnce(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	orgID := testOrg(t, systemPool)
+	uploadedBy := testUploader(t, systemPool, orgID)
+	docID := insertPendingDocument(t, appPool, orgID, uploadedBy, "notes.txt")
+	store := newFakeStore()
+	store.objects["documents/"+orgID.String()+"/"+docID.String()+"/notes.txt"] = []byte("a short document")
+
+	embedder := &countingEmbedder{}
+	p := NewProcessor(appPool, store, embedder, newFakeVectorIndex())
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = p.Process(context.Background(), orgID, docID)
+		}()
+	}
+	wg.Wait()
+
+	if n := embedder.batches.Load(); n != 1 {
+		t.Fatalf("a one-batch document was embedded %d times by 6 concurrent workers, want 1", n)
+	}
+	if doc := getDocument(t, appPool, orgID, docID); doc.ProcessingStatus == nil || *doc.ProcessingStatus != "indexed" {
+		t.Fatalf("processing_status = %v, want indexed", doc.ProcessingStatus)
+	}
+}
+
+func TestProcessor_Process_LeavesAFreshlyProcessingDocumentAloneButReclaimsADeadOne(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	orgID := testOrg(t, systemPool)
+	uploadedBy := testUploader(t, systemPool, orgID)
+	store := newFakeStore()
+	embedder := &countingEmbedder{}
+	p := NewProcessor(appPool, store, embedder, newFakeVectorIndex())
+
+	mk := func(name string) pgtype.UUID {
+		id := insertPendingDocument(t, appPool, orgID, uploadedBy, name)
+		store.objects["documents/"+orgID.String()+"/"+id.String()+"/"+name] = []byte("some text to embed")
+		return id
+	}
+
+	fresh := mk("fresh.txt")
+	if _, err := systemPool.Exec(context.Background(), "update documents set processing_status = 'processing' where id = $1", fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Process(context.Background(), orgID, fresh); err != nil || embedder.batches.Load() != 0 {
+		t.Fatalf("Process on a document another worker is on: err=%v, embeds=%d, want it left alone", err, embedder.batches.Load())
+	}
+
+	dead := mk("dead.txt")
+	if _, err := systemPool.Exec(context.Background(), "update documents set processing_status = 'processing' where id = $1", dead); err != nil {
+		t.Fatal(err)
+	}
+	// Its worker never touched it again: shrink the threshold so "stale" is a few milliseconds.
+	orig := stuckThreshold
+	stuckThreshold = time.Millisecond
+	t.Cleanup(func() { stuckThreshold = orig })
+	time.Sleep(30 * time.Millisecond)
+	if err := p.Process(context.Background(), orgID, dead); err != nil || embedder.batches.Load() != 1 {
+		t.Fatalf("Process on a dead worker's document: err=%v, embeds=%d, want it reclaimed and embedded", err, embedder.batches.Load())
+	}
+	if doc := getDocument(t, appPool, orgID, dead); doc.ProcessingStatus == nil || *doc.ProcessingStatus != "indexed" {
+		t.Fatalf("reclaimed document status = %v, want indexed", doc.ProcessingStatus)
 	}
 }

@@ -5,7 +5,11 @@ package workflows
 import (
 	"context"
 	"encoding/json"
+	"github.com/founderstack/api/internal/db/dbgen"
+	"github.com/google/uuid"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -198,4 +202,84 @@ func TestExpireApprovals_ExpiresAndResumesTheRun(t *testing.T) {
 	if runStatus != "completed" {
 		t.Fatalf("workflow_runs.status after expiry = %q, want completed (a rejected approval still finishes the run — reporterNode composes a stopped-not-approved summary)", runStatus)
 	}
+}
+
+type countingResumer struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingResumer) Resume(uuid.UUID, uuid.UUID, bool, string) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+}
+
+func (c *countingResumer) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// The sweep lists expired approvals, then acts on each. Between those two
+// steps a person can decide one, and a second instance's sweep can reach it —
+// either way the run must not be resumed a second time.
+func TestExpireOne_OnlyActsOnAnApprovalItActuallyFlipped(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	registry, err := coremcp.NewRegistry(context.Background(), map[string]*gomcp.Server{"fake": fakeDestructiveToolServer()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := coremcp.NewGateway(appPool, make([]byte, 32), registry, nil)
+	mockResolver := func(ctx context.Context, appPool *pgxpool.Pool, encryptionKey []byte, orgID pgtype.UUID, provider llm.ProviderID, model string) (llm.ChatClient, error) {
+		return llm.NewMockChatClient(
+			llm.ChatResponse{ToolCalls: []llm.ToolCall{{ID: "call_0", Name: "fake.delete_thing", Args: json.RawMessage(`{"id":"abc"}`)}}, StopReason: llm.StopReasonToolUse},
+		), nil
+	}
+	launcher := graph.NewLauncherWithResolver(graph.NewEngine(appPool), appPool, make([]byte, 32), registry, gateway, nil, mockResolver)
+	q := dbgen.New(systemPool)
+
+	decisions := func(approvalID pgtype.UUID) int {
+		var n int
+		if err := systemPool.QueryRow(context.Background(), "select count(*) from approval_decisions where approval_id = $1", approvalID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	t.Run("a person decided it after the sweep listed it", func(t *testing.T) {
+		orgID, runID, approvalID := suspendedApproval(t, systemPool, appPool, launcher)
+		if _, err := systemPool.Exec(context.Background(), "update approvals set status = 'approved' where id = $1", approvalID); err != nil {
+			t.Fatal(err)
+		}
+		r := &countingResumer{}
+		if expireOne(context.Background(), q, r, dbgen.ListExpiredPendingApprovalsRow{ID: approvalID, RunID: runID, OrgID: orgID}) {
+			t.Fatal("expireOne reported success for an approval that was no longer pending")
+		}
+		if r.count() != 0 || decisions(approvalID) != 0 {
+			t.Fatalf("resumed %d times and wrote %d decisions for an already-decided approval, want 0 and 0", r.count(), decisions(approvalID))
+		}
+	})
+
+	t.Run("two sweeps reaching the same approval resume the run once", func(t *testing.T) {
+		orgID, runID, approvalID := suspendedApproval(t, systemPool, appPool, launcher)
+		row := dbgen.ListExpiredPendingApprovalsRow{ID: approvalID, RunID: runID, OrgID: orgID}
+		r := &countingResumer{}
+		var wg sync.WaitGroup
+		var won atomic.Int32
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if expireOne(context.Background(), q, r, row) {
+					won.Add(1)
+				}
+			}()
+		}
+		wg.Wait()
+		if won.Load() != 1 || r.count() != 1 || decisions(approvalID) != 1 {
+			t.Fatalf("8 concurrent sweeps: %d won, %d resumes, %d decisions — want exactly 1 of each", won.Load(), r.count(), decisions(approvalID))
+		}
+	})
 }

@@ -203,15 +203,24 @@ func (h *Handler) Cancel(c *gin.Context) {
 
 	// engine.Cancel is process-wide with no org scoping of its own — this lookup is what
 	// actually enforces tenant isolation here.
-	if !h.runExists(c, user.OrgID, id) {
+	status, ok := h.runStatus(c, user.OrgID, id)
+	if !ok {
 		return
 	}
 
-	if !h.engine.Cancel(uuid.UUID(id.Bytes)) {
-		response.Fail(c, http.StatusConflict, "RUN_NOT_IN_FLIGHT", "Run is not currently in flight on this instance")
+	runID := uuid.UUID(id.Bytes)
+	if h.engine.Cancel(runID) {
+		response.OK(c, http.StatusOK, "Cancellation requested", gin.H{"run_id": id.String()})
 		return
 	}
-	response.OK(c, http.StatusOK, "Cancellation requested", gin.H{"run_id": id.String()})
+	// Not executing on this instance. A run that is actively executing is on
+	// another one — ask whichever has it. (A run waiting on an approval isn't
+	// executing anywhere, so there is nothing to interrupt.)
+	if (status == "running" || status == "pending") && h.engine.PublishCancel(c.Request.Context(), runID) {
+		response.OK(c, http.StatusOK, "Cancellation requested", gin.H{"run_id": id.String()})
+		return
+	}
+	response.Fail(c, http.StatusConflict, "RUN_NOT_IN_FLIGHT", "Run is not currently in flight")
 }
 
 func (h *Handler) Stream(c *gin.Context) {
