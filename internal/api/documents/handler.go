@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/founderstack/api/internal/pkg/ratelimit"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -32,6 +34,17 @@ import (
 
 const maxUploadBytes = 50 << 20
 
+// Ingesting and searching documents spends the platform's own Cohere key, not
+// the customer's, and deleting a file frees its storage quota — so quota alone
+// doesn't stop a delete-and-reupload loop. These are per workspace, and vars
+// so tests can shrink them.
+var (
+	uploadsPerHour       int64 = 30
+	uploadBytesPerHour   int64 = 250 << 20
+	reindexesPerHour     int64 = 20
+	uncachedSearchPerMin int64 = 120
+)
+
 // Checked here at the API boundary; internal/core/documents.ExtractText independently
 // rejects anything else too, so a file that skips this check still can't be mis-processed.
 var allowedExtensions = map[string]string{
@@ -53,6 +66,8 @@ type Handler struct {
 	redis             *redis.Client
 	encryptionKey     []byte
 	resolveChatClient chatClientResolver
+
+	uploads, uploadBytes, reindexes, searches *ratelimit.Limiter
 }
 
 // store takes the BlobStore interface, not the concrete *coredocs.Store, so tests can
@@ -68,6 +83,10 @@ func NewHandlerWithResolver(appPool *pgxpool.Pool, store coredocs.BlobStore, pro
 	return &Handler{
 		appPool: appPool, store: store, processor: processor, searcher: searcher,
 		redis: rdb, encryptionKey: encryptionKey, resolveChatClient: resolveChatClient,
+		uploads:     ratelimit.New(rdb, uploadsPerHour, time.Hour),
+		uploadBytes: ratelimit.New(rdb, uploadBytesPerHour, time.Hour),
+		reindexes:   ratelimit.New(rdb, reindexesPerHour, time.Hour),
+		searches:    ratelimit.New(rdb, uncachedSearchPerMin, time.Minute),
 	}
 }
 
@@ -129,6 +148,12 @@ func (h *Handler) Upload(c *gin.Context) {
 		return
 	}
 
+	if !h.uploads.Allow(c.Request.Context(), "docs-upload:"+user.OrgID.String()) ||
+		!h.uploadBytes.AllowN(c.Request.Context(), "docs-upload-bytes:"+user.OrgID.String(), fileHeader.Size) {
+		response.Fail(c, http.StatusTooManyRequests, "RATE_LIMITED", "This workspace has uploaded a lot in the last hour — try again later")
+		return
+	}
+
 	var overStorage bool
 	err = tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
 		overStorage, err = corebilling.StorageLimitReached(ctx, q, user.OrgID, fileHeader.Size)
@@ -181,13 +206,13 @@ func (h *Handler) Upload(c *gin.Context) {
 	}
 
 	orgID := user.OrgID
-	go func() {
+	safego.Go("documents: process upload", func() {
 		// Not c.Request.Context(): that's cancelled the moment this handler returns.
 		if err := h.processor.Process(context.Background(), orgID, docID); err != nil {
 			// Process already persists 'failed'+error_detail; this log is for operators only.
 			logProcessingError("upload", docID, err)
 		}
-	}()
+	})
 
 	response.OK(c, http.StatusAccepted, "Document uploaded, processing started",
 		gin.H{"doc_id": docID.String(), "status": "processing"})
@@ -326,11 +351,11 @@ func (h *Handler) Delete(c *gin.Context) {
 	h.invalidateSearchCache(c.Request.Context(), user.OrgID)
 
 	orgID := user.OrgID
-	go func() {
+	safego.Go("documents: purge", func() {
 		if err := h.processor.Purge(context.Background(), orgID, docID); err != nil {
 			logProcessingError("delete", docID, err)
 		}
-	}()
+	})
 
 	c.Status(http.StatusNoContent)
 }
@@ -351,14 +376,18 @@ func (h *Handler) Reindex(c *gin.Context) {
 	if !h.loadManageable(c, user, docID) {
 		return
 	}
+	if !h.reindexes.Allow(c.Request.Context(), "docs-reindex:"+user.OrgID.String()) {
+		response.Fail(c, http.StatusTooManyRequests, "RATE_LIMITED", "This workspace has reindexed a lot in the last hour — try again later")
+		return
+	}
 	h.invalidateSearchCache(c.Request.Context(), user.OrgID)
 
 	orgID := user.OrgID
-	go func() {
+	safego.Go("documents: reindex", func() {
 		if err := h.processor.Reindex(context.Background(), orgID, docID); err != nil {
 			logProcessingError("reindex", docID, err)
 		}
-	}()
+	})
 
 	response.OK(c, http.StatusAccepted, "Reindexing started", gin.H{"doc_id": docID.String(), "status": "processing"})
 }
@@ -629,6 +658,13 @@ func (h *Handler) Search(c *gin.Context) {
 		// about seeing, not less interesting than a successful one.
 		h.auditSearch(ctx, user, req.Category, nil, false)
 		response.OK(c, http.StatusOK, "", gin.H{"results": []searchResult{}, "from_cache": false})
+		return
+	}
+
+	// Past the cache and the ACL short-circuit: only a search that will call
+	// the embedding API counts.
+	if !h.searches.Allow(ctx, "docs-search:"+user.OrgID.String()) {
+		response.Fail(c, http.StatusTooManyRequests, "RATE_LIMITED", "Too many searches — try again in a minute")
 		return
 	}
 

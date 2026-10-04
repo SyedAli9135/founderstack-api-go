@@ -2,6 +2,7 @@ package v1
 
 import (
 	"context"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"net/http"
 	"sync"
 	"time"
@@ -55,23 +56,23 @@ func (h *HealthHandler) Check(c *gin.Context) {
 	}
 
 	wg.Add(3)
-	go func() {
+	safego.Go("health: database", func() {
 		defer wg.Done()
 		if err := h.db.Ping(ctx); err != nil {
 			set("database", "unhealthy: "+err.Error())
 			return
 		}
 		set("database", "healthy")
-	}()
-	go func() {
+	})
+	safego.Go("health: redis", func() {
 		defer wg.Done()
 		if err := h.redis.Ping(ctx).Err(); err != nil {
 			set("redis", "unhealthy: "+err.Error())
 			return
 		}
 		set("redis", "healthy")
-	}()
-	go func() {
+	})
+	safego.Go("health: pinecone", func() {
 		defer wg.Done()
 		if h.pinecone == nil {
 			set("pinecone", "skipped (no API key in .env)")
@@ -82,7 +83,7 @@ func (h *HealthHandler) Check(c *gin.Context) {
 			return
 		}
 		set("pinecone", "healthy")
-	}()
+	})
 	wg.Wait()
 
 	criticalHealthy := checks["database"] == "healthy" && checks["redis"] == "healthy"

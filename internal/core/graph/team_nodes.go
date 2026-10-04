@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"strings"
 	"time"
@@ -102,8 +103,10 @@ func delegateNode(deps RunDeps, members []TeamMember) NodeFunc {
 				continue
 			}
 			g.Go(func() error {
-				results[i] = dispatchSubtask(gctx, deps, state, member, sub)
-				return nil
+				return safego.DoErr("graph: team dispatch", func() error {
+					results[i] = dispatchSubtask(gctx, deps, state, member, sub)
+					return nil
+				})
 			})
 		}
 		if err := g.Wait(); err != nil {

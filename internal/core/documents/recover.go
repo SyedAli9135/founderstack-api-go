@@ -2,6 +2,7 @@ package documents
 
 import (
 	"context"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"time"
 
@@ -42,17 +43,17 @@ func (p *Processor) RecoverStuckJobs(ctx context.Context, systemPool *pgxpool.Po
 
 		switch status {
 		case "deleting":
-			go func() {
+			safego.Go("documents: recover stuck purge", func() {
 				if err := p.Purge(ctx, orgID, docID); err != nil {
 					slog.Error("documents: recover stuck purge", "doc_id", docID.String(), "error", err)
 				}
-			}()
+			})
 		case "pending", "processing":
-			go func() {
+			safego.Go("documents: recover stuck process", func() {
 				if err := p.Process(ctx, orgID, docID); err != nil {
 					slog.Error("documents: recover stuck process", "doc_id", docID.String(), "error", err)
 				}
-			}()
+			})
 		}
 	}
 

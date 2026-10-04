@@ -2,6 +2,7 @@ package integrations
 
 import (
 	"context"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"time"
 
@@ -27,14 +28,14 @@ func RunRefreshJob(ctx context.Context, systemPool *pgxpool.Pool, encryptionKey 
 
 	// Catch anything that expired while the process was down, don't wait
 	// a full interval.
-	refreshExpiringConnections(ctx, systemPool, encryptionKey, registry)
+	_ = safego.Do("integrations: refresh job", func() { refreshExpiringConnections(ctx, systemPool, encryptionKey, registry) })
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			refreshExpiringConnections(ctx, systemPool, encryptionKey, registry)
+			_ = safego.Do("integrations: refresh job", func() { refreshExpiringConnections(ctx, systemPool, encryptionKey, registry) })
 		}
 	}
 }

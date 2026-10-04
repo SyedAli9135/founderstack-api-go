@@ -2649,6 +2649,13 @@ billing writes answer `503 BILLING_NOT_CONFIGURED`. Only `sk_test_` keys are acc
    schedulers), not a shortcut around auth.
 4. **New external dependency**: `go get` it when you write the first line of code that imports
    it, not before (see "Dependency policy" above).
-5. **New secret/config value**: add a field to `internal/config/config.go`'s `Config` struct
+5. **New background goroutine**: start it with `safego.Go` (`internal/pkg/safego`), and wrap each pass of a
+   periodic job in `safego.Do`. `middleware.Recovery` only covers HTTP handlers — a panic on any other
+   goroutine ends the whole process for every tenant. A run-driving goroutine goes through
+   `Launcher.containRun` so a panic fails that run instead of leaving it `running`.
+6. **Anything that spends the platform's own keys** (Cohere embeds, ...) needs a per-workspace limit from
+   `internal/pkg/ratelimit`, not just a storage quota — see the limits at the top of
+   `internal/api/documents/handler.go`.
+7. **New secret/config value**: add a field to `internal/config/config.go`'s `Config` struct
    (use `secret.Value` for anything sensitive), add it to the `defaults` map in `Load()`, add
    it to `requiredFields` if the app can't run without it, document it in `.env.example`.

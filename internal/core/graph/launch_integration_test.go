@@ -326,3 +326,33 @@ func TestLauncher_LaunchMarksFailedWhenAgentHasNoModel(t *testing.T) {
 		t.Fatalf("status = %q, want failed (no model configured should fail fast, not hang at pending)", status)
 	}
 }
+
+type panicChatClient struct{}
+
+func (panicChatClient) Send(ctx context.Context, systemPrompt string, messages []llm.Message, tools []llm.ToolSchema) (llm.ChatResponse, error) {
+	panic("synthetic provider-adapter panic")
+}
+
+// A run executes on a bare goroutine: a panic in it must end that run as
+// failed, not the API process (and not leave the row 'running' for an hour).
+func TestLauncher_LaunchContainsAPanicAndFailsTheRun(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	fx := newLaunchFixture(t, systemPool, map[string]any{"allowed_tools": []string{"fake.get_data"}}, "anthropic", true)
+
+	launcher := NewLauncherWithResolver(NewEngine(appPool), appPool, fx.encKey, nil, nil, nil, mockChatClientResolver(panicChatClient{}))
+	launcher.Launch(fx.orgID, fx.agentID, fx.workflowID, fx.runID, "do something")
+
+	var status string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := systemPool.QueryRow(context.Background(), "select status from workflow_runs where id = $1", pgtype.UUID{Bytes: fx.runID, Valid: true}).Scan(&status); err != nil {
+			t.Fatalf("query run status: %v", err)
+		}
+		if status == "failed" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("status = %q, want failed after the run panicked", status)
+}

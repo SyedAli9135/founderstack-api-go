@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -63,7 +64,9 @@ func writeApprovalGate(ctx context.Context, deps RunDeps, state *RunState, calls
 	if deps.Notifier != nil {
 		// Fire-and-forget: must not delay the checkpoint that follows.
 		// Explicit fields, not deps — notify must not import graph.
-		go deps.Notifier.NotifyApprovalRequired(context.Background(), deps.AppPool, deps.Gateway, deps.OrgID, approvalID.Bytes, riskLevel, calls)
+		safego.Go("graph: notify approval required", func() {
+			deps.Notifier.NotifyApprovalRequired(context.Background(), deps.AppPool, deps.Gateway, deps.OrgID, approvalID.Bytes, riskLevel, calls)
+		})
 	}
 	return nil
 }

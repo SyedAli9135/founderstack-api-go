@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"errors"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -149,11 +150,12 @@ func RequireAuth(systemPool *pgxpool.Pool, cfg *config.Config) gin.HandlerFunc {
 		// request. The query's own WHERE guard (not just this goroutine) is
 		// what keeps this to one write per user per 5 minutes, not one per
 		// request — see TouchLastLogin's doc comment.
-		go func(userID pgtype.UUID) {
+		userID := user.ID
+		safego.Go("middleware: touch last_login_at", func() {
 			if err := q.TouchLastLogin(context.Background(), userID); err != nil {
 				slog.Warn("middleware: touch last_login_at failed", "err", err)
 			}
-		}(user.ID)
+		})
 
 		authctx.Set(c, user)
 		c.Next()

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 
 	"github.com/google/uuid"
@@ -114,17 +115,32 @@ func (l *Launcher) Preflight(ctx context.Context, orgID pgtype.UUID) error {
 // Launch resolves RunDeps and runs the workflow in a detached goroutine
 // (context.Background(), never the caller's request context).
 func (l *Launcher) Launch(orgID, agentID, workflowID, runID uuid.UUID, input string) {
-	go func() {
+	safego.Go("graph: launch run", func() {
 		ctx := context.Background()
 		orgPg := pgtype.UUID{Bytes: orgID, Valid: true}
 		runPg := pgtype.UUID{Bytes: runID, Valid: true}
 
-		if err := l.run(ctx, orgID, agentID, runID, input); err != nil {
+		if err := l.containRun("graph: run", orgPg, runPg, func() error { return l.run(ctx, orgID, agentID, runID, input) }); err != nil {
 			if status, statusErr := getRunStatus(ctx, l.appPool, orgPg, runPg); statusErr == nil && status == "pending" {
 				_ = markRunFailedNoCheckpoint(ctx, l.appPool, orgPg, runPg)
 			}
 		}
-	}()
+	})
+}
+
+// containRun runs one run-driving function, turning a panic (in the engine, a
+// tool or a parser) into a failed run. Left alone, it would end the whole API
+// process for every tenant, or leave the row 'running' until the hourly reaper.
+func (l *Launcher) containRun(name string, orgPg, runPg pgtype.UUID, fn func() error) error {
+	err := safego.DoErr(name, fn)
+	var panicked *safego.PanicError
+	if errors.As(err, &panicked) {
+		ctx := context.Background()
+		if status, statusErr := getRunStatus(ctx, l.appPool, orgPg, runPg); statusErr != nil || !terminalStatuses[status] {
+			_ = markRunFailedNoCheckpoint(ctx, l.appPool, orgPg, runPg)
+		}
+	}
+	return err
 }
 
 func (l *Launcher) run(ctx context.Context, orgID, agentID, runID uuid.UUID, input string) error {
@@ -153,18 +169,18 @@ func (l *Launcher) run(ctx context.Context, orgID, agentID, runID uuid.UUID, inp
 // Resume continues a run suspended at approval_gate — same
 // resolve-then-drive shape as Launch, but via Engine.Resume.
 func (l *Launcher) Resume(orgID, runID uuid.UUID, approved bool, reason string) {
-	go func() {
+	safego.Go("graph: resume run", func() {
 		ctx := context.Background()
 		orgPg := pgtype.UUID{Bytes: orgID, Valid: true}
 		runPg := pgtype.UUID{Bytes: runID, Valid: true}
 
-		if err := l.resume(ctx, orgID, runID, approved, reason); err != nil {
+		if err := l.containRun("graph: resume", orgPg, runPg, func() error { return l.resume(ctx, orgID, runID, approved, reason) }); err != nil {
 			slog.Error("graph: resume run failed", "run_id", runID, "err", err)
 			if status, statusErr := getRunStatus(ctx, l.appPool, orgPg, runPg); statusErr == nil && status == "awaiting_approval" {
 				_ = markRunFailedNoCheckpoint(ctx, l.appPool, orgPg, runPg)
 			}
 		}
-	}()
+	})
 }
 
 func (l *Launcher) resume(ctx context.Context, orgID, runID uuid.UUID, approved bool, reason string) error {
@@ -282,17 +298,19 @@ func (l *Launcher) LaunchTeam(orgID, orchestratorAgentID, runID uuid.UUID, membe
 	if l.a2aClient == nil {
 		panic("graph: LaunchTeam called before SetA2AClient — see cmd/api/main.go wiring")
 	}
-	go func() {
+	safego.Go("graph: launch team run", func() {
 		ctx := context.Background()
 		orgPg := pgtype.UUID{Bytes: orgID, Valid: true}
 		runPg := pgtype.UUID{Bytes: runID, Valid: true}
 
-		if err := l.runTeam(ctx, orgID, orchestratorAgentID, runID, members, input); err != nil {
+		if err := l.containRun("graph: team run", orgPg, runPg, func() error {
+			return l.runTeam(ctx, orgID, orchestratorAgentID, runID, members, input)
+		}); err != nil {
 			if status, statusErr := getRunStatus(ctx, l.appPool, orgPg, runPg); statusErr == nil && status == "pending" {
 				_ = markRunFailedNoCheckpoint(ctx, l.appPool, orgPg, runPg)
 			}
 		}
-	}()
+	})
 }
 
 func (l *Launcher) runTeam(ctx context.Context, orgID, agentID, runID uuid.UUID, members []TeamMember, input string) error {

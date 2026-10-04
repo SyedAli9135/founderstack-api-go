@@ -6,6 +6,7 @@ package notify
 import (
 	"context"
 	"fmt"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"sync"
 	"time"
@@ -54,7 +55,7 @@ func (n *Notifier) NotifyApprovalRequired(ctx context.Context, appPool *pgxpool.
 	var wg sync.WaitGroup
 
 	wg.Add(1)
-	go func() {
+	safego.Go("notify: slack", func() {
 		defer wg.Done()
 		channel, err := lookupSlackChannel(ctx, appPool, orgID)
 		if err != nil {
@@ -66,19 +67,19 @@ func (n *Notifier) NotifyApprovalRequired(ctx context.Context, appPool *pgxpool.
 		}
 		text := fmt.Sprintf("🔴 Needs approval (%s): %s", riskLevel, summary)
 		sendSlackApproval(ctx, gateway, orgID, channel, text)
-	}()
+	})
 
 	wg.Add(1)
-	go func() {
+	safego.Go("notify: email", func() {
 		defer wg.Done()
 		n.notifyApprovers(ctx, appPool, orgID, approvalID, summary)
-	}()
+	})
 
 	wg.Add(1)
-	go func() {
+	safego.Go("notify: push", func() {
 		defer wg.Done()
 		n.notifyPushSubscribers(ctx, appPool, orgID, approvalID, riskLevel, summary, expiresAt)
-	}()
+	})
 
 	wg.Wait()
 }

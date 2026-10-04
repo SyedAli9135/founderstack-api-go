@@ -3,6 +3,7 @@ package billing
 import (
 	"context"
 	"fmt"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"time"
 
@@ -89,15 +90,17 @@ func RunWorkspaceUsageJob(ctx context.Context, systemPool *pgxpool.Pool, s *Sync
 			return
 		case <-timer.C:
 		}
-		ids, err := dbgen.New(systemPool).ListPracticesWithLiveSubscriptions(ctx)
-		if err != nil {
-			slog.Error("billing: workspace usage job: listing practices", "err", err)
-		}
-		for _, id := range ids {
-			if err := s.SyncWorkspaceUsage(ctx, id); err != nil {
-				slog.Error("billing: workspace usage job", "org_id", id.String(), "err", err)
+		_ = safego.Do("billing: workspace usage job", func() {
+			ids, err := dbgen.New(systemPool).ListPracticesWithLiveSubscriptions(ctx)
+			if err != nil {
+				slog.Error("billing: workspace usage job: listing practices", "err", err)
 			}
-		}
+			for _, id := range ids {
+				if err := s.SyncWorkspaceUsage(ctx, id); err != nil {
+					slog.Error("billing: workspace usage job", "org_id", id.String(), "err", err)
+				}
+			}
+		})
 		timer.Reset(24 * time.Hour)
 	}
 }

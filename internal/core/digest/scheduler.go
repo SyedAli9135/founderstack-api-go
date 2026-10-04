@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"time"
 
@@ -21,7 +22,7 @@ import (
 // (BYPASSRLS) is required: scanning every org's digest_send_hour is
 // inherently cross-tenant, same reasoning as workflows.RunScheduler.
 func RunScheduler(ctx context.Context, systemPool *pgxpool.Pool, email notify.EmailSender, tokens *notify.DigestTokenSigner, appBaseURL string) {
-	tick(ctx, systemPool, email, tokens, appBaseURL)
+	_ = safego.Do("digest: scheduler tick", func() { tick(ctx, systemPool, email, tokens, appBaseURL) })
 
 	timer := time.NewTimer(time.Until(nextTopOfHour(time.Now())))
 	defer timer.Stop()
@@ -30,7 +31,7 @@ func RunScheduler(ctx context.Context, systemPool *pgxpool.Pool, email notify.Em
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			tick(ctx, systemPool, email, tokens, appBaseURL)
+			_ = safego.Do("digest: scheduler tick", func() { tick(ctx, systemPool, email, tokens, appBaseURL) })
 			timer.Reset(time.Until(nextTopOfHour(time.Now())))
 		}
 	}

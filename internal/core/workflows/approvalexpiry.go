@@ -2,6 +2,7 @@ package workflows
 
 import (
 	"context"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"time"
 
@@ -21,7 +22,7 @@ const approvalExpiryInterval = 5 * time.Minute
 // 'awaiting_approval' forever, since nothing else tells its state
 // machine the wait is over.
 func RunApprovalExpiryJob(ctx context.Context, systemPool *pgxpool.Pool, launcher *graph.Launcher) {
-	expireApprovals(ctx, systemPool, launcher)
+	_ = safego.Do("workflows: approval expiry", func() { expireApprovals(ctx, systemPool, launcher) })
 
 	ticker := time.NewTicker(approvalExpiryInterval)
 	defer ticker.Stop()
@@ -30,7 +31,7 @@ func RunApprovalExpiryJob(ctx context.Context, systemPool *pgxpool.Pool, launche
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			expireApprovals(ctx, systemPool, launcher)
+			_ = safego.Do("workflows: approval expiry", func() { expireApprovals(ctx, systemPool, launcher) })
 		}
 	}
 }

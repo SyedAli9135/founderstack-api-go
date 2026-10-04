@@ -1201,3 +1201,78 @@ func TestDocumentsHandler_AccessControl(t *testing.T) {
 		}
 	})
 }
+
+func TestDocumentsHandler_IngestAndSearchAreRateLimitedPerWorkspace(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	rdb := newTestRedis(t)
+
+	origUploads, origBytes, origReindex, origSearch := uploadsPerHour, uploadBytesPerHour, reindexesPerHour, uncachedSearchPerMin
+	uploadsPerHour, uploadBytesPerHour, reindexesPerHour, uncachedSearchPerMin = 2, 1000, 1, 1
+	t.Cleanup(func() {
+		uploadsPerHour, uploadBytesPerHour, reindexesPerHour, uncachedSearchPerMin = origUploads, origBytes, origReindex, origSearch
+	})
+
+	orgA, adminA := testOrgAndUserWithRole(t, systemPool, "admin")
+	_, adminB := testOrgAndUserWithRole(t, systemPool, "admin")
+
+	docA := insertIndexedDocument(t, appPool, orgA, "policy.txt", "general", "all_members")
+	index := fakeVectorIndex{results: []coredocs.QueryMatch{fakeMatch(docA, 0, "vacation policy", 0.9)}}
+	searcher := coredocs.NewSearcher(fakeEmbedder{}, index, fakeReranker{})
+	store := newFakeBlobStore()
+	processor := coredocs.NewProcessor(appPool, store, fakeEmbedder{}, fakeVectorIndex{})
+	router := testSearchRouter(t, systemPool, appPool, cfg, store, processor, searcher, rdb, fakeChatClientResolver(nil, errNoKeyConfigured))
+
+	upload := func(user string, size int) int {
+		body, ct := multipartUploadBody(t, "notes.txt", "", make([]byte, size))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, authedRequest(t, cfg, user, http.MethodPost, "/api/v1/documents/upload", body, ct))
+		return rec.Code
+	}
+
+	t.Run("uploads are limited per workspace, not per server", func(t *testing.T) {
+		if c1, c2 := upload(adminA, 10), upload(adminA, 10); c1 != http.StatusAccepted || c2 != http.StatusAccepted {
+			t.Fatalf("first two uploads = %d, %d, want 202 each", c1, c2)
+		}
+		if c := upload(adminA, 10); c != http.StatusTooManyRequests {
+			t.Fatalf("third upload = %d, want 429", c)
+		}
+		if c := upload(adminB, 10); c != http.StatusAccepted {
+			t.Fatalf("another workspace's upload = %d, want 202 (limits are per workspace)", c)
+		}
+	})
+
+	t.Run("upload volume is limited too, not just the count", func(t *testing.T) {
+		_, adminC := testOrgAndUserWithRole(t, systemPool, "admin")
+		if c := upload(adminC, 2000); c != http.StatusTooManyRequests {
+			t.Fatalf("2000-byte upload against a 1000-byte hourly budget = %d, want 429", c)
+		}
+	})
+
+	t.Run("reindexing is limited", func(t *testing.T) {
+		reindex := func() int {
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, authedRequest(t, cfg, adminA, http.MethodPost, "/api/v1/documents/"+docA.String()+"/reindex", nil, ""))
+			return rec.Code
+		}
+		if c := reindex(); c != http.StatusAccepted {
+			t.Fatalf("first reindex = %d, want 202", c)
+		}
+		if c := reindex(); c != http.StatusTooManyRequests {
+			t.Fatalf("second reindex = %d, want 429", c)
+		}
+	})
+
+	t.Run("only searches that reach the embedding API count, so a cached repeat is free", func(t *testing.T) {
+		if code, _ := doSearch(t, router, cfg, adminA, map[string]any{"query": "vacation policy"}); code != http.StatusOK {
+			t.Fatalf("first search = %d, want 200", code)
+		}
+		if code, data := doSearch(t, router, cfg, adminA, map[string]any{"query": "vacation policy"}); code != http.StatusOK || data["from_cache"] != true {
+			t.Fatalf("repeat search = (%d, from_cache=%v), want a free cached 200", code, data["from_cache"])
+		}
+		if code, _ := doSearch(t, router, cfg, adminA, map[string]any{"query": "a different question"}); code != http.StatusTooManyRequests {
+			t.Fatalf("second uncached search = %d, want 429", code)
+		}
+	})
+}

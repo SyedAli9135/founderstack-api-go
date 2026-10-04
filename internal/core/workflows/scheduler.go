@@ -6,6 +6,7 @@ package workflows
 import (
 	"context"
 	"errors"
+	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
 	"time"
 
@@ -36,7 +37,7 @@ type RunLauncher interface {
 // so a workflow whose fire time passed while the process was down isn't
 // stuck waiting a full tick.
 func RunScheduler(ctx context.Context, systemPool *pgxpool.Pool, launcher RunLauncher) {
-	tick(ctx, systemPool, launcher)
+	_ = safego.Do("workflows: scheduler tick", func() { tick(ctx, systemPool, launcher) })
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -45,7 +46,7 @@ func RunScheduler(ctx context.Context, systemPool *pgxpool.Pool, launcher RunLau
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tick(ctx, systemPool, launcher)
+			_ = safego.Do("workflows: scheduler tick", func() { tick(ctx, systemPool, launcher) })
 		}
 	}
 }
