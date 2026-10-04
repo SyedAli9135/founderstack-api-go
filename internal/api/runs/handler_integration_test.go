@@ -592,6 +592,52 @@ func TestRunsHandler_Stream(t *testing.T) {
 	}
 }
 
+func TestRunsHandler_Stream_RefusesPastThePerUserCap(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	engine := graph.NewEngine(appPool)
+	router := testRouter(t, systemPool, appPool, cfg, engine)
+
+	origUser := maxStreamsPerUser
+	maxStreamsPerUser = 2
+	t.Cleanup(func() { maxStreamsPerUser = origUser })
+
+	_, clerkUserID, runID := testOrgUserAgentWorkflowRun(t, systemPool, "running")
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+	token, err := devtoken.Sign(cfg.DevTokenSecret.Expose(), clerkUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := func() *http.Response {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/runs/"+runID.String()+"/stream", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatalf("stream request: %v", err)
+		}
+		return resp
+	}
+
+	// The run never completes, so these two stay open and hold their slots.
+	first, second := open(), open()
+	defer first.Body.Close()
+	defer second.Body.Close()
+	if first.StatusCode != http.StatusOK || second.StatusCode != http.StatusOK {
+		t.Fatalf("first two streams = %d, %d, want 200", first.StatusCode, second.StatusCode)
+	}
+
+	third := open()
+	defer third.Body.Close()
+	if third.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("third stream = %d, want 429", third.StatusCode)
+	}
+	if ct := third.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("refusal Content-Type = %q, want JSON (not text/event-stream)", ct)
+	}
+}
+
 func TestRunsHandler_Stream_NotFoundForUnknownRun(t *testing.T) {
 	appPool := testAppPool(t)
 	systemPool := testSystemPool(t)

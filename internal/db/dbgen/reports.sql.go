@@ -11,6 +11,19 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countClientReportsForOrg = `-- name: CountClientReportsForOrg :one
+SELECT count(*) FROM client_reports
+WHERE org_id = $1 AND is_revoked = false AND expires_at > now()
+`
+
+// Reports not yet revoked or expired; backs the per-workspace cap.
+func (q *Queries) CountClientReportsForOrg(ctx context.Context, orgID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countClientReportsForOrg, orgID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const getClientReportByToken = `-- name: GetClientReportByToken :one
 SELECT r.id, r.title, r.date_from, r.date_to, r.timezone, r.visible_sections, r.snapshot,
        r.expires_at, r.is_revoked, o.is_active AS org_active

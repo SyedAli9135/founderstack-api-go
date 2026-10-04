@@ -28,6 +28,8 @@ const (
 	defaultExpiryDays = 30
 	maxExpiryDays     = 365
 	maxWindowDays     = 366
+	// Live (unrevoked, unexpired) share links per workspace.
+	maxLiveReportsPerOrg = 500
 )
 
 type Handler struct {
@@ -217,7 +219,16 @@ func (h *Handler) Create(c *gin.Context) {
 
 	var snapJSON []byte
 	var inserted dbgen.InsertClientReportRow
+	var limitReached bool
 	err = tenant.WithTx(ctx, h.appPool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
+		live, err := q.CountClientReportsForOrg(ctx, orgID)
+		if err != nil {
+			return err
+		}
+		if live >= maxLiveReportsPerOrg {
+			limitReached = true
+			return nil
+		}
 		snap, err := buildSnapshot(ctx, q, orgID, org.Name, org.PreparedBy, from, to, loc, req.VisibleSections)
 		if err != nil {
 			return err
@@ -241,6 +252,11 @@ func (h *Handler) Create(c *gin.Context) {
 	if err != nil {
 		slog.Error("reports: create failed", "error", err, "request_id", response.RequestID(c))
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not generate report")
+		return
+	}
+
+	if limitReached {
+		response.Fail(c, http.StatusBadRequest, "REPORT_LIMIT_REACHED", "This workspace has 500 live report links — revoke some before creating more")
 		return
 	}
 

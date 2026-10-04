@@ -50,15 +50,17 @@ type PushSubscription struct {
 }
 
 // The JSON body founderstack-web's public/sw.js "push" handler expects.
-// ApproveURL/RejectURL are full, ready-to-POST URLs (already carrying
-// ?action_token=), not bare tokens — a static sw.js has no build-time
-// access to NEXT_PUBLIC_API_URL, so the server builds the complete URL.
+// ApproveURL/RejectURL are full, ready-to-POST URLs — a static sw.js has no
+// build-time access to NEXT_PUBLIC_API_URL, so the server builds the complete
+// URL — and ActionToken is sent in the X-Action-Token header, never the URL.
 type PushPayload struct {
 	Title      string `json:"title"`
 	Body       string `json:"body"`
 	ApprovalID string `json:"approval_id"`
 	ApproveURL string `json:"approve_url,omitempty"`
 	RejectURL  string `json:"reject_url,omitempty"`
+	// ActionToken authorizes the approve/reject URLs above, sent as a header.
+	ActionToken string `json:"action_token,omitempty"`
 }
 
 // SendToSubscription is a logged no-op when either VAPID key is unset.

@@ -159,7 +159,9 @@ func (h *Handler) Connect(c *gin.Context) {
 		return
 	}
 	if err := keyProvider.ValidateKey(ctx, req.Key); err != nil {
-		response.Fail(c, http.StatusBadRequest, "INVALID_KEY", "That key could not be validated: "+err.Error())
+		// The provider's own error text (URLs, response bodies) stays in the log.
+		slog.Warn("integration key validation failed", "service", service, "error", err)
+		response.Fail(c, http.StatusBadRequest, "INVALID_KEY", meta.Name+" didn't accept that key — check it and try again")
 		return
 	}
 

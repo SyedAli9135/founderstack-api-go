@@ -26,10 +26,11 @@ import (
 type Handler struct {
 	appPool *pgxpool.Pool
 	engine  *graph.Engine
+	streams *streamLimiter
 }
 
 func NewHandler(appPool *pgxpool.Pool, engine *graph.Engine) *Handler {
-	return &Handler{appPool: appPool, engine: engine}
+	return &Handler{appPool: appPool, engine: engine, streams: newStreamLimiter()}
 }
 
 func (h *Handler) Register(rg *gin.RouterGroup) {
@@ -245,12 +246,24 @@ func (h *Handler) Stream(c *gin.Context) {
 		return
 	}
 
+	userKey, orgKey := user.ID.String(), user.OrgID.String()
+	if !h.streams.acquire(userKey, orgKey) {
+		c.Header("Content-Type", "application/json; charset=utf-8") // undo the event-stream type set above
+		response.Fail(c, http.StatusTooManyRequests, "TOO_MANY_STREAMS", "Too many live run views are open — close one and try again")
+		return
+	}
+	defer h.streams.release(userKey, orgKey)
+
 	events, unsubscribe := h.engine.Bus.Subscribe(runID)
 	defer unsubscribe()
 
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
+	// Send the headers now, not with the first event: a run waiting on an
+	// approval can be silent for hours, and the client should know it's connected.
+	c.Writer.WriteHeaderNow()
+	c.Writer.Flush()
 
 	clientGone := c.Request.Context().Done()
 	c.Stream(func(w io.Writer) bool {

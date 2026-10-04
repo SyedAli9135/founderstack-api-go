@@ -197,6 +197,13 @@ func (h *ClerkHandler) upsertMembership(ctx context.Context, raw json.RawMessage
 		return fmt.Errorf("decode membership payload: %w", err)
 	}
 
+	if data.Organization.ID == "" || data.PublicUserData.UserID == "" {
+		// Retrying can't fill in a missing id, so acknowledge rather than make
+		// Clerk redeliver it forever (or write a row with an empty user id).
+		slog.Warn("ignoring clerk membership event with no organization or user id", "org", data.Organization.ID)
+		return nil
+	}
+
 	orgID, err := h.db.GetOrganizationIDByClerkOrgID(ctx, data.Organization.ID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -283,6 +290,10 @@ func (h *ClerkHandler) softDeleteMembership(ctx context.Context, raw json.RawMes
 	var data membershipPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return fmt.Errorf("decode membership payload: %w", err)
+	}
+	if data.Organization.ID == "" || data.PublicUserData.UserID == "" {
+		slog.Warn("ignoring clerk membership removal with no organization or user id")
+		return nil
 	}
 	if _, err := h.db.SoftDeleteMembership(ctx, dbgen.SoftDeleteMembershipParams{
 		ClerkUserID: data.PublicUserData.UserID,

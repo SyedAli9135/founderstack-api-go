@@ -11,6 +11,24 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countActiveAgentTeams = `-- name: CountActiveAgentTeams :one
+
+SELECT count(*) FROM agent_teams WHERE org_id = $1 AND is_active = true
+`
+
+// Queries backing workflow 18 (Multi-Agent Team Run / A2A). agent_teams
+// and agent_team_members have existed, RLS-covered, since 000001/000002 —
+// these are the first queries ever written against them. All tenant-scoped
+// through app_user via tenant.WithTx, same as every other feature area in
+// this file set — team membership and A2A dispatch never cross an org
+// boundary.
+func (q *Queries) CountActiveAgentTeams(ctx context.Context, orgID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveAgentTeams, orgID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deactivateAgentTeam = `-- name: DeactivateAgentTeam :execrows
 UPDATE agent_teams SET is_active = false WHERE org_id = $1 AND id = $2 AND is_active = true
 `
@@ -146,7 +164,6 @@ func (q *Queries) GetAgentTeamMemberRole(ctx context.Context, arg GetAgentTeamMe
 }
 
 const insertAgentTeam = `-- name: InsertAgentTeam :one
-
 INSERT INTO agent_teams (org_id, name, description, orchestrator_agent_id)
 VALUES ($1, $2, $3, $4)
 RETURNING id, name, description, orchestrator_agent_id, max_agent_hops,
@@ -173,12 +190,6 @@ type InsertAgentTeamRow struct {
 	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
 }
 
-// Queries backing workflow 18 (Multi-Agent Team Run / A2A). agent_teams
-// and agent_team_members have existed, RLS-covered, since 000001/000002 —
-// these are the first queries ever written against them. All tenant-scoped
-// through app_user via tenant.WithTx, same as every other feature area in
-// this file set — team membership and A2A dispatch never cross an org
-// boundary.
 func (q *Queries) InsertAgentTeam(ctx context.Context, arg InsertAgentTeamParams) (InsertAgentTeamRow, error) {
 	row := q.db.QueryRow(ctx, insertAgentTeam,
 		arg.OrgID,

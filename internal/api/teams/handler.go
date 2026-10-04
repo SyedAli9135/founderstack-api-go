@@ -30,6 +30,7 @@ const (
 	maxTeamDescLen     = 2000
 	maxTeamRoleLen     = 100
 	maxTeamRunInputLen = 20000
+	maxTeamsPerOrg     = 25
 )
 
 func formatTimestamptz(t pgtype.Timestamptz) *string {
@@ -189,7 +190,16 @@ func (h *Handler) Create(c *gin.Context) {
 	orchestratorPg := pgtype.UUID{Bytes: orchestratorAgentID, Valid: true}
 	var team dbgen.InsertAgentTeamRow
 	var invalidAgentID string
+	var teamLimitReached bool
 	err = tenant.WithTx(c.Request.Context(), h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		count, err := q.CountActiveAgentTeams(ctx, user.OrgID)
+		if err != nil {
+			return err
+		}
+		if count >= maxTeamsPerOrg {
+			teamLimitReached = true
+			return nil
+		}
 		if _, err := q.ValidateAgentForTeamMembership(ctx, dbgen.ValidateAgentForTeamMembershipParams{OrgID: user.OrgID, ID: orchestratorPg}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				invalidAgentID = req.OrchestratorAgentID
@@ -198,7 +208,6 @@ func (h *Handler) Create(c *gin.Context) {
 			return err
 		}
 
-		var err error
 		team, err = q.InsertAgentTeam(ctx, dbgen.InsertAgentTeamParams{
 			OrgID: user.OrgID, Name: req.Name, Description: req.Description, OrchestratorAgentID: orchestratorPg,
 		})
@@ -230,6 +239,10 @@ func (h *Handler) Create(c *gin.Context) {
 	})
 	if err != nil {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Could not create team")
+		return
+	}
+	if teamLimitReached {
+		response.Fail(c, http.StatusBadRequest, "TEAM_LIMIT_REACHED", "A workspace can have at most 25 teams — delete one first")
 		return
 	}
 	if invalidAgentID != "" {
@@ -383,6 +396,14 @@ func (h *Handler) Run(c *gin.Context) {
 		return
 	}
 
+	if !h.launcher.TeamRunsAvailable() {
+		response.Fail(c, http.StatusServiceUnavailable, "TEAM_RUNS_NOT_CONFIGURED", "Team runs aren't available on this deployment")
+		return
+	}
+	if !h.launcher.TeamRunsAvailable() {
+		response.Fail(c, http.StatusServiceUnavailable, "TEAM_RUNS_NOT_CONFIGURED", "Team runs aren't available on this deployment")
+		return
+	}
 	if err := h.launcher.Preflight(c.Request.Context(), user.OrgID); err != nil {
 		var pe *graph.PreflightError
 		if errors.As(err, &pe) {

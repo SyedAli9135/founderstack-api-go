@@ -60,6 +60,11 @@ WHERE r.org_id = sqlc.arg(org_id) AND r.parent_run_id IS NULL AND r.created_at >
 ORDER BY r.created_at DESC
 LIMIT sqlc.arg(row_limit);
 
+-- name: CountClientReportsForOrg :one
+-- Reports not yet revoked or expired; backs the per-workspace cap.
+SELECT count(*) FROM client_reports
+WHERE org_id = $1 AND is_revoked = false AND expires_at > now();
+
 -- name: InsertClientReport :one
 INSERT INTO client_reports (org_id, created_by_user_id, title, date_from, date_to, timezone,
                             visible_sections, snapshot, share_token, expires_at)

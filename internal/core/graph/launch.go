@@ -57,6 +57,10 @@ func (l *Launcher) SetA2AClient(c *a2a.Client) {
 	l.a2aClient = c
 }
 
+// TeamRunsAvailable reports whether team runs are configured (they need the
+// A2A client, which needs A2A_TASK_TOKEN_SECRET).
+func (l *Launcher) TeamRunsAvailable() bool { return l.a2aClient != nil }
+
 // NewLauncher builds a Launcher against llm.ResolveChatClient. appPool
 // must be the app_user (RLS-enforced) pool — every DB op goes through
 // tenant.WithTx. notifier may be nil (RunDeps.Notifier is nil-checked).
@@ -295,13 +299,15 @@ func markRunFailedNoCheckpoint(ctx context.Context, pool *pgxpool.Pool, orgID, r
 
 // LaunchTeam is Launch's team-orchestrator counterpart: same
 // resolve-then-detached-goroutine shape, but wires BuildTeamNodes instead
-// of BuildNodes and requires SetA2AClient to have been called first
-// (panics otherwise — a misconfigured deployment should fail loudly at
-// the one call site that needs A2A_TASK_TOKEN_SECRET, not silently run a
-// team with every specialist dispatch failing).
+// of BuildNodes and requires SetA2AClient to have been called first.
+// Callers check TeamRunsAvailable before queueing a run; if it wasn't called
+// the run is failed here rather than left pending (or, as this used to, a
+// panic that took the request down after the run row was already inserted).
 func (l *Launcher) LaunchTeam(orgID, orchestratorAgentID, runID uuid.UUID, members []TeamMember, input string) {
-	if l.a2aClient == nil {
-		panic("graph: LaunchTeam called before SetA2AClient — see cmd/api/main.go wiring")
+	if !l.TeamRunsAvailable() {
+		slog.Error("graph: LaunchTeam called before SetA2AClient — see cmd/api/main.go wiring", "run_id", runID)
+		_ = markRunFailedNoCheckpoint(context.Background(), l.appPool, pgtype.UUID{Bytes: orgID, Valid: true}, pgtype.UUID{Bytes: runID, Valid: true})
+		return
 	}
 	safego.Go("graph: launch team run", func() {
 		ctx := context.Background()

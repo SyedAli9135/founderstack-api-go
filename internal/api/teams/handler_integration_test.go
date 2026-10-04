@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -709,5 +710,65 @@ func TestTeamsHandler_TraceOnlyServesTheTeamsOwnRuns(t *testing.T) {
 	}
 	if c := get(teamB); c != http.StatusNotFound {
 		t.Fatalf("another team's id for the same run = %d, want 404", c)
+	}
+}
+
+func TestTeamsHandler_TeamCapPerWorkspace(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	fx := newTeamTestFixture(t, systemPool)
+	server, _ := buildTeamTestServer(t, appPool, systemPool, cfg, nil)
+
+	if _, err := systemPool.Exec(context.Background(), fmt.Sprintf(`
+		insert into agent_teams (org_id, name, orchestrator_agent_id)
+		select $1, 'seed team '||g, $2 from generate_series(1, %d) g`, maxTeamsPerOrg), fx.orgPg, fx.orchestratorID); err != nil {
+		t.Fatalf("seed teams: %v", err)
+	}
+	code, errCode := postTeam(t, server, cfg, fx.userClerkID, createTeamRequest{
+		Name: "One too many", OrchestratorAgentID: fx.orchestratorID.String(),
+		Members: []createTeamMemberRequest{{AgentID: fx.financeID.String(), Role: "finance"}},
+	})
+	if code != http.StatusBadRequest || errCode != "TEAM_LIMIT_REACHED" {
+		t.Fatalf("got (%d, %s), want (400, TEAM_LIMIT_REACHED)", code, errCode)
+	}
+}
+
+// Without the A2A client (no A2A_TASK_TOKEN_SECRET) a team run can't work:
+// the API must say so up front, not insert a run and then fail.
+func TestTeamsHandler_RunIsRefusedWhenTeamRunsAreNotConfigured(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	fx := newTeamTestFixture(t, systemPool)
+
+	gin.SetMode(gin.TestMode)
+	registry, err := coremcp.NewRegistry(context.Background(), map[string]*gomcp.Server{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	launcher := graph.NewLauncherWithResolver(graph.NewEngine(appPool), appPool, nil, registry, nil, nil, modelKeyedResolver(nil))
+	if launcher.TeamRunsAvailable() {
+		t.Fatal("a launcher with no A2A client claims team runs are available")
+	}
+	r := gin.New()
+	r.Use(middleware.RequestID())
+	authed := r.Group("/api/v1")
+	authed.Use(middleware.RequireAuth(systemPool, cfg))
+	NewHandler(appPool, launcher).Register(authed)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, authedRequest(t, cfg, fx.userClerkID, http.MethodPost, "/api/v1/teams/"+uuid.NewString()+"/run", map[string]string{"input": "go"}))
+	var e apiError
+	_ = json.Unmarshal(w.Body.Bytes(), &e)
+	if w.Code != http.StatusServiceUnavailable || e.Error.Code != "TEAM_RUNS_NOT_CONFIGURED" {
+		t.Fatalf("got (%d, %s), want (503, TEAM_RUNS_NOT_CONFIGURED)", w.Code, e.Error.Code)
+	}
+	var runs int
+	if err := systemPool.QueryRow(context.Background(), "select count(*) from workflow_runs where org_id = $1", fx.orgPg).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 0 {
+		t.Fatalf("%d run rows were inserted despite the refusal", runs)
 	}
 }

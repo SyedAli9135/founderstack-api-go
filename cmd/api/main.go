@@ -310,18 +310,33 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	router.Use(middleware.SecurityHeaders(cfg))
 	router.Use(middleware.LimitBody(maxRequestBody))
 	router.Use(cors.New(corsConfig(cfg)))
+	// Generous ceiling for any one IP; the webhooks are exempt (signed, bursty).
+	router.Use(middleware.RateLimitIP(rdb, "global", 3000, time.Minute, "/api/webhooks"))
+
+	// Every authenticated group shares one verifier (one JWK cache) and the
+	// same limits: a general per-user ceiling plus tighter caps on the routes
+	// that spend money or send mail.
+	authed := []gin.HandlerFunc{
+		middleware.RequireAuth(systemDB, cfg),
+		middleware.RateLimitUser(rdb, "api", 600, time.Minute),
+		middleware.RateLimitRoutes(rdb, expensiveRoutes),
+	}
+	// The endpoints that need no session get a much lower per-IP ceiling.
+	publicLimit := middleware.RateLimitIP(rdb, "public", 120, time.Minute)
 
 	apiV1 := router.Group("/api/v1")
+	apiV1.Use(publicLimit)
 	v1.NewHealthHandler(db, rdb, pc).Register(apiV1)
 
 	apiAuth := router.Group("/api/v1/auth")
+	apiAuth.Use(publicLimit)
 	identity.NewDevTokenHandler(cfg).Register(apiAuth)
 
 	// Every route under here requires a verified session; each handler
 	// scopes its own queries via tenant.WithTx against the app_user pool.
 	settingsHandler := settings.NewHandler(db, encryptionKey, mockKeyPrefix(cfg), emailSender, digestTokens, cfg.AppBaseURL)
 	apiSettings := router.Group("/api/v1/settings")
-	apiSettings.Use(middleware.RequireAuth(systemDB, cfg))
+	apiSettings.Use(authed...)
 	settingsHandler.Register(apiSettings)
 
 	// Deliberately ungated — a digest email's unsubscribe link has no
@@ -330,6 +345,7 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	// same "route patterns don't collide" reasoning as
 	// apiIntegrationsCallback below.
 	apiSettingsPublic := router.Group("/api/v1/settings")
+	apiSettingsPublic.Use(publicLimit)
 	settingsHandler.RegisterPublic(apiSettingsPublic)
 
 	apiWebhooks := router.Group("/api/webhooks")
@@ -340,33 +356,34 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	intHandler := integrationsapi.NewHandler(db, encryptionKey, registry, stateManager, cfg.FrontendURL)
 
 	apiIntegrations := router.Group("/api/v1/integrations")
-	apiIntegrations.Use(middleware.RequireAuth(systemDB, cfg))
+	apiIntegrations.Use(authed...)
 	intHandler.Register(apiIntegrations)
 
 	// Unauthenticated: the OAuth provider redirects the founder's browser
 	// here directly, with no JWT. Same URL prefix as apiIntegrations above;
 	// the route patterns don't collide.
 	apiIntegrationsCallback := router.Group("/api/v1/integrations")
+	apiIntegrationsCallback.Use(publicLimit)
 	intHandler.RegisterCallback(apiIntegrationsCallback)
 
 	apiDocuments := router.Group("/api/v1")
-	apiDocuments.Use(middleware.RequireAuth(systemDB, cfg))
+	apiDocuments.Use(authed...)
 	documents.NewHandler(db, docsStore, docsProcessor, docsSearcher, rdb, encryptionKey).Register(apiDocuments)
 
 	apiAgents := router.Group("/api/v1")
-	apiAgents.Use(middleware.RequireAuth(systemDB, cfg))
+	apiAgents.Use(authed...)
 	agents.NewHandler(db, mcpRegistry).Register(apiAgents)
 
 	apiWorkflows := router.Group("/api/v1")
-	apiWorkflows.Use(middleware.RequireAuth(systemDB, cfg))
+	apiWorkflows.Use(authed...)
 	workflowsapi.NewHandler(db, launcher).Register(apiWorkflows)
 
 	apiRuns := router.Group("/api/v1")
-	apiRuns.Use(middleware.RequireAuth(systemDB, cfg))
+	apiRuns.Use(authed...)
 	runsapi.NewHandler(db, graphEngine).Register(apiRuns)
 
 	apiAnalytics := router.Group("/api/v1")
-	apiAnalytics.Use(middleware.RequireAuth(systemDB, cfg))
+	apiAnalytics.Use(authed...)
 	analytics.NewHandler(db).Register(apiAnalytics)
 
 	// Dev-only stand-in for the real approve/reject endpoints, registered
@@ -378,13 +395,14 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	approvalsHandler := approvalsapi.NewHandler(db, systemDB, launcher, actionTokens, cfg)
 
 	apiApprovals := router.Group("/api/v1")
-	apiApprovals.Use(middleware.RequireAuth(systemDB, cfg))
+	apiApprovals.Use(authed...)
 	approvalsHandler.Register(apiApprovals)
 
 	// Deliberately ungated — a push notification's Approve/Reject buttons
 	// have no live Clerk session; Handler.resolveActor does its own dual
 	// auth (Bearer or ?action_token=) per request instead.
 	apiApprovalsActions := router.Group("/api/v1")
+	apiApprovalsActions.Use(publicLimit)
 	approvalsHandler.RegisterActions(apiApprovalsActions)
 
 	// The zero-value ClientConfig is deliberate: BackendConfig.Key nil falls
@@ -393,36 +411,37 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	membershipSyncer := org.NewClerkMembershipSyncer(organizationmembership.NewClient(&clerk.ClientConfig{}))
 	invitationLister := org.NewClerkInvitationLister(organizationinvitation.NewClient(&clerk.ClientConfig{}))
 	apiOrg := router.Group("/api/v1")
-	apiOrg.Use(middleware.RequireAuth(systemDB, cfg))
+	apiOrg.Use(authed...)
 	org.NewHandler(db, membershipSyncer, invitationLister).Register(apiOrg)
 
 	apiBilling := router.Group("/api/v1")
-	apiBilling.Use(middleware.RequireAuth(systemDB, cfg))
+	apiBilling.Use(authed...)
 	billing.NewHandler(db, systemDB, stripeAPI, billingSyncer, cfg.FrontendURL).Register(apiBilling)
 
 	apiAuditLogs := router.Group("/api/v1")
-	apiAuditLogs.Use(middleware.RequireAuth(systemDB, cfg))
+	apiAuditLogs.Use(authed...)
 	auditlogs.NewHandler(db).Register(apiAuditLogs)
 
 	apiTeams := router.Group("/api/v1")
-	apiTeams.Use(middleware.RequireAuth(systemDB, cfg))
+	apiTeams.Use(authed...)
 	teamsapi.NewHandler(db, launcher).Register(apiTeams)
 
 	a2aHandler := a2aapi.NewHandler(db, launcher, taskTokens, cfg.AppBaseURL)
 
 	apiA2A := router.Group("/api/v1")
-	apiA2A.Use(middleware.RequireAuth(systemDB, cfg))
+	apiA2A.Use(authed...)
 	a2aHandler.Register(apiA2A)
 
 	apiA2ATasksSend := router.Group("/api/v1")
+	apiA2ATasksSend.Use(publicLimit)
 	a2aHandler.RegisterTasksSend(apiA2ATasksSend)
 
 	apiTemplates := router.Group("/api/v1")
-	apiTemplates.Use(middleware.RequireAuth(systemDB, cfg))
+	apiTemplates.Use(authed...)
 	templatesapi.NewHandler(db).Register(apiTemplates)
 
 	apiPractice := router.Group("/api/v1")
-	apiPractice.Use(middleware.RequireAuth(systemDB, cfg))
+	apiPractice.Use(authed...)
 	practiceHandler := practiceapi.NewHandler(systemDB, db, practiceapi.NewClerkProvisioner(organization.NewClient(&clerk.ClientConfig{})), mcpRegistry)
 	if billingSyncer != nil {
 		practiceHandler.SetUsageSyncer(billingSyncer)
@@ -437,11 +456,31 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	// unauthenticated read of tenant data in the API.
 	reportsHandler := reportsapi.NewHandler(db, systemDB, reportsapi.NewRedisLimiter(rdb, 30, time.Minute))
 	apiReports := router.Group("/api/v1")
-	apiReports.Use(middleware.RequireAuth(systemDB, cfg))
+	apiReports.Use(authed...)
 	reportsHandler.Register(apiReports)
 	reportsHandler.RegisterPublic(router.Group("/api/public"))
 
 	return router
+}
+
+// expensiveRoutes are tighter per-user caps on routes that spend the
+// customer's or the platform's money, call Clerk, or send mail. A pattern here
+// must match the one the handler registers.
+var expensiveRoutes = []middleware.RouteRule{
+	{Method: "POST", Path: "/api/v1/settings/api-key", Limit: 10, Window: time.Minute},
+	{Method: "POST", Path: "/api/v1/settings/digest/test", Limit: 5, Window: time.Hour},
+	{Method: "POST", Path: "/api/v1/settings/push-subscription", Limit: 30, Window: time.Hour},
+	{Method: "POST", Path: "/api/v1/integrations/:service/connect", Limit: 20, Window: time.Minute},
+	{Method: "POST", Path: "/api/v1/reports", Limit: 30, Window: time.Hour},
+	{Method: "POST", Path: "/api/v1/practice/client-workspaces", Limit: 10, Window: time.Hour},
+	{Method: "POST", Path: "/api/v1/practice/sops", Limit: 60, Window: time.Hour},
+	{Method: "POST", Path: "/api/v1/practice/sops/:id/deploy", Limit: 60, Window: time.Hour},
+	{Method: "POST", Path: "/api/v1/agents", Limit: 60, Window: time.Hour},
+	{Method: "POST", Path: "/api/v1/workflows", Limit: 60, Window: time.Hour},
+	{Method: "POST", Path: "/api/v1/workflows/:id/run", Limit: 120, Window: time.Hour},
+	{Method: "POST", Path: "/api/v1/teams", Limit: 30, Window: time.Hour},
+	{Method: "POST", Path: "/api/v1/teams/:id/run", Limit: 60, Window: time.Hour},
+	{Method: "POST", Path: "/api/v1/templates/:id/install", Limit: 60, Window: time.Hour},
 }
 
 // newIntegrationsRegistry constructs one provider per catalog.go entry —
@@ -508,7 +547,7 @@ func newDocumentsProcessor(ctx context.Context, cfg *config.Config, appPool *pgx
 func corsConfig(cfg *config.Config) cors.Config {
 	c := cors.Config{
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "Accept"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "Accept", "X-Action-Token"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}

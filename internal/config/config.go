@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -128,6 +129,11 @@ type Config struct {
 	// on public report links. Set it to the load balancer's range in production.
 	TrustedProxies string `mapstructure:"TRUSTED_PROXIES"`
 
+	// ClerkAuthorizedParties lists the browser origins whose Clerk session
+	// tokens are accepted (the token's "azp" claim). Empty means: any origin in
+	// development, and FRONTEND_URL's origin in production.
+	ClerkAuthorizedParties string `mapstructure:"CLERK_AUTHORIZED_PARTIES"`
+
 	// FounderStack's own platform billing (workflow 15) — not the Stripe
 	// integration agents use, which is per-org OAuth. Both optional: unset,
 	// the app boots and billing routes answer 503 BILLING_NOT_CONFIGURED.
@@ -135,9 +141,29 @@ type Config struct {
 	StripeWebhookSecret secret.Value `mapstructure:"STRIPE_WEBHOOK_SECRET"`
 }
 
-// TrustedProxyList splits TrustedProxies; nil means trust no proxy.
+// AuthorizedParties is the set of allowed token origins; nil means "don't check".
+func (c *Config) AuthorizedParties() []string {
+	var out []string
+	for _, p := range strings.Split(c.ClerkAuthorizedParties, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 && c.IsProduction() {
+		if u, err := url.Parse(c.FrontendURL); err == nil && u.Scheme != "" && u.Host != "" {
+			out = append(out, u.Scheme+"://"+u.Host)
+		}
+	}
+	return out
+}
+
+// TrustedProxyList splits TrustedProxies; nil means trust no proxy ("none"
+// says so explicitly, which production requires).
 func (c *Config) TrustedProxyList() []string {
 	var out []string
+	if strings.EqualFold(strings.TrimSpace(c.TrustedProxies), "none") {
+		return nil
+	}
 	for _, p := range strings.Split(c.TrustedProxies, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
@@ -223,6 +249,11 @@ func (c *Config) validateProduction() []string {
 			problems = append(problems, u.key+" must be an https:// URL")
 		}
 	}
+	// Left unset, every client would share the load balancer's IP: one
+	// rate-limit bucket for all users, and report viewers throttled together.
+	if strings.TrimSpace(c.TrustedProxies) == "" {
+		problems = append(problems, "TRUSTED_PROXIES must be set to the load balancer's IPs/CIDRs (or \"none\" if clients connect directly)")
+	}
 	return problems
 }
 
@@ -294,6 +325,7 @@ func Load() (*Config, error) {
 		"A2A_TASK_TOKEN_SECRET":     "",
 		"DIGEST_UNSUBSCRIBE_SECRET": "",
 		"TRUSTED_PROXIES":           "",
+		"CLERK_AUTHORIZED_PARTIES":  "",
 		"STRIPE_SECRET_KEY":         "",
 		"STRIPE_WEBHOOK_SECRET":     "",
 	}

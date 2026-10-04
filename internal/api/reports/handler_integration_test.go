@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -427,5 +428,33 @@ func TestRedisLimiter_LimitsPerIPAndIgnoresSpoofedForwardedFor(t *testing.T) {
 		if codes[i] != want[i] {
 			t.Fatalf("codes = %v, want %v (spoofed X-Forwarded-For must not reset the limit)", codes, want)
 		}
+	}
+}
+
+func TestReports_LiveLinkCapPerWorkspace(t *testing.T) {
+	app, sys := pool(t, "TEST_APP_DATABASE_URL"), pool(t, "TEST_SYSTEM_DATABASE_URL")
+	fx := newFixture(t, sys)
+	r := router(app, sys, allowAll{})
+	valid := map[string]any{"org_id": fx.orgID, "date_from": "2026-09-01", "date_to": "2026-09-30"}
+
+	// Fill the workspace to the cap directly rather than through 500 requests.
+	if _, err := sys.Exec(context.Background(), fmt.Sprintf(`
+		insert into client_reports (org_id, title, date_from, date_to, timezone, visible_sections, snapshot, share_token, expires_at)
+		select $1, 'seed '||g, '2026-09-01', '2026-09-30', 'UTC', '{}'::jsonb, '{}'::jsonb, 'seedtoken-'||$2||'-'||g, now() + interval '1 day'
+		from generate_series(1, %d) g`, maxLiveReportsPerOrg), fx.orgID, suffix()); err != nil {
+		t.Fatalf("seed reports: %v", err)
+	}
+
+	rec, env := do(t, r, fx.admin, http.MethodPost, "/api/v1/reports", valid)
+	if rec.Code != http.StatusBadRequest || env.Error.Code != "REPORT_LIMIT_REACHED" {
+		t.Fatalf("create at the cap = (%d, %s), want (400, REPORT_LIMIT_REACHED)", rec.Code, env.Error.Code)
+	}
+
+	// Revoked and expired links don't count, so cleaning up frees room.
+	if _, err := sys.Exec(context.Background(), `update client_reports set is_revoked = true where org_id = $1 and title like 'seed %'`, fx.orgID); err != nil {
+		t.Fatal(err)
+	}
+	if rec, env := do(t, r, fx.admin, http.MethodPost, "/api/v1/reports", valid); rec.Code != http.StatusCreated {
+		t.Fatalf("create after revoking = (%d, %s), want 201", rec.Code, env.Error.Code)
 	}
 }

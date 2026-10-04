@@ -148,3 +148,23 @@ func TestJWKCache_RemembersDefinitiveUnknownKeyID(t *testing.T) {
 		t.Fatalf("fetch called %d times, want 1 (an unknown kid should be negatively cached)", calls)
 	}
 }
+
+func TestCheckAuthorizedParty(t *testing.T) {
+	allowed := []string{"https://app.founderstack.ai"}
+	for _, tc := range []struct {
+		name    string
+		azp     string
+		allowed []string
+		wantErr bool
+	}{
+		{"matching origin", "https://app.founderstack.ai", allowed, false},
+		{"another origin", "https://evil.example", allowed, true},
+		{"a look-alike prefix", "https://app.founderstack.ai.evil.example", allowed, true},
+		{"no azp claim", "", allowed, false},
+		{"no list configured", "https://anything.example", nil, false},
+	} {
+		if err := checkAuthorizedParty(tc.azp, tc.allowed); (err != nil) != tc.wantErr {
+			t.Errorf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)
+		}
+	}
+}

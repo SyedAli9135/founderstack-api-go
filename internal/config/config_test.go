@@ -207,3 +207,40 @@ func TestLoad_ProductionRejectsShortSigningSecrets(t *testing.T) {
 		t.Errorf("error %q reports a secret that is long enough", err)
 	}
 }
+
+func TestLoad_ProductionRequiresAnExplicitTrustedProxiesDecision(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("TRUSTED_PROXIES", "")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "TRUSTED_PROXIES must be set") {
+		t.Fatalf("Load() error = %v, want it to demand TRUSTED_PROXIES", err)
+	}
+	// "none" is a decision, not an omission — it must clear this one problem.
+	t.Setenv("TRUSTED_PROXIES", "none")
+	if _, err := Load(); err != nil && strings.Contains(err.Error(), "TRUSTED_PROXIES") {
+		t.Fatalf("TRUSTED_PROXIES=none still reported: %v", err)
+	}
+}
+
+func TestTrustedProxyList(t *testing.T) {
+	for in, want := range map[string]int{"": 0, "none": 0, "NONE": 0, "10.0.0.0/8": 1, "10.0.0.1, 10.0.0.2": 2} {
+		if got := len((&Config{TrustedProxies: in}).TrustedProxyList()); got != want {
+			t.Errorf("TrustedProxyList(%q) has %d entries, want %d", in, got, want)
+		}
+	}
+}
+
+func TestAuthorizedParties(t *testing.T) {
+	prod := &Config{AppEnv: "production", FrontendURL: "https://app.founderstack.ai/some/path"}
+	if got := prod.AuthorizedParties(); len(got) != 1 || got[0] != "https://app.founderstack.ai" {
+		t.Errorf("production default = %v, want just the frontend origin", got)
+	}
+	if got := (&Config{AppEnv: "development", FrontendURL: "http://localhost:3000"}).AuthorizedParties(); got != nil {
+		t.Errorf("development default = %v, want no check", got)
+	}
+	explicit := &Config{AppEnv: "production", FrontendURL: "https://a.example", ClerkAuthorizedParties: "https://x.example, https://y.example"}
+	if got := explicit.AuthorizedParties(); len(got) != 2 || got[0] != "https://x.example" {
+		t.Errorf("explicit list = %v, want the two configured origins", got)
+	}
+}

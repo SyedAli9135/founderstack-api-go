@@ -112,21 +112,30 @@ func (n *Notifier) notifyPushSubscribers(ctx context.Context, appPool *pgxpool.P
 		return
 	}
 	for _, sub := range subs {
-		var approveURL, rejectURL string
+		var token string
 		if n.Tokens != nil {
-			token := n.Tokens.Sign(approvalID, sub.userID, expiresAt)
-			if token != "" {
-				approveURL = fmt.Sprintf("%s/api/v1/approvals/%s/approve?action_token=%s", n.apiBaseURL, approvalID, token)
-				rejectURL = fmt.Sprintf("%s/api/v1/approvals/%s/reject?action_token=%s", n.apiBaseURL, approvalID, token)
-			}
+			token = n.Tokens.Sign(approvalID, sub.userID, expiresAt)
 		}
 		n.Push.SendToSubscription(ctx, PushSubscription{
 			Endpoint: sub.endpoint, P256dhKey: sub.p256dhKey, AuthKey: sub.authKey,
-		}, PushPayload{
-			Title: "Approval needed", Body: fmt.Sprintf("(%s) %s", riskLevel, summary),
-			ApprovalID: approvalID.String(), ApproveURL: approveURL, RejectURL: rejectURL,
-		})
+		}, buildApprovalPush(n.apiBaseURL, approvalID, token, riskLevel, summary))
 	}
+}
+
+// buildApprovalPush assembles the notification. The action token travels in a
+// header (the service worker sets it), never the URL: URLs end up in
+// load-balancer and proxy logs. An empty token yields a notification whose
+// buttons just open the app.
+func buildApprovalPush(apiBaseURL string, approvalID uuid.UUID, token, riskLevel, summary string) PushPayload {
+	p := PushPayload{
+		Title: "Approval needed", Body: fmt.Sprintf("(%s) %s", riskLevel, summary), ApprovalID: approvalID.String(),
+	}
+	if token != "" {
+		p.ActionToken = token
+		p.ApproveURL = fmt.Sprintf("%s/api/v1/approvals/%s/approve", apiBaseURL, approvalID)
+		p.RejectURL = fmt.Sprintf("%s/api/v1/approvals/%s/reject", apiBaseURL, approvalID)
+	}
+	return p
 }
 
 func summarizeToolCalls(calls []llm.ToolCall) string {

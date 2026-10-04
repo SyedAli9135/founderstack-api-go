@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -439,6 +440,29 @@ func TestIntegrationsHandler_FullLifecycle(t *testing.T) {
 			t.Fatalf("status = %s, want revoked", got.Data.Status)
 		}
 	})
+}
+
+func TestIntegrationsHandler_RejectedKeyDoesNotEchoTheProviderError(t *testing.T) {
+	systemPool := testSystemPool(t)
+	appPool := testAppPool(t)
+	rdb := testRedis(t)
+	cfg := testConfig(t)
+	_, clerkUserID := testOrgAndUser(t, systemPool)
+
+	const upstream = "providers: https://api.stripe.com/v1/balance returned 401: sk_live_leaked_fragment"
+	registry := integrations.NewRegistry(&fakeKeyProvider{name: "stripe", validateErr: errors.New(upstream)})
+	router := testRouter(t, systemPool, appPool, rdb, cfg, testEncryptionKey(t), registry, "http://localhost:3000")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/integrations/stripe/connect", map[string]string{"key": "sk_test_x"}))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "INVALID_KEY") {
+		t.Fatalf("got (%d, %s), want 400 INVALID_KEY", rec.Code, rec.Body.String())
+	}
+	for _, leak := range []string{"api.stripe.com", "sk_live", "returned 401"} {
+		if strings.Contains(rec.Body.String(), leak) {
+			t.Fatalf("response leaks %q: %s", leak, rec.Body.String())
+		}
+	}
 }
 
 func TestIntegrationsHandler_CrossOrgIsolation(t *testing.T) {

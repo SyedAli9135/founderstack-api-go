@@ -160,7 +160,7 @@ type actor struct {
 	orgID  pgtype.UUID
 }
 
-// resolveActor tries Authorization first, then ?action_token=. Neither path is trusted
+// resolveActor tries Authorization first, then X-Action-Token (or ?action_token=). Neither path is trusted
 // as authorization by itself — Approve/Reject re-check permission/expiry/agents_paused after.
 func (h *Handler) resolveActor(c *gin.Context, approvalID pgtype.UUID) (actor, bool) {
 	ctx := c.Request.Context()
@@ -179,7 +179,14 @@ func (h *Handler) resolveActor(c *gin.Context, approvalID pgtype.UUID) (actor, b
 		return actor{userID: uuid.UUID(user.ID.Bytes), orgID: user.OrgID}, true
 	}
 
-	if token := c.Query("action_token"); token != "" {
+	// X-Action-Token is the form push notifications send now. The query form is
+	// kept only for notifications sent before that: they expire within
+	// notify.ApprovalTTL (24h), after which this fallback can be deleted.
+	token := c.GetHeader("X-Action-Token")
+	if token == "" {
+		token = c.Query("action_token")
+	}
+	if token != "" {
 		// System-scoped: no tenant context exists yet to trust for org_id.
 		approval, err := dbgen.New(h.systemPool).GetApprovalSystemScoped(ctx, approvalID)
 		if err != nil {

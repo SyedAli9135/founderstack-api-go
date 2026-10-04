@@ -198,7 +198,7 @@ func fetchJWK(ctx context.Context, keyID string) (*clerk.JSONWebKey, error) {
 // path being a signed action token, not a Clerk JWT — see
 // notify.ActionTokenSigner).
 func VerifyToken(ctx context.Context, cache *JWKCache, cfg *config.Config, token string) (clerkUserID, clerkOrgID string, err error) {
-	clerkUserID, clerkOrgID, err = verifyClerkToken(ctx, cache, token)
+	clerkUserID, clerkOrgID, err = verifyClerkToken(ctx, cache, token, cfg.AuthorizedParties())
 	if err != nil {
 		return devTokenFallback(cfg, token)
 	}
@@ -208,7 +208,7 @@ func VerifyToken(ctx context.Context, cache *JWKCache, cfg *config.Config, token
 // verifyClerkToken returns the token's subject and active org. The SDK's
 // ActiveOrganizationID already reads both session-token formats (v1's
 // "org_id", v2's "o.id").
-func verifyClerkToken(ctx context.Context, cache *JWKCache, token string) (string, string, error) {
+func verifyClerkToken(ctx context.Context, cache *JWKCache, token string, allowedParties []string) (string, string, error) {
 	unverified, err := jwt.Decode(ctx, &jwt.DecodeParams{Token: token})
 	if err != nil {
 		return "", "", err
@@ -221,7 +221,28 @@ func verifyClerkToken(ctx context.Context, cache *JWKCache, token string) (strin
 	if err != nil {
 		return "", "", err
 	}
+	if err := checkAuthorizedParty(claims.AuthorizedParty, allowedParties); err != nil {
+		return "", "", err
+	}
 	return claims.Subject, claims.ActiveOrganizationID, nil
+}
+
+var errUnauthorizedParty = errors.New("middleware: token was issued for a different origin")
+
+// checkAuthorizedParty rejects a session token minted for a browser origin
+// other than ours (the "azp" claim), so a token obtained on some other site
+// can't be replayed here. No configured list, or a token without the claim,
+// is accepted — the signature has already proved it came from our Clerk.
+func checkAuthorizedParty(azp string, allowed []string) error {
+	if len(allowed) == 0 || azp == "" {
+		return nil
+	}
+	for _, a := range allowed {
+		if azp == a {
+			return nil
+		}
+	}
+	return errUnauthorizedParty
 }
 
 // errOrgNotFound distinguishes "no such user" from "user exists but their

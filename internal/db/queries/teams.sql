@@ -5,6 +5,9 @@
 -- this file set — team membership and A2A dispatch never cross an org
 -- boundary.
 
+-- name: CountActiveAgentTeams :one
+SELECT count(*) FROM agent_teams WHERE org_id = $1 AND is_active = true;
+
 -- name: InsertAgentTeam :one
 INSERT INTO agent_teams (org_id, name, description, orchestrator_agent_id)
 VALUES ($1, $2, $3, $4)

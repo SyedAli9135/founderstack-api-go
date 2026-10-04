@@ -25,12 +25,21 @@ type Querier interface {
 	// org, deactivating a non-active provider's key must not clobber a
 	// different, still-active provider's pointer.
 	ClearOrganizationActiveApiKeyForProvider(ctx context.Context, arg ClearOrganizationActiveApiKeyForProviderParams) error
+	// Queries backing workflow 18 (Multi-Agent Team Run / A2A). agent_teams
+	// and agent_team_members have existed, RLS-covered, since 000001/000002 —
+	// these are the first queries ever written against them. All tenant-scoped
+	// through app_user via tenant.WithTx, same as every other feature area in
+	// this file set — team membership and A2A dispatch never cross an org
+	// boundary.
+	CountActiveAgentTeams(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	CountActiveAgents(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	CountActiveClientWorkspaces(ctx context.Context, parentPracticeID pgtype.UUID) (int64, error)
 	// Top-level runs still in flight for an org; backs the manual-run concurrency
 	// cap (child runs of a team run are not counted, matching the portfolio stats).
 	CountActiveRuns(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	CountActiveWorkflows(ctx context.Context, orgID pgtype.UUID) (int64, error)
+	// Reports not yet revoked or expired; backs the per-workspace cap.
+	CountClientReportsForOrg(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	CountCostLedger(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	// Soft delete — is_active=false, row stays for run history (Workflow 9+).
 	// :execrows (not :exec) so the handler can distinguish "deactivated" from
@@ -297,12 +306,6 @@ type Querier interface {
 	// rows (pgx.ErrNoRows on the :one Scan), which the handler translates to a
 	// 400 DUPLICATE_AGENT_NAME rather than a generic 500.
 	InsertAgent(ctx context.Context, arg InsertAgentParams) (InsertAgentRow, error)
-	// Queries backing workflow 18 (Multi-Agent Team Run / A2A). agent_teams
-	// and agent_team_members have existed, RLS-covered, since 000001/000002 —
-	// these are the first queries ever written against them. All tenant-scoped
-	// through app_user via tenant.WithTx, same as every other feature area in
-	// this file set — team membership and A2A dispatch never cross an org
-	// boundary.
 	InsertAgentTeam(ctx context.Context, arg InsertAgentTeamParams) (InsertAgentTeamRow, error)
 	InsertAgentTeamMember(ctx context.Context, arg InsertAgentTeamMemberParams) (InsertAgentTeamMemberRow, error)
 	// Workflow 10: approvals/approval_decisions writes (internal/core/graph's

@@ -866,3 +866,34 @@ func TestClerkWebhook_RejectsAnOversizedBodyBeforeDoingAnyWork(t *testing.T) {
 		t.Fatalf("got (%d, %s), want 400 INVALID_BODY for a body over %d bytes", rec.Code, rec.Body.String(), maxClerkPayload)
 	}
 }
+
+func TestClerkWebhook_MembershipEventsWithoutIDsAreAckedAndWriteNothing(t *testing.T) {
+	pool := testPool(t)
+	secret, secretBytes := testSecret(t)
+	router := testRouter(t, pool, secret)
+
+	var before int
+	if err := pool.QueryRow(context.Background(), "select count(*) from users where clerk_user_id = ''").Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	for _, typ := range []string{"organizationMembership.created", "organizationMembership.updated", "organizationMembership.deleted"} {
+		rec := postWebhook(t, router, secretBytes, map[string]any{
+			"type": typ,
+			"data": map[string]any{
+				"organization":     map[string]any{"id": "org_whatever", "name": "x", "slug": "x"},
+				"public_user_data": map[string]any{"user_id": "", "identifier": "nobody@example.invalid"},
+				"role":             "org:admin",
+			},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s with no user id = %d, want 200 (ack, nothing to retry)", typ, rec.Code)
+		}
+	}
+	var after int
+	if err := pool.QueryRow(context.Background(), "select count(*) from users where clerk_user_id = ''").Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("rows with an empty clerk_user_id went from %d to %d", before, after)
+	}
+}

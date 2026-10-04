@@ -401,6 +401,32 @@ func TestApprovalsHandler_FullLifecycle(t *testing.T) {
 		}
 	})
 
+	t.Run("the action token is accepted from the X-Action-Token header", func(t *testing.T) {
+		fx := newApprovalFixture(t, systemPool, appPool)
+		runID, approvalID := suspendNewRun(t, systemPool, appPool, fx, launcher)
+		token := tokens.Sign(uuidFromPg(approvalID), uuidFromPg(fx.approverUserID), time.Now().Add(time.Hour))
+
+		req := jsonRequest(http.MethodPost, "/api/v1/approvals/"+idString(approvalID)+"/approve", nil)
+		req.Header.Set("X-Action-Token", token)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		var status string
+		for time.Now().Before(deadline) {
+			if err := systemPool.QueryRow(context.Background(), "select status from workflow_runs where id = $1", runID).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if status == "completed" {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("run status = %q, want completed after a header-token approval", status)
+	})
+
 	t.Run("action token approves without any Authorization header", func(t *testing.T) {
 		fx := newApprovalFixture(t, systemPool, appPool)
 		runID, approvalID := suspendNewRun(t, systemPool, appPool, fx, launcher)
