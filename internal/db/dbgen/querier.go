@@ -613,6 +613,10 @@ type Querier interface {
 	RestoreClientWorkspace(ctx context.Context, arg RestoreClientWorkspaceParams) (int64, error)
 	RevokeClientReport(ctx context.Context, arg RevokeClientReportParams) (int64, error)
 	RevokeConnection(ctx context.Context, arg RevokeConnectionParams) (int64, error)
+	// Recorded after the app's own role change has reached Clerk, so the webhook
+	// Clerk then sends (carrying that same role) isn't mistaken for a Clerk-side
+	// change that should overwrite the app's finer-grained role.
+	SetMemberClerkRole(ctx context.Context, arg SetMemberClerkRoleParams) error
 	SetOrgStripeCustomer(ctx context.Context, arg SetOrgStripeCustomerParams) error
 	SetOrganizationActiveApiKey(ctx context.Context, arg SetOrganizationActiveApiKeyParams) error
 	SoftDeleteDocument(ctx context.Context, arg SoftDeleteDocumentParams) error
@@ -727,6 +731,12 @@ type Querier interface {
 	// written by workspace creation): an event older than the newest one already
 	// applied to this membership changes nothing, so a retried "created" can't
 	// undo a later removal and a stale "updated" can't revert a role.
+	//
+	// clerk_role is the role Clerk reports. users.role (what the app enforces) is
+	// replaced only when Clerk's role changed or the membership is new/reactivated;
+	// the permission flags are recomputed in exactly those cases, so a promotion
+	// made in Clerk doesn't leave an admin with a member's flags. An unrelated
+	// membership event leaves both alone, so an app-side demotion sticks.
 	UpsertUserForMembership(ctx context.Context, arg UpsertUserForMembershipParams) (int64, error)
 	// Queries backing workflow 8 (workflow config CRUD + scheduling). Most are
 	// tenant-scoped through app_user via tenant.WithTx, like every other

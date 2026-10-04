@@ -123,7 +123,7 @@ func TestRender_DefaultsAndOverrides(t *testing.T) {
 	if !strings.Contains(a.SystemPrompt, "#finance") || strings.Contains(a.SystemPrompt, "{{") {
 		t.Fatalf("defaults not filled: %q", a.SystemPrompt)
 	}
-	if a.Model != DefaultModel || a.AgentType != DefaultAgentType || *a.MaxOutputTokens != DefaultMaxOutputTokens || *a.Temperature != DefaultTemperature {
+	if a.Model != "" || a.AgentType != DefaultAgentType || *a.MaxOutputTokens != DefaultMaxOutputTokens || *a.Temperature != DefaultTemperature {
 		t.Fatalf("agents-API defaults not applied: %+v", a)
 	}
 	if *w.TaskInputTemplate != "Close the books and post to #finance for the client" {

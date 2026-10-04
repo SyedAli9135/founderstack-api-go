@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/founderstack/api/internal/core/llm"
 	"net/http"
 	"sort"
 	"strings"
@@ -206,6 +207,12 @@ func (h *Handler) Install(c *gin.Context) {
 		activeCount, err := q.CountActiveAgents(ctx, user.OrgID)
 		if err != nil {
 			return err
+		}
+		// Templates carry an Anthropic model; an org on another provider needs
+		// that provider's own default or the agent's first run would fail.
+		if settings, err := q.GetOrgRunSettings(ctx, user.OrgID); err == nil && settings.LlmProvider != nil &&
+			llm.ProviderID(*settings.LlmProvider) != llm.ProviderAnthropic {
+			model = llm.DefaultModel(llm.ProviderID(*settings.LlmProvider))
 		}
 		if maxAgents != nil && activeCount >= int64(*maxAgents) {
 			limitReached = true

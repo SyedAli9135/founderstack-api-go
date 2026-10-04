@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"github.com/founderstack/api/internal/core/llm"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -309,7 +310,7 @@ func TestAgentsHandler_FullLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got.ID == "" || got.Slug != "finance-agent" || got.AgentType != defaultAgentType ||
-			got.Model != defaultModel || got.MaxOutputTokens != defaultMaxOutputTokens || !got.IsActive {
+			got.Model != llm.DefaultModel(llm.ProviderAnthropic) || got.MaxOutputTokens != defaultMaxOutputTokens || !got.IsActive {
 			t.Fatalf("unexpected created agent: %+v", got)
 		}
 		agentID = got.ID
@@ -581,5 +582,43 @@ func TestAgentsHandler_MemberAndViewerCannotDelete(t *testing.T) {
 	adminRouter.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// An agent made without a model must get one its org's provider serves: model
+// IDs are per-provider, so an Anthropic default on an OpenAI org would fail on
+// the agent's first run.
+func TestAgentsHandler_DefaultModelFollowsTheOrgsProvider(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg, fakeToolRegistry(t))
+
+	create := func(provider string) string {
+		orgID, user := testOrgAndUserWithRole(t, systemPool, "admin")
+		if provider != "" {
+			if _, err := systemPool.Exec(context.Background(), "update organizations set llm_provider = $1 where id = $2", provider, orgID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		req := authedRequest(t, cfg, user, http.MethodPost, "/api/v1/agents", map[string]any{
+			"name": "Defaults", "system_prompt": validSystemPrompt,
+			"policy_scope": map[string]any{"allowed_tools": []string{"stripe.get_mrr"}},
+		})
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create (%q) = %d, %s", provider, rec.Code, rec.Body.String())
+		}
+		var env apiEnvelope
+		_ = json.Unmarshal(rec.Body.Bytes(), &env)
+		var got agentView
+		_ = json.Unmarshal(env.Data, &got)
+		return got.Model
+	}
+	for provider, want := range map[string]string{"anthropic": "claude-sonnet-5-5", "openai": "gpt-4o", "gemini": "gemini-2.0-flash", "": "claude-sonnet-5-5"} {
+		if got := create(provider); got != want {
+			t.Errorf("provider %q: default model = %q, want %q", provider, got, want)
+		}
 	}
 }

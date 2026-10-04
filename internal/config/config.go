@@ -129,6 +129,14 @@ type Config struct {
 	// on public report links. Set it to the load balancer's range in production.
 	TrustedProxies string `mapstructure:"TRUSTED_PROXIES"`
 
+	// Abuse and cost ceilings, per workspace. The defaults suit a small
+	// customer base; raise them for a plan that earns it.
+	DocsUploadsPerHour    int `mapstructure:"DOCS_UPLOADS_PER_HOUR"`
+	DocsUploadMBPerHour   int `mapstructure:"DOCS_UPLOAD_MB_PER_HOUR"`
+	DocsReindexesPerHour  int `mapstructure:"DOCS_REINDEXES_PER_HOUR"`
+	DocsSearchesPerMinute int `mapstructure:"DOCS_SEARCHES_PER_MINUTE"`
+	MaxActiveRunsPerOrg   int `mapstructure:"MAX_ACTIVE_RUNS_PER_ORG"`
+
 	// ClerkAuthorizedParties lists the browser origins whose Clerk session
 	// tokens are accepted (the token's "azp" claim). Empty means: any origin in
 	// development, and FRONTEND_URL's origin in production.
@@ -326,6 +334,11 @@ func Load() (*Config, error) {
 		"DIGEST_UNSUBSCRIBE_SECRET": "",
 		"TRUSTED_PROXIES":           "",
 		"CLERK_AUTHORIZED_PARTIES":  "",
+		"DOCS_UPLOADS_PER_HOUR":     30,
+		"DOCS_UPLOAD_MB_PER_HOUR":   250,
+		"DOCS_REINDEXES_PER_HOUR":   20,
+		"DOCS_SEARCHES_PER_MINUTE":  120,
+		"MAX_ACTIVE_RUNS_PER_ORG":   10,
 		"STRIPE_SECRET_KEY":         "",
 		"STRIPE_WEBHOOK_SECRET":     "",
 	}

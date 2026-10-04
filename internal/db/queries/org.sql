@@ -35,3 +35,9 @@ WHERE org_id = $1 AND id = $2;
 -- Only ever called after the real Clerk-side removal already succeeded —
 -- see Handler.Remove's doc comment for why the ordering matters.
 UPDATE users SET is_active = false WHERE org_id = $1 AND id = $2;
+
+-- name: SetMemberClerkRole :exec
+-- Recorded after the app's own role change has reached Clerk, so the webhook
+-- Clerk then sends (carrying that same role) isn't mistaken for a Clerk-side
+-- change that should overwrite the app's finer-grained role.
+UPDATE users SET clerk_role = $3 WHERE org_id = $1 AND id = $2;

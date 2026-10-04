@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	dbpkg "github.com/founderstack/api/internal/db"
 	"log/slog"
 	"net/http"
 	"os"
@@ -90,8 +91,21 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	documents.SetLimits(cfg.DocsUploadsPerHour, cfg.DocsUploadMBPerHour, cfg.DocsReindexesPerHour, cfg.DocsSearchesPerMinute)
+	if cfg.MaxActiveRunsPerOrg > 0 {
+		graph.MaxActiveRunsPerOrg = cfg.MaxActiveRunsPerOrg
+	}
+
 	// app_user, RLS-enforced — not the postgres superuser that runs migrations.
-	dbPool, err := pgxpool.New(ctx, cfg.AppDatabaseURL)
+	if cfg.IsProduction() {
+		// The migrations create these roles with passwords that live in the
+		// repository; a production database must not still accept them.
+		if err := dbpkg.RefuseDevCredentials(ctx, cfg.SystemDatabaseURL); err != nil {
+			return err
+		}
+	}
+
+	dbPool, err := dbpkg.NewPool(ctx, cfg.AppDatabaseURL, int32(cfg.DatabasePoolSize))
 	if err != nil {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}
@@ -99,7 +113,8 @@ func run() error {
 
 	// app_system, BYPASSRLS — the Clerk webhook and any system context
 	// that legitimately spans tenants.
-	systemPool, err := pgxpool.New(ctx, cfg.SystemDatabaseURL)
+	// Cross-tenant sweeps and webhooks need far fewer connections than request traffic.
+	systemPool, err := dbpkg.NewPool(ctx, cfg.SystemDatabaseURL, max(int32(cfg.DatabasePoolSize)/4, 4))
 	if err != nil {
 		return fmt.Errorf("connect to postgres (system pool): %w", err)
 	}

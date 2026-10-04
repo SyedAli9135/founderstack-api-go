@@ -244,3 +244,24 @@ func TestAuthorizedParties(t *testing.T) {
 		t.Errorf("explicit list = %v, want the two configured origins", got)
 	}
 }
+
+func TestLoad_LimitsHaveDefaultsAndAreOverridable(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DocsUploadsPerHour != 30 || cfg.DocsUploadMBPerHour != 250 || cfg.DocsReindexesPerHour != 20 ||
+		cfg.DocsSearchesPerMinute != 120 || cfg.MaxActiveRunsPerOrg != 10 {
+		t.Fatalf("defaults = %+v", cfg)
+	}
+	t.Setenv("DOCS_UPLOADS_PER_HOUR", "99")
+	t.Setenv("MAX_ACTIVE_RUNS_PER_ORG", "25")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DocsUploadsPerHour != 99 || cfg.MaxActiveRunsPerOrg != 25 {
+		t.Fatalf("overrides not applied: uploads=%d runs=%d", cfg.DocsUploadsPerHour, cfg.MaxActiveRunsPerOrg)
+	}
+}

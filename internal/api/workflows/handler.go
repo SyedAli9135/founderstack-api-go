@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/founderstack/api/internal/pkg/cronutil"
 	"net/http"
 	"strings"
 	"time"
@@ -15,7 +16,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	cron "github.com/robfig/cron/v3"
 
 	"github.com/founderstack/api/internal/api/authctx"
 	"github.com/founderstack/api/internal/api/response"
@@ -543,7 +543,7 @@ func (h *Handler) Run(c *gin.Context) {
 		if err != nil {
 			return err
 		}
-		if active >= graph.MaxActiveRunsPerOrg {
+		if int(active) >= graph.MaxActiveRunsPerOrg {
 			tooManyRuns = true
 			return nil
 		}
@@ -597,7 +597,7 @@ func computeSchedule(triggerType string, cronExpr *string) (*string, pgtype.Time
 	if cronExpr == nil || *cronExpr == "" {
 		return nil, pgtype.Timestamptz{}, "CRON_EXPRESSION_REQUIRED", "cron_expression is required when trigger_type is scheduled"
 	}
-	schedule, err := cron.ParseStandard(*cronExpr)
+	schedule, err := cronutil.Validate(*cronExpr)
 	if err != nil {
 		return nil, pgtype.Timestamptz{}, "INVALID_CRON_EXPRESSION", fmt.Sprintf("Invalid cron_expression: %v", err)
 	}

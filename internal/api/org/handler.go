@@ -96,6 +96,18 @@ func (h *Handler) List(c *gin.Context) {
 
 func isAdminRole(role string) bool { return role == "owner" || role == "admin" }
 
+// Clerk ships two org roles, "org:admin" and "org:member"; the app's four fold
+// onto them (a viewer is a member as far as Clerk is concerned). Keeping
+// Clerk's role in step matters beyond bookkeeping: the invite UI is Clerk's,
+// so a member demoted here but still an admin there could keep inviting and
+// removing people.
+func clerkRoleFor(role string) (key, name string) {
+	if isAdminRole(role) {
+		return "org:admin", "admin"
+	}
+	return "org:member", "member"
+}
+
 // canTouchOwnerRole: admin and owner are otherwise equivalent here, but the
 // owner role itself is protected — only an owner can grant it, change an
 // owner's role, or remove an owner, so an admin can't take over or lock out
@@ -204,8 +216,15 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 	// (e.g. "viewer", which Clerk's own default org roles don't have)
 	// must not undo the local change Postgres just committed — see
 	// MembershipSyncer's own doc comment.
-	if err := h.syncer.UpdateRole(ctx, user.ClerkOrgID, target.ClerkUserID, req.Role); err != nil {
+	clerkKey, clerkName := clerkRoleFor(req.Role)
+	if err := h.syncer.UpdateRole(ctx, user.ClerkOrgID, target.ClerkUserID, clerkKey); err != nil {
 		slog.Warn("org: clerk role sync failed, local role change stands", "member_id", targetID.String(), "err", err)
+	} else if err := tenant.WithTx(ctx, h.appPool, user.OrgID, func(ctx context.Context, q *dbgen.Queries) error {
+		// Clerk will now send a webhook carrying this role; recording it first
+		// stops that echo from overwriting the app's finer-grained role.
+		return q.SetMemberClerkRole(ctx, dbgen.SetMemberClerkRoleParams{OrgID: user.OrgID, ID: targetID, ClerkRole: &clerkName})
+	}); err != nil {
+		slog.Warn("org: could not record the synced clerk role", "member_id", targetID.String(), "err", err)
 	}
 
 	response.OK(c, http.StatusOK, "Role updated", gin.H{"id": targetID.String(), "role": req.Role})

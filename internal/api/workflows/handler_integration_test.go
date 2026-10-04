@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -277,6 +278,19 @@ func TestWorkflowsHandler_FullLifecycle(t *testing.T) {
 		router.ServeHTTP(rec, req)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("create rejects a schedule that runs more often than every 5 minutes", func(t *testing.T) {
+		for _, expr := range []string{"* * * * *", "*/2 * * * *"} {
+			req := authedRequest(t, cfg, clerkUserID, http.MethodPost, "/api/v1/workflows", map[string]any{
+				"agent_id": agentID.String(), "name": "Too often", "trigger_type": "scheduled", "cron_expression": expr,
+			})
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "INVALID_CRON_EXPRESSION") || !strings.Contains(rec.Body.String(), "minimum interval") {
+				t.Fatalf("%q: status = %d, body = %s, want 400 INVALID_CRON_EXPRESSION mentioning the minimum interval", expr, rec.Code, rec.Body.String())
+			}
 		}
 	})
 

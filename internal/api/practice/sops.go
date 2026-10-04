@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/founderstack/api/internal/core/llm"
 	"net/http"
 	"sort"
 	"strings"
@@ -821,6 +822,19 @@ func failDeploymentWrite(c *gin.Context, err error, fallback string) {
 	}
 }
 
+// modelOrProviderDefault keeps a SOP's own model choice, or else uses the
+// default for the target workspace's active LLM provider.
+func modelOrProviderDefault(ctx context.Context, q *dbgen.Queries, orgID pgtype.UUID, model string) string {
+	if model != "" {
+		return model
+	}
+	var provider llm.ProviderID
+	if settings, err := q.GetOrgRunSettings(ctx, orgID); err == nil && settings.LlmProvider != nil {
+		provider = llm.ProviderID(*settings.LlmProvider)
+	}
+	return llm.DefaultModel(provider)
+}
+
 func insertAgent(ctx context.Context, q *dbgen.Queries, orgID, createdBy pgtype.UUID, a sop.AgentConfig) (pgtype.UUID, error) {
 	policyJSON, err := json.Marshal(a.PolicyScope)
 	if err != nil {
@@ -830,9 +844,10 @@ func insertAgent(ctx context.Context, q *dbgen.Queries, orgID, createdBy pgtype.
 	if err != nil {
 		return pgtype.UUID{}, err
 	}
+	model := modelOrProviderDefault(ctx, q, orgID, a.Model)
 	r, err := q.InsertAgent(ctx, dbgen.InsertAgentParams{
 		OrgID: orgID, Name: a.Name, Slug: slugify(a.Name), Description: a.Description, AgentType: a.AgentType,
-		Model: &a.Model, SystemPrompt: a.SystemPrompt, MaxOutputTokens: a.MaxOutputTokens, Temperature: a.Temperature,
+		Model: &model, SystemPrompt: a.SystemPrompt, MaxOutputTokens: a.MaxOutputTokens, Temperature: a.Temperature,
 		PolicyScope: policyJSON, AllowedMcpServers: serversJSON, CreatedBy: createdBy,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -973,9 +988,10 @@ func (h *Handler) applyDeployment(ctx context.Context, d dbgen.GetSopDeploymentR
 		if err != nil {
 			return err
 		}
+		model := modelOrProviderDefault(ctx, q, d.TargetOrgID, agent.Model)
 		_, err = q.SyncSopAgent(ctx, dbgen.SyncSopAgentParams{
 			OrgID: d.TargetOrgID, ID: d.AgentID, Name: agent.Name, Description: agent.Description,
-			AgentType: agent.AgentType, Model: &agent.Model, SystemPrompt: agent.SystemPrompt,
+			AgentType: agent.AgentType, Model: &model, SystemPrompt: agent.SystemPrompt,
 			MaxOutputTokens: agent.MaxOutputTokens, Temperature: agent.Temperature,
 			PolicyScope: policyJSON, AllowedMcpServers: serversJSON,
 		})

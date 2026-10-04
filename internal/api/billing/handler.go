@@ -79,6 +79,11 @@ func (h *Handler) Usage(c *gin.Context) {
 		return
 	}
 
+	if user.Role == "viewer" {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Viewers can see outcomes but not spend")
+		return
+	}
+
 	since := time.Now().UTC().AddDate(0, 0, -usageWindowDays)
 	sinceParam := pgtype.Timestamptz{Time: since, Valid: true}
 
@@ -153,6 +158,11 @@ func (h *Handler) Ledger(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
 		response.Fail(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Missing auth context")
+		return
+	}
+
+	if user.Role == "viewer" {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Viewers can see outcomes but not spend")
 		return
 	}
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/founderstack/api/internal/core/llm"
 	"net/http"
 	"sort"
 	"strings"
@@ -26,7 +27,6 @@ import (
 
 const (
 	defaultAgentType       = "specialist"
-	defaultModel           = "claude-sonnet-5"
 	defaultMaxOutputTokens = int32(4096)
 	defaultTemperature     = 0.3
 	minSystemPromptLen     = 50
@@ -178,7 +178,7 @@ func toView(r row) agentView {
 		Slug:                r.Slug,
 		Description:         r.Description,
 		AgentType:           r.AgentType,
-		Model:               derefOr(r.Model, defaultModel),
+		Model:               derefOr(r.Model, llm.DefaultModel(llm.ProviderAnthropic)),
 		SystemPrompt:        r.SystemPrompt,
 		ContextWindowTokens: derefInt32(r.ContextWindowTokens),
 		MaxOutputTokens:     derefInt32(r.MaxOutputTokens),
@@ -300,6 +300,21 @@ type createAgentRequest struct {
 }
 
 // Create validates and inserts a new agent — POST /api/v1/agents.
+// defaultModelFor is the default chat model for the org's active provider
+// (Anthropic's when none is set yet), so an agent made without a model runs on
+// a model its own provider actually serves.
+func (h *Handler) defaultModelFor(ctx context.Context, orgID pgtype.UUID) string {
+	var provider llm.ProviderID
+	_ = tenant.WithTx(ctx, h.appPool, orgID, func(ctx context.Context, q *dbgen.Queries) error {
+		settings, err := q.GetOrgRunSettings(ctx, orgID)
+		if err == nil && settings.LlmProvider != nil {
+			provider = llm.ProviderID(*settings.LlmProvider)
+		}
+		return nil
+	})
+	return llm.DefaultModel(provider)
+}
+
 func (h *Handler) Create(c *gin.Context) {
 	user, ok := authctx.FromContext(c)
 	if !ok {
@@ -337,7 +352,7 @@ func (h *Handler) Create(c *gin.Context) {
 	}
 	model := req.Model
 	if model == "" {
-		model = defaultModel
+		model = h.defaultModelFor(c.Request.Context(), user.OrgID)
 	}
 	maxOutputTokens := defaultMaxOutputTokens
 	if req.MaxOutputTokens != nil {

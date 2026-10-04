@@ -354,3 +354,52 @@ func TestTemplatesHandler_InstallRequiresOwnerOrAdmin(t *testing.T) {
 		t.Fatalf("error code = %q, want NOT_AUTHORIZED", apiErr.Error.Code)
 	}
 }
+
+// A template ships an Anthropic model ID; an org on another provider must get
+// that provider's own default, and no seeded template may carry the retired ID.
+func TestTemplatesHandler_InstallUsesAModelTheOrgsProviderServes(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	r := testRouter(t, systemPool, appPool, cfg)
+
+	var bad int
+	if err := systemPool.QueryRow(context.Background(), "select count(*) from agent_templates where model = 'claude-sonnet-5'").Scan(&bad); err != nil {
+		t.Fatal(err)
+	}
+	if bad != 0 {
+		t.Fatalf("%d seeded templates still use the invalid model ID claude-sonnet-5", bad)
+	}
+
+	install := func(provider string) string {
+		orgID, user := testOrgAndUser(t, systemPool, "admin")
+		if provider != "" {
+			if _, err := systemPool.Exec(context.Background(), "update organizations set llm_provider = $1 where id = $2", provider, orgID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, authedRequest(t, cfg, user, http.MethodGet, "/api/v1/templates"))
+		var list []templateSummary
+		mustUnmarshalData(t, w.Body.Bytes(), &list)
+		w = httptest.NewRecorder()
+		r.ServeHTTP(w, authedRequest(t, cfg, user, http.MethodPost, "/api/v1/templates/"+list[0].ID+"/install"))
+		if w.Code != http.StatusCreated {
+			t.Fatalf("install (%q) = %d, %s", provider, w.Code, w.Body.String())
+		}
+		var inst installResponse
+		mustUnmarshalData(t, w.Body.Bytes(), &inst)
+		var model string
+		if err := systemPool.QueryRow(context.Background(), "select model from agents where id = $1", inst.AgentID).Scan(&model); err != nil {
+			t.Fatal(err)
+		}
+		return model
+	}
+
+	if got := install("anthropic"); got != "claude-sonnet-5-5" {
+		t.Errorf("anthropic org: model = %q, want claude-sonnet-5-5", got)
+	}
+	if got := install("openai"); got != "gpt-4o" {
+		t.Errorf("openai org: model = %q, want gpt-4o (not an Anthropic ID)", got)
+	}
+}

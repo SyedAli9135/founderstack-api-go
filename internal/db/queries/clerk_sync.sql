@@ -38,14 +38,21 @@ SELECT id FROM organizations WHERE clerk_org_id = $1;
 -- written by workspace creation): an event older than the newest one already
 -- applied to this membership changes nothing, so a retried "created" can't
 -- undo a later removal and a stale "updated" can't revert a role.
-INSERT INTO users (org_id, clerk_user_id, email, full_name, role, can_approve_workflows, can_manage_api_keys, can_manage_integrations, is_active, clerk_event_at)
-VALUES (sqlc.arg(org_id), sqlc.arg(clerk_user_id), sqlc.arg(email), sqlc.arg(full_name), sqlc.arg(role), sqlc.arg(can_approve_workflows), sqlc.arg(can_manage_api_keys), sqlc.arg(can_manage_integrations), true, sqlc.narg(event_at)::timestamptz)
+--
+-- clerk_role is the role Clerk reports. users.role (what the app enforces) is
+-- replaced only when Clerk's role changed or the membership is new/reactivated;
+-- the permission flags are recomputed in exactly those cases, so a promotion
+-- made in Clerk doesn't leave an admin with a member's flags. An unrelated
+-- membership event leaves both alone, so an app-side demotion sticks.
+INSERT INTO users (org_id, clerk_user_id, email, full_name, role, clerk_role, can_approve_workflows, can_manage_api_keys, can_manage_integrations, is_active, clerk_event_at)
+VALUES (sqlc.arg(org_id), sqlc.arg(clerk_user_id), sqlc.arg(email), sqlc.arg(full_name), sqlc.arg(role), sqlc.arg(role), sqlc.arg(can_approve_workflows), sqlc.arg(can_manage_api_keys), sqlc.arg(can_manage_integrations), true, sqlc.narg(event_at)::timestamptz)
 ON CONFLICT (org_id, clerk_user_id) DO UPDATE SET
-    role = EXCLUDED.role,
+    role = CASE WHEN NOT users.is_active OR users.clerk_role IS DISTINCT FROM EXCLUDED.clerk_role THEN EXCLUDED.role ELSE users.role END,
+    can_approve_workflows = CASE WHEN NOT users.is_active OR users.clerk_role IS DISTINCT FROM EXCLUDED.clerk_role THEN EXCLUDED.can_approve_workflows ELSE users.can_approve_workflows END,
+    can_manage_api_keys = CASE WHEN NOT users.is_active OR users.clerk_role IS DISTINCT FROM EXCLUDED.clerk_role THEN EXCLUDED.can_manage_api_keys ELSE users.can_manage_api_keys END,
+    can_manage_integrations = CASE WHEN NOT users.is_active OR users.clerk_role IS DISTINCT FROM EXCLUDED.clerk_role THEN EXCLUDED.can_manage_integrations ELSE users.can_manage_integrations END,
+    clerk_role = EXCLUDED.clerk_role,
     is_active = true,
-    can_approve_workflows = CASE WHEN users.is_active THEN users.can_approve_workflows ELSE EXCLUDED.can_approve_workflows END,
-    can_manage_api_keys = CASE WHEN users.is_active THEN users.can_manage_api_keys ELSE EXCLUDED.can_manage_api_keys END,
-    can_manage_integrations = CASE WHEN users.is_active THEN users.can_manage_integrations ELSE EXCLUDED.can_manage_integrations END,
     clerk_event_at = GREATEST(users.clerk_event_at, EXCLUDED.clerk_event_at)
 WHERE users.clerk_event_at IS NULL OR EXCLUDED.clerk_event_at IS NULL OR EXCLUDED.clerk_event_at >= users.clerk_event_at;
 

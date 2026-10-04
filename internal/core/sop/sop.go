@@ -2,18 +2,16 @@ package sop
 
 import (
 	"fmt"
+	"github.com/founderstack/api/internal/pkg/cronutil"
 	"regexp"
 	"sort"
 	"strings"
-
-	cron "github.com/robfig/cron/v3"
 )
 
 // Mirrors internal/api/agents' own limits and defaults, so a SOP can never
 // produce an agent the agents API itself would have rejected.
 const (
 	DefaultAgentType       = "specialist"
-	DefaultModel           = "claude-sonnet-5"
 	DefaultMaxOutputTokens = int32(4096)
 	DefaultTemperature     = 0.3
 	MinSystemPromptLen     = 50
@@ -254,9 +252,8 @@ func Render(s Spec, o Overrides) (AgentConfig, *WorkflowConfig) {
 	if a.AgentType == "" {
 		a.AgentType = DefaultAgentType
 	}
-	if a.Model == "" {
-		a.Model = DefaultModel
-	}
+	// An empty model is filled in at deploy time from the target workspace's
+	// own provider (a SOP is written once and runs under many providers).
 	if a.MaxOutputTokens == nil {
 		v := DefaultMaxOutputTokens
 		a.MaxOutputTokens = &v
@@ -356,7 +353,7 @@ func validateCron(expr *string) error {
 	if expr == nil || strings.TrimSpace(*expr) == "" {
 		return invalid("CRON_EXPRESSION_REQUIRED", "cron_expression is required for a scheduled workflow")
 	}
-	if _, err := cron.ParseStandard(*expr); err != nil {
+	if _, err := cronutil.Validate(*expr); err != nil {
 		return invalid("INVALID_CRON_EXPRESSION", "Invalid cron_expression: %v", err)
 	}
 	return nil

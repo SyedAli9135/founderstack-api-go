@@ -136,14 +136,15 @@ func (q *Queries) UpsertOrganization(ctx context.Context, arg UpsertOrganization
 }
 
 const upsertUserForMembership = `-- name: UpsertUserForMembership :execrows
-INSERT INTO users (org_id, clerk_user_id, email, full_name, role, can_approve_workflows, can_manage_api_keys, can_manage_integrations, is_active, clerk_event_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9::timestamptz)
+INSERT INTO users (org_id, clerk_user_id, email, full_name, role, clerk_role, can_approve_workflows, can_manage_api_keys, can_manage_integrations, is_active, clerk_event_at)
+VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, true, $9::timestamptz)
 ON CONFLICT (org_id, clerk_user_id) DO UPDATE SET
-    role = EXCLUDED.role,
+    role = CASE WHEN NOT users.is_active OR users.clerk_role IS DISTINCT FROM EXCLUDED.clerk_role THEN EXCLUDED.role ELSE users.role END,
+    can_approve_workflows = CASE WHEN NOT users.is_active OR users.clerk_role IS DISTINCT FROM EXCLUDED.clerk_role THEN EXCLUDED.can_approve_workflows ELSE users.can_approve_workflows END,
+    can_manage_api_keys = CASE WHEN NOT users.is_active OR users.clerk_role IS DISTINCT FROM EXCLUDED.clerk_role THEN EXCLUDED.can_manage_api_keys ELSE users.can_manage_api_keys END,
+    can_manage_integrations = CASE WHEN NOT users.is_active OR users.clerk_role IS DISTINCT FROM EXCLUDED.clerk_role THEN EXCLUDED.can_manage_integrations ELSE users.can_manage_integrations END,
+    clerk_role = EXCLUDED.clerk_role,
     is_active = true,
-    can_approve_workflows = CASE WHEN users.is_active THEN users.can_approve_workflows ELSE EXCLUDED.can_approve_workflows END,
-    can_manage_api_keys = CASE WHEN users.is_active THEN users.can_manage_api_keys ELSE EXCLUDED.can_manage_api_keys END,
-    can_manage_integrations = CASE WHEN users.is_active THEN users.can_manage_integrations ELSE EXCLUDED.can_manage_integrations END,
     clerk_event_at = GREATEST(users.clerk_event_at, EXCLUDED.clerk_event_at)
 WHERE users.clerk_event_at IS NULL OR EXCLUDED.clerk_event_at IS NULL OR EXCLUDED.clerk_event_at >= users.clerk_event_at
 `
@@ -178,6 +179,12 @@ type UpsertUserForMembershipParams struct {
 // written by workspace creation): an event older than the newest one already
 // applied to this membership changes nothing, so a retried "created" can't
 // undo a later removal and a stale "updated" can't revert a role.
+//
+// clerk_role is the role Clerk reports. users.role (what the app enforces) is
+// replaced only when Clerk's role changed or the membership is new/reactivated;
+// the permission flags are recomputed in exactly those cases, so a promotion
+// made in Clerk doesn't leave an admin with a member's flags. An unrelated
+// membership event leaves both alone, so an app-side demotion sticks.
 func (q *Queries) UpsertUserForMembership(ctx context.Context, arg UpsertUserForMembershipParams) (int64, error) {
 	result, err := q.db.Exec(ctx, upsertUserForMembership,
 		arg.OrgID,

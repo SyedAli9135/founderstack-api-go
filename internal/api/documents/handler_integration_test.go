@@ -1208,10 +1208,10 @@ func TestDocumentsHandler_IngestAndSearchAreRateLimitedPerWorkspace(t *testing.T
 	cfg := testConfig(t)
 	rdb := newTestRedis(t)
 
-	origUploads, origBytes, origReindex, origSearch := uploadsPerHour, uploadBytesPerHour, reindexesPerHour, uncachedSearchPerMin
-	uploadsPerHour, uploadBytesPerHour, reindexesPerHour, uncachedSearchPerMin = 2, 1000, 1, 1
+	origUploads, origBytes, origReindex, origSearch := uploadsPerHourLimit, uploadBytesPerHourLimit, reindexesPerHourLimit, uncachedSearchPerMinLimit
+	uploadsPerHourLimit, uploadBytesPerHourLimit, reindexesPerHourLimit, uncachedSearchPerMinLimit = 2, 1000, 1, 1
 	t.Cleanup(func() {
-		uploadsPerHour, uploadBytesPerHour, reindexesPerHour, uncachedSearchPerMin = origUploads, origBytes, origReindex, origSearch
+		uploadsPerHourLimit, uploadBytesPerHourLimit, reindexesPerHourLimit, uncachedSearchPerMinLimit = origUploads, origBytes, origReindex, origSearch
 	})
 
 	orgA, adminA := testOrgAndUserWithRole(t, systemPool, "admin")

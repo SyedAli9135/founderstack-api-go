@@ -453,7 +453,7 @@ func (h *Handler) Run(c *gin.Context) {
 		if err != nil {
 			return err
 		}
-		if active >= graph.MaxActiveRunsPerOrg {
+		if int(active) >= graph.MaxActiveRunsPerOrg {
 			tooManyRuns = true
 			return nil
 		}

@@ -116,10 +116,10 @@ func (l *Launcher) Preflight(ctx context.Context, orgID pgtype.UUID) error {
 	return nil
 }
 
-// MaxActiveRunsPerOrg caps top-level runs in flight per workspace, for manual
+// MaxActiveRunsPerOrg (set from MAX_ACTIVE_RUNS_PER_ORG at boot) caps top-level runs in flight per workspace, for manual
 // workflow runs and team runs alike: each run spends the customer's own LLM
 // key and holds a goroutine, and a team run fans out to several more.
-const MaxActiveRunsPerOrg = 10
+var MaxActiveRunsPerOrg = 10
 
 // Launch resolves RunDeps and runs the workflow in a detached goroutine
 // (context.Background(), never the caller's request context).

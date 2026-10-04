@@ -219,3 +219,32 @@ func TestBillingHandler_Ledger(t *testing.T) {
 		t.Errorf("Entries[0].EstimatedCostUsd = %v, want 3.0 (most recent first)", env.Data.Entries[0].EstimatedCostUsd)
 	}
 }
+
+// Spend totals and the itemized ledger are financial detail; a viewer sees
+// outcomes (runs, hours saved) but not what the workspace is spending.
+func TestBillingHandler_ViewersCannotSeeSpend(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg)
+	_, clerkUserID := testOrgAndUser(t, systemPool)
+
+	for _, role := range []string{"admin", "member"} {
+		if _, err := systemPool.Exec(context.Background(), "update users set role = $1 where clerk_user_id = $2", role, clerkUserID); err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range []string{"/api/v1/billing/usage", "/api/v1/billing/ledger"} {
+			if rec := authedGet(t, router, cfg, clerkUserID, path); rec.Code != http.StatusOK {
+				t.Fatalf("%s as %s = %d, want 200", path, role, rec.Code)
+			}
+		}
+	}
+	if _, err := systemPool.Exec(context.Background(), "update users set role = 'viewer' where clerk_user_id = $1", clerkUserID); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/api/v1/billing/usage", "/api/v1/billing/ledger"} {
+		if rec := authedGet(t, router, cfg, clerkUserID, path); rec.Code != http.StatusForbidden {
+			t.Fatalf("%s as viewer = %d, want 403", path, rec.Code)
+		}
+	}
+}

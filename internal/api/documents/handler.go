@@ -34,15 +34,32 @@ import (
 
 const maxUploadBytes = 50 << 20
 
+// SetLimits overrides the per-workspace ceilings below (from configuration).
+// Call it before NewHandler; a non-positive value keeps the current one.
+func SetLimits(uploadsPerHour, uploadMBPerHour, reindexesPerHour, searchesPerMinute int) {
+	if uploadsPerHour > 0 {
+		uploadsPerHourLimit = int64(uploadsPerHour)
+	}
+	if uploadMBPerHour > 0 {
+		uploadBytesPerHourLimit = int64(uploadMBPerHour) << 20
+	}
+	if reindexesPerHour > 0 {
+		reindexesPerHourLimit = int64(reindexesPerHour)
+	}
+	if searchesPerMinute > 0 {
+		uncachedSearchPerMinLimit = int64(searchesPerMinute)
+	}
+}
+
 // Ingesting and searching documents spends the platform's own Cohere key, not
 // the customer's, and deleting a file frees its storage quota — so quota alone
 // doesn't stop a delete-and-reupload loop. These are per workspace, and vars
 // so tests can shrink them.
 var (
-	uploadsPerHour       int64 = 30
-	uploadBytesPerHour   int64 = 250 << 20
-	reindexesPerHour     int64 = 20
-	uncachedSearchPerMin int64 = 120
+	uploadsPerHourLimit       int64 = 30
+	uploadBytesPerHourLimit   int64 = 250 << 20
+	reindexesPerHourLimit     int64 = 20
+	uncachedSearchPerMinLimit int64 = 120
 )
 
 // Checked here at the API boundary; internal/core/documents.ExtractText independently
@@ -83,10 +100,10 @@ func NewHandlerWithResolver(appPool *pgxpool.Pool, store coredocs.BlobStore, pro
 	return &Handler{
 		appPool: appPool, store: store, processor: processor, searcher: searcher,
 		redis: rdb, encryptionKey: encryptionKey, resolveChatClient: resolveChatClient,
-		uploads:     ratelimit.New(rdb, uploadsPerHour, time.Hour),
-		uploadBytes: ratelimit.New(rdb, uploadBytesPerHour, time.Hour),
-		reindexes:   ratelimit.New(rdb, reindexesPerHour, time.Hour),
-		searches:    ratelimit.New(rdb, uncachedSearchPerMin, time.Minute),
+		uploads:     ratelimit.New(rdb, uploadsPerHourLimit, time.Hour),
+		uploadBytes: ratelimit.New(rdb, uploadBytesPerHourLimit, time.Hour),
+		reindexes:   ratelimit.New(rdb, reindexesPerHourLimit, time.Hour),
+		searches:    ratelimit.New(rdb, uncachedSearchPerMinLimit, time.Minute),
 	}
 }
 
@@ -497,7 +514,7 @@ func logProcessingError(op string, docID pgtype.UUID, err error) {
 // fastest/cheapest publicly available chat model, not whatever model an
 // agent happens to be configured with (search isn't agent-scoped).
 var hydeModelByProvider = map[llm.ProviderID]string{
-	llm.ProviderAnthropic: "claude-3-5-haiku-20241022",
+	llm.ProviderAnthropic: "claude-haiku-4-5-20251001",
 	llm.ProviderOpenAI:    "gpt-4o-mini",
 	llm.ProviderGemini:    "gemini-2.0-flash",
 	llm.ProviderQwen:      "qwen-turbo",

@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -330,8 +331,8 @@ func TestOrgHandler_UpdateRole_DerivesPermissionsAndSyncsToClerk(t *testing.T) {
 		t.Fatalf("Clerk UpdateRole calls = %d, want 1", len(syncer.updateCalls))
 	}
 	call := syncer.updateCalls[0]
-	if call.clerkOrgID != fx.clerkOrgID || call.clerkUserID != fx.memberClerkID || call.role != "admin" {
-		t.Fatalf("UpdateRole called with %+v, want org=%s user=%s role=admin", call, fx.clerkOrgID, fx.memberClerkID)
+	if call.clerkOrgID != fx.clerkOrgID || call.clerkUserID != fx.memberClerkID || call.role != "org:admin" {
+		t.Fatalf("UpdateRole called with %+v, want org=%s user=%s role=org:admin", call, fx.clerkOrgID, fx.memberClerkID)
 	}
 }
 
@@ -733,5 +734,75 @@ func TestOrgHandler_Remove_AdminCannotRemoveOwner(t *testing.T) {
 	defer syncer.mu.Unlock()
 	if len(syncer.removeCalls) != 0 {
 		t.Errorf("Clerk Remove called %d times for a refused removal, want 0", len(syncer.removeCalls))
+	}
+}
+
+// Clerk only knows org:admin and org:member, so a viewer is sent as a member,
+// and the role Clerk now holds is recorded so its echo webhook is recognised.
+func TestOrgHandler_UpdateRole_SendsClerkRoleKeysAndRecordsTheSyncedRole(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	fx := newTestOrg(t, systemPool)
+	syncer := &fakeMembershipSyncer{}
+	router := testRouter(t, systemPool, appPool, cfg, syncer)
+
+	patch := func(role string) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]string{"role": role})
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, authedRequest(t, cfg, fx.adminClerkID, http.MethodPatch, "/api/v1/org/members/"+fx.memberID.String()+"/role", body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PATCH role=%s = %d, %s", role, rec.Code, rec.Body.String())
+		}
+	}
+	clerkRole := func() string {
+		var r *string
+		if err := systemPool.QueryRow(context.Background(), "select clerk_role from users where id = $1", fx.memberID).Scan(&r); err != nil {
+			t.Fatal(err)
+		}
+		if r == nil {
+			return ""
+		}
+		return *r
+	}
+
+	patch("viewer")
+	if got := syncer.updateCalls[len(syncer.updateCalls)-1].role; got != "org:member" {
+		t.Errorf("viewer was sent to Clerk as %q, want org:member", got)
+	}
+	if got := clerkRole(); got != "member" {
+		t.Errorf("clerk_role after demotion to viewer = %q, want member", got)
+	}
+	patch("admin")
+	if got := syncer.updateCalls[len(syncer.updateCalls)-1].role; got != "org:admin" {
+		t.Errorf("admin was sent to Clerk as %q, want org:admin", got)
+	}
+	if got := clerkRole(); got != "admin" {
+		t.Errorf("clerk_role after promotion = %q, want admin", got)
+	}
+}
+
+func TestOrgHandler_UpdateRole_FailedClerkSyncLeavesTheRecordedClerkRoleAlone(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	fx := newTestOrg(t, systemPool)
+	syncer := &fakeMembershipSyncer{updateErr: errors.New("clerk is down")}
+	router := testRouter(t, systemPool, appPool, cfg, syncer)
+
+	var before *string
+	_ = systemPool.QueryRow(context.Background(), "select clerk_role from users where id = $1", fx.memberID).Scan(&before)
+
+	body, _ := json.Marshal(map[string]string{"role": "admin"})
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, authedRequest(t, cfg, fx.adminClerkID, http.MethodPatch, "/api/v1/org/members/"+fx.memberID.String()+"/role", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (local change stands)", rec.Code)
+	}
+	var after *string
+	_ = systemPool.QueryRow(context.Background(), "select clerk_role from users where id = $1", fx.memberID).Scan(&after)
+	if (before == nil) != (after == nil) || (before != nil && *before != *after) {
+		t.Fatalf("clerk_role changed from %v to %v although Clerk never accepted the role", before, after)
 	}
 }

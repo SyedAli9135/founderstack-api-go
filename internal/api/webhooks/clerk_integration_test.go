@@ -291,14 +291,11 @@ func TestClerkWebhook_FullLifecycle(t *testing.T) {
 		if role != "member" {
 			t.Fatalf("role = %q, want %q", role, "member")
 		}
-		// The user was active throughout this role change (created as
-		// org:admin, never removed) — its permission flags must survive
-		// untouched even though the new role would compute false for all 3.
-		// A membership re-sync must never silently clobber a flag that
-		// could since have been hand-adjusted via workflow 13's PATCH
-		// .../role.
-		if !canApprove || !canManageKeys || !canManageIntegrations {
-			t.Fatalf("flags = (%v, %v, %v), want all true — an active member's flags must not reset on a role-changing re-sync",
+		// Clerk really changed this person's role (org:admin -> org:member), so
+		// the permission flags follow it. Keeping the admin-era flags would
+		// leave a demoted member able to manage keys, integrations and approvals.
+		if canApprove || canManageKeys || canManageIntegrations {
+			t.Fatalf("flags = (%v, %v, %v), want all false — a role demoted in Clerk must take the flags with it",
 				canApprove, canManageKeys, canManageIntegrations)
 		}
 	})
@@ -331,14 +328,17 @@ func TestClerkWebhook_FullLifecycle(t *testing.T) {
 	})
 
 	t.Run("organizationMembership.created after removal resets stale permission flags", func(t *testing.T) {
-		// Regression test for a real bug found live 2026-09-07: userClerkID
-		// is currently is_active=false with can_approve_workflows/
-		// can_manage_api_keys/can_manage_integrations all still true from
-		// its original org:admin creation earlier in this test. A brand new
-		// membership (this user was removed, then re-invited as a plain
-		// member) must reset those stale admin-era flags to the new role's
-		// default — unlike the still-active case above, there's no existing
-		// grant here worth protecting; the prior membership is over.
+		// Regression test for a real bug found live 2026-09-07: a removed
+		// member's row keeps its old admin-era flags. Recreate that stale state
+		// explicitly (role changes in Clerk now recompute flags, so nothing
+		// earlier in this test leaves them true).
+		if _, err := pool.Exec(context.Background(),
+			"update users set can_approve_workflows = true, can_manage_api_keys = true, can_manage_integrations = true where clerk_user_id = $1", userClerkID); err != nil {
+			t.Fatal(err)
+		}
+		// A brand new membership (this user was removed, then re-invited as a
+		// plain member) must reset those stale admin-era flags to the new
+		// role's default: the prior membership is over.
 		rec := postWebhook(t, router, secretBytes, map[string]any{
 			"type": "organizationMembership.created",
 			"data": map[string]any{
@@ -896,4 +896,88 @@ func TestClerkWebhook_MembershipEventsWithoutIDsAreAckedAndWriteNothing(t *testi
 	if after != before {
 		t.Fatalf("rows with an empty clerk_user_id went from %d to %d", before, after)
 	}
+}
+
+// users.role is what the app enforces and can be finer-grained than Clerk's
+// (a viewer; a demotion that didn't reach Clerk). A membership event that
+// carries the role Clerk already had must not undo it, while a role that
+// genuinely changed in Clerk must apply — flags included.
+func TestClerkWebhook_RoleOnlyFollowsGenuineClerkChanges(t *testing.T) {
+	pool := testPool(t)
+	secret, secretBytes := testSecret(t)
+	router := testRouter(t, pool, secret)
+
+	suffix := response.NewID()[:12]
+	orgClerkID, userClerkID := "org_role_"+suffix, "user_role_"+suffix
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_, _ = pool.Exec(ctx, "delete from users where clerk_user_id = $1", userClerkID)
+		_, _ = pool.Exec(ctx, "delete from organizations where clerk_org_id = $1", orgClerkID)
+	})
+	if rec := postWebhook(t, router, secretBytes, map[string]any{
+		"type": "organization.created",
+		"data": map[string]any{"id": orgClerkID, "name": "Role Org", "slug": "role-" + suffix},
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("org create = %d", rec.Code)
+	}
+	membership := func(typ, role string) {
+		t.Helper()
+		rec := postWebhook(t, router, secretBytes, map[string]any{
+			"type": typ,
+			"data": map[string]any{
+				"organization":     map[string]any{"id": orgClerkID, "name": "Role Org", "slug": "role-" + suffix},
+				"public_user_data": map[string]any{"user_id": userClerkID, "identifier": "role@example.invalid"},
+				"role":             role,
+			},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s = %d", typ, role, rec.Code)
+		}
+	}
+	state := func() (role string, canManageKeys bool) {
+		t.Helper()
+		if err := pool.QueryRow(context.Background(), "select role, can_manage_api_keys from users where clerk_user_id = $1", userClerkID).Scan(&role, &canManageKeys); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	setLocal := func(role string, flag bool) {
+		t.Helper()
+		if _, err := pool.Exec(context.Background(), "update users set role = $1, can_manage_api_keys = $2 where clerk_user_id = $3", role, flag, userClerkID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	membership("organizationMembership.created", "org:member")
+
+	t.Run("an unrelated event doesn't undo an app-side role (a viewer stays a viewer)", func(t *testing.T) {
+		setLocal("viewer", false)
+		membership("organizationMembership.updated", "org:member")
+		if role, _ := state(); role != "viewer" {
+			t.Fatalf("role = %q after an unrelated event, want viewer", role)
+		}
+	})
+
+	t.Run("an admin demoted in the app isn't re-promoted by a later event", func(t *testing.T) {
+		membership("organizationMembership.updated", "org:admin") // Clerk really changed: now admin
+		if role, keys := state(); role != "admin" || !keys {
+			t.Fatalf("after a real Clerk promotion: role=%q keys=%v, want admin/true", role, keys)
+		}
+		setLocal("member", false) // the app demotes them (Clerk never got the change)
+		membership("organizationMembership.updated", "org:admin")
+		if role, keys := state(); role != "member" || keys {
+			t.Fatalf("a repeat of Clerk's old role re-promoted them: role=%q keys=%v, want member/false", role, keys)
+		}
+	})
+
+	t.Run("a real Clerk-side change applies and recomputes the flags", func(t *testing.T) {
+		membership("organizationMembership.updated", "org:member") // Clerk really changed: admin -> member
+		if role, keys := state(); role != "member" || keys {
+			t.Fatalf("after a real Clerk demotion: role=%q keys=%v, want member/false", role, keys)
+		}
+		membership("organizationMembership.updated", "org:admin") // and back: member -> admin
+		if role, keys := state(); role != "admin" || !keys {
+			t.Fatalf("a promotion in Clerk left role=%q keys=%v, want admin/true — flags must follow the role", role, keys)
+		}
+	})
 }

@@ -124,3 +124,26 @@ func TestSettingsAPIKey_Usage_CrossOrgIsolation(t *testing.T) {
 		t.Fatalf("usage = %+v, want all-zero — another org's cost_ledger rows must not leak in", env.Data)
 	}
 }
+
+func TestSettingsAPIKey_Usage_ViewersCannotSeeSpend(t *testing.T) {
+	appPool := testAppPool(t)
+	systemPool := testSystemPool(t)
+	cfg := testConfig(t)
+	router := testRouter(t, systemPool, appPool, cfg, testEncryptionKey(t))
+	_, clerkUserID := testOrgAndUserWithOrgID(t, systemPool)
+
+	get := func() int {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, authedRequest(t, cfg, clerkUserID, http.MethodGet, "/api/v1/settings/api-key/usage", nil))
+		return rec.Code
+	}
+	if code := get(); code != http.StatusOK {
+		t.Fatalf("as admin = %d, want 200", code)
+	}
+	if _, err := systemPool.Exec(context.Background(), "update users set role = 'viewer' where clerk_user_id = $1", clerkUserID); err != nil {
+		t.Fatal(err)
+	}
+	if code := get(); code != http.StatusForbidden {
+		t.Fatalf("as viewer = %d, want 403", code)
+	}
+}

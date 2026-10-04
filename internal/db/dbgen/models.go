@@ -333,6 +333,7 @@ type User struct {
 	IsActive              *bool              `json:"is_active"`
 	LastLoginAt           pgtype.Timestamptz `json:"last_login_at"`
 	ClerkEventAt          pgtype.Timestamptz `json:"clerk_event_at"`
+	ClerkRole             *string            `json:"clerk_role"`
 }
 
 type VectorNamespace struct {

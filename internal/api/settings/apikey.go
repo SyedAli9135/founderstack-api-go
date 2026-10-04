@@ -371,6 +371,11 @@ func (h *Handler) APIKeyUsage(c *gin.Context) {
 		return
 	}
 
+	if user.Role == "viewer" {
+		response.Fail(c, http.StatusForbidden, "NOT_AUTHORIZED", "Viewers can see outcomes but not spend")
+		return
+	}
+
 	now := time.Now().UTC()
 	startOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 

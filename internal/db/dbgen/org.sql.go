@@ -115,6 +115,24 @@ func (q *Queries) ListOrgMembers(ctx context.Context, orgID pgtype.UUID) ([]List
 	return items, nil
 }
 
+const setMemberClerkRole = `-- name: SetMemberClerkRole :exec
+UPDATE users SET clerk_role = $3 WHERE org_id = $1 AND id = $2
+`
+
+type SetMemberClerkRoleParams struct {
+	OrgID     pgtype.UUID `json:"org_id"`
+	ID        pgtype.UUID `json:"id"`
+	ClerkRole *string     `json:"clerk_role"`
+}
+
+// Recorded after the app's own role change has reached Clerk, so the webhook
+// Clerk then sends (carrying that same role) isn't mistaken for a Clerk-side
+// change that should overwrite the app's finer-grained role.
+func (q *Queries) SetMemberClerkRole(ctx context.Context, arg SetMemberClerkRoleParams) error {
+	_, err := q.db.Exec(ctx, setMemberClerkRole, arg.OrgID, arg.ID, arg.ClerkRole)
+	return err
+}
+
 const updateMemberRoleAndPermissions = `-- name: UpdateMemberRoleAndPermissions :exec
 UPDATE users
 SET role = $3, can_manage_api_keys = $4, can_manage_integrations = $5, can_approve_workflows = $6
