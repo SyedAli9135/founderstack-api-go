@@ -397,13 +397,21 @@ func TestClerkWebhook_FullLifecycle(t *testing.T) {
 		}
 
 		var isActive bool
+		var email, clerkID string
+		var fullName *string
 		if err := pool.QueryRow(context.Background(),
-			"select is_active from users where clerk_user_id = $1", userClerkID2,
-		).Scan(&isActive); err != nil {
-			t.Fatalf("user row missing after user.deleted (should survive): %v", err)
+			`select u.is_active, u.email, u.full_name, u.clerk_user_id from users u join organizations o on o.id = u.org_id
+			 where o.clerk_org_id = $1 and u.email like 'erased-%'`, orgClerkID,
+		).Scan(&isActive, &email, &fullName, &clerkID); err != nil {
+			t.Fatalf("anonymized user row missing after user.deleted (it should survive, scrubbed): %v", err)
 		}
-		if isActive {
-			t.Fatal("is_active = true, want false after user.deleted")
+		if isActive || fullName != nil || clerkID == userClerkID2 {
+			t.Fatalf("after user.deleted: active=%v name=%v clerk_user_id=%q — want inactive, no name, no Clerk id", isActive, fullName, clerkID)
+		}
+		var leftover int
+		_ = pool.QueryRow(context.Background(), "select count(*) from users where clerk_user_id = $1 or email = 'cofounder@example.com'", userClerkID2).Scan(&leftover)
+		if leftover != 0 {
+			t.Fatal("identifying fields of the deleted user are still stored")
 		}
 	})
 
@@ -696,14 +704,19 @@ func TestClerkWebhook_MultiOrgMembership(t *testing.T) {
 
 	t.Run("user.deleted deactivates every membership", func(t *testing.T) {
 		membership("organizationMembership.created", orgA)
+		before := len(activeRows())
 		rec := postWebhook(t, router, secretBytes, map[string]any{"type": "user.deleted", "data": map[string]any{"id": userID}})
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d", rec.Code)
 		}
-		for org, active := range activeRows() {
-			if active {
-				t.Fatalf("membership in %s still active after user.deleted", org)
-			}
+		if len(activeRows()) != 0 {
+			t.Fatal("rows still found under the deleted account's Clerk id")
+		}
+		var erased, stillActive int
+		_ = pool.QueryRow(ctx, `select count(*), count(*) filter (where u.is_active) from users u join organizations o on o.id = u.org_id
+			where o.clerk_org_id in ($1, $2) and u.email like 'erased-%'`, orgA, orgB).Scan(&erased, &stillActive)
+		if erased != before || stillActive != 0 {
+			t.Fatalf("erased %d of %d memberships, %d still active", erased, before, stillActive)
 		}
 	})
 }
@@ -843,8 +856,14 @@ func TestClerkWebhook_StaleEventsCannotUndoNewerOnes(t *testing.T) {
 			t.Fatal("a user.deleted older than the membership must not deactivate it")
 		}
 		userDeleted(9000)
-		if active, _ := state(); active {
-			t.Fatal("a newer user.deleted should deactivate")
+		var active bool
+		var email string
+		if err := pool.QueryRow(context.Background(), `select u.is_active, u.email from users u join organizations o on o.id = u.org_id
+			where o.clerk_org_id = $1`, orgClerkID).Scan(&active, &email); err != nil {
+			t.Fatal(err)
+		}
+		if active || email == "stale@example.com" {
+			t.Fatalf("a newer user.deleted should deactivate and scrub (active=%v email=%q)", active, email)
 		}
 	})
 }

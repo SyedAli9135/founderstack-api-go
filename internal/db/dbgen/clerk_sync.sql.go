@@ -11,6 +11,39 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const eraseUserByClerkUserID = `-- name: EraseUserByClerkUserID :execrows
+WITH erased AS (
+    UPDATE users SET is_active = false, can_manage_api_keys = false, can_manage_integrations = false,
+           can_approve_workflows = false, full_name = NULL, avatar_url = NULL,
+           email = 'erased-' || id::text || '@erased.invalid',
+           clerk_user_id = 'erased:' || id::text,
+           clerk_event_at = GREATEST(clerk_event_at, $1::timestamptz)
+    WHERE clerk_user_id = $2
+      AND (clerk_event_at IS NULL OR $1::timestamptz IS NULL OR $1::timestamptz >= clerk_event_at)
+    RETURNING id
+), subs AS (
+    DELETE FROM push_subscriptions WHERE user_id IN (SELECT id FROM erased)
+)
+SELECT 1 FROM erased
+`
+
+type EraseUserByClerkUserIDParams struct {
+	EventAt     pgtype.Timestamptz `json:"event_at"`
+	ClerkUserID string             `json:"clerk_user_id"`
+}
+
+// Account deletion (user.deleted) is final, so unlike a membership removal it
+// also scrubs the person's identifying fields. The row stays (audit history,
+// run attribution) but no longer says who it was. A stale event (older than
+// the newest applied to the row) is ignored, like every other membership write.
+func (q *Queries) EraseUserByClerkUserID(ctx context.Context, arg EraseUserByClerkUserIDParams) (int64, error) {
+	result, err := q.db.Exec(ctx, eraseUserByClerkUserID, arg.EventAt, arg.ClerkUserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getOrganizationIDByClerkOrgID = `-- name: GetOrganizationIDByClerkOrgID :one
 SELECT id FROM organizations WHERE clerk_org_id = $1
 `
@@ -46,7 +79,7 @@ func (q *Queries) SoftDeleteMembership(ctx context.Context, arg SoftDeleteMember
 }
 
 const softDeleteOrganizationByClerkOrgID = `-- name: SoftDeleteOrganizationByClerkOrgID :execrows
-UPDATE organizations SET is_active = false WHERE clerk_org_id = $1
+UPDATE organizations SET is_active = false, deactivated_at = COALESCE(deactivated_at, now()) WHERE clerk_org_id = $1
 `
 
 func (q *Queries) SoftDeleteOrganizationByClerkOrgID(ctx context.Context, clerkOrgID string) (int64, error) {

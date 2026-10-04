@@ -40,6 +40,7 @@ func NewHandler(appPool *pgxpool.Pool, syncer MembershipSyncer, invitations Invi
 
 func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/org/members", h.List)
+	rg.GET("/org/export", h.Export)
 	rg.PATCH("/org/members/:user_id/role", h.UpdateRole)
 	rg.DELETE("/org/members/:user_id", h.Remove)
 	rg.GET("/org/invitations", h.ListInvitations)

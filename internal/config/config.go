@@ -145,6 +145,14 @@ type Config struct {
 	// own kill timeout (30s on most) minus the 10s HTTP drain.
 	ShutdownGraceSeconds int `mapstructure:"SHUTDOWN_GRACE_SECONDS"`
 
+	// Retention, in days. Audit and cost history keep two years by default
+	// (billing disputes, compliance look-backs); traces are bulky and short-lived.
+	RetentionAuditDays        int `mapstructure:"RETENTION_AUDIT_DAYS"`
+	RetentionCostDays         int `mapstructure:"RETENTION_COST_DAYS"`
+	RetentionStepsDays        int `mapstructure:"RETENTION_STEPS_DAYS"`
+	RetentionReportsGraceDays int `mapstructure:"RETENTION_REPORTS_GRACE_DAYS"`
+	RetentionStripeEventsDays int `mapstructure:"RETENTION_STRIPE_EVENTS_DAYS"`
+
 	// ClerkAuthorizedParties lists the browser origins whose Clerk session
 	// tokens are accepted (the token's "azp" claim). Empty means: any origin in
 	// development, and FRONTEND_URL's origin in production.
@@ -333,24 +341,29 @@ func Load() (*Config, error) {
 		"DEV_TOKEN_SECRET":        "",
 		"MOCK_LLM_MODE":           false,
 
-		"BREVO_API_KEY":             "",
-		"BREVO_FROM_EMAIL":          "",
-		"WEBPUSH_VAPID_PUBLIC_KEY":  "",
-		"WEBPUSH_VAPID_PRIVATE_KEY": "",
-		"WEBPUSH_VAPID_SUBJECT":     "",
-		"PUSH_ACTION_TOKEN_SECRET":  "",
-		"A2A_TASK_TOKEN_SECRET":     "",
-		"DIGEST_UNSUBSCRIBE_SECRET": "",
-		"TRUSTED_PROXIES":           "",
-		"CLERK_AUTHORIZED_PARTIES":  "",
-		"DOCS_UPLOADS_PER_HOUR":     30,
-		"DOCS_UPLOAD_MB_PER_HOUR":   250,
-		"DOCS_REINDEXES_PER_HOUR":   20,
-		"DOCS_SEARCHES_PER_MINUTE":  120,
-		"MAX_ACTIVE_RUNS_PER_ORG":   10,
-		"SHUTDOWN_GRACE_SECONDS":    15,
-		"STRIPE_SECRET_KEY":         "",
-		"STRIPE_WEBHOOK_SECRET":     "",
+		"BREVO_API_KEY":                "",
+		"BREVO_FROM_EMAIL":             "",
+		"WEBPUSH_VAPID_PUBLIC_KEY":     "",
+		"WEBPUSH_VAPID_PRIVATE_KEY":    "",
+		"WEBPUSH_VAPID_SUBJECT":        "",
+		"PUSH_ACTION_TOKEN_SECRET":     "",
+		"A2A_TASK_TOKEN_SECRET":        "",
+		"DIGEST_UNSUBSCRIBE_SECRET":    "",
+		"TRUSTED_PROXIES":              "",
+		"CLERK_AUTHORIZED_PARTIES":     "",
+		"DOCS_UPLOADS_PER_HOUR":        30,
+		"DOCS_UPLOAD_MB_PER_HOUR":      250,
+		"DOCS_REINDEXES_PER_HOUR":      20,
+		"DOCS_SEARCHES_PER_MINUTE":     120,
+		"MAX_ACTIVE_RUNS_PER_ORG":      10,
+		"SHUTDOWN_GRACE_SECONDS":       15,
+		"RETENTION_AUDIT_DAYS":         730,
+		"RETENTION_COST_DAYS":          730,
+		"RETENTION_STEPS_DAYS":         180,
+		"RETENTION_REPORTS_GRACE_DAYS": 30,
+		"RETENTION_STRIPE_EVENTS_DAYS": 90,
+		"STRIPE_SECRET_KEY":            "",
+		"STRIPE_WEBHOOK_SECRET":        "",
 	}
 	for key, def := range defaults {
 		v.SetDefault(key, def)

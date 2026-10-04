@@ -62,13 +62,32 @@ WHERE users.clerk_event_at IS NULL OR EXCLUDED.clerk_event_at IS NULL OR EXCLUDE
 UPDATE users SET full_name = $2, avatar_url = $3 WHERE clerk_user_id = $1;
 
 -- name: SoftDeleteOrganizationByClerkOrgID :execrows
-UPDATE organizations SET is_active = false WHERE clerk_org_id = $1;
+UPDATE organizations SET is_active = false, deactivated_at = COALESCE(deactivated_at, now()) WHERE clerk_org_id = $1;
 
 -- name: SoftDeleteUserByClerkUserID :execrows
 -- A full Clerk account deletion (user.deleted): every membership goes.
 UPDATE users SET is_active = false, clerk_event_at = GREATEST(clerk_event_at, sqlc.narg(event_at)::timestamptz)
 WHERE clerk_user_id = sqlc.arg(clerk_user_id)
   AND (clerk_event_at IS NULL OR sqlc.narg(event_at)::timestamptz IS NULL OR sqlc.narg(event_at)::timestamptz >= clerk_event_at);
+
+-- name: EraseUserByClerkUserID :execrows
+-- Account deletion (user.deleted) is final, so unlike a membership removal it
+-- also scrubs the person's identifying fields. The row stays (audit history,
+-- run attribution) but no longer says who it was. A stale event (older than
+-- the newest applied to the row) is ignored, like every other membership write.
+WITH erased AS (
+    UPDATE users SET is_active = false, can_manage_api_keys = false, can_manage_integrations = false,
+           can_approve_workflows = false, full_name = NULL, avatar_url = NULL,
+           email = 'erased-' || id::text || '@erased.invalid',
+           clerk_user_id = 'erased:' || id::text,
+           clerk_event_at = GREATEST(clerk_event_at, sqlc.narg(event_at)::timestamptz)
+    WHERE clerk_user_id = sqlc.arg(clerk_user_id)
+      AND (clerk_event_at IS NULL OR sqlc.narg(event_at)::timestamptz IS NULL OR sqlc.narg(event_at)::timestamptz >= clerk_event_at)
+    RETURNING id
+), subs AS (
+    DELETE FROM push_subscriptions WHERE user_id IN (SELECT id FROM erased)
+)
+SELECT 1 FROM erased;
 
 -- name: SoftDeleteMembership :execrows
 -- A single membership removal: only this org's row, never the person's

@@ -84,6 +84,11 @@ type Querier interface {
 	// digest off, never on, so a leaked/replayed token can't be used to
 	// re-enable something a founder actively disabled some other way.
 	DisableDigestForOrg(ctx context.Context, id pgtype.UUID) error
+	// Account deletion (user.deleted) is final, so unlike a membership removal it
+	// also scrubs the person's identifying fields. The row stays (audit history,
+	// run attribution) but no longer says who it was. A stale event (older than
+	// the newest applied to the row) is ignored, like every other membership write.
+	EraseUserByClerkUserID(ctx context.Context, arg EraseUserByClerkUserIDParams) (int64, error)
 	// Fills in the completion-summary fields checkpoint() itself doesn't own
 	// (status stays checkpoint()'s alone) — only called once a run reaches a
 	// genuinely terminal status, never for awaiting_approval.

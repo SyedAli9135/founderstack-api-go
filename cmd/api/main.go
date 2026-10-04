@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/founderstack/api/internal/core/lifecycle"
 	dbpkg "github.com/founderstack/api/internal/db"
 	"github.com/founderstack/api/internal/pkg/safego"
 	"log/slog"
@@ -233,6 +234,15 @@ func run() error {
 	go integrations.RunRefreshJob(ctx, systemPool, encryptionKey, integrationsRegistry)
 	go coreworkflows.RunScheduler(ctx, systemPool, launcher)
 	go coreworkflows.RunApprovalExpiryJob(ctx, systemPool, launcher)
+	safego.Go("lifecycle: purge job", func() {
+		(&lifecycle.Purger{
+			System: systemPool, App: dbPool, Docs: docsProcessor, Registry: integrationsRegistry, Key: encryptionKey,
+			Retain: lifecycle.Retention{
+				AuditDays: cfg.RetentionAuditDays, CostDays: cfg.RetentionCostDays, StepsDays: cfg.RetentionStepsDays,
+				ReportsGraceDays: cfg.RetentionReportsGraceDays, StripeEventsDays: cfg.RetentionStripeEventsDays,
+			},
+		}).Run(ctx)
+	})
 	go coredigest.RunScheduler(ctx, systemPool, emailSender, digestTokens, cfg.AppBaseURL)
 	if billingSyncer != nil {
 		go corebilling.RunWorkspaceUsageJob(ctx, systemPool, billingSyncer)
@@ -460,6 +470,7 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 	invitationLister := org.NewClerkInvitationLister(organizationinvitation.NewClient(&clerk.ClientConfig{}))
 	apiOrg := router.Group("/api/v1")
 	apiOrg.Use(authed...)
+	org.EnableExportLimit(rdb)
 	org.NewHandler(db, membershipSyncer, invitationLister).Register(apiOrg)
 
 	apiBilling := router.Group("/api/v1")

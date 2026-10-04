@@ -305,14 +305,14 @@ func (h *ClerkHandler) softDeleteMembership(ctx context.Context, raw json.RawMes
 	return nil
 }
 
-// A whole Clerk account is gone, so every membership row the person holds goes with it.
+// A whole Clerk account is gone: every membership row the person holds is deactivated and anonymized.
 func (h *ClerkHandler) softDeleteUser(ctx context.Context, raw json.RawMessage, at pgtype.Timestamptz) error {
 	var data userPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return fmt.Errorf("decode user payload: %w", err)
 	}
-	if _, err := h.db.SoftDeleteUserByClerkUserID(ctx, dbgen.SoftDeleteUserByClerkUserIDParams{ClerkUserID: data.ID, EventAt: at}); err != nil {
-		return fmt.Errorf("soft-delete user: %w", err)
+	if _, err := h.db.EraseUserByClerkUserID(ctx, dbgen.EraseUserByClerkUserIDParams{ClerkUserID: data.ID, EventAt: at}); err != nil {
+		return fmt.Errorf("erase user: %w", err)
 	}
 	return nil
 }

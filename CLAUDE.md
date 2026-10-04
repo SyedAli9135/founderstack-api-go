@@ -2570,6 +2570,28 @@ What makes that true, and what to keep true when adding to it:
   balancer's address. Team runs call back to `APP_BASE_URL` through the load balancer, which is why the relay
   above matters.
 
+### Data lifecycle (added 2026-10-04) — `internal/core/lifecycle`, migration `000027`
+
+- **Workspace purge.** A deactivated workspace stays restorable for 30 days (`lifecycle.RestoreWindow`), then
+  `Purger.PurgeDue` (every 6h, started from `main`) deletes it: each document's vectors/S3 file first
+  (`documents.Processor.Purge`), best-effort provider token revocation, then the SQL function
+  `purge_organization` — SECURITY DEFINER, executable by `app_system` only, because `audit_logs` is append-only
+  for the app roles and `workflow_runs`/`approvals` have no cascade. It refuses an active org or one that still
+  has client workspaces (a practice waits for its clients). `organization.deleted` now sets `deactivated_at`.
+  Not done: cancelling a purged org's live Stripe subscription.
+- **Retention.** `purge_expired_records` deletes audit_logs/cost_ledger/workflow_steps/expired client_reports/
+  stripe_events past `RETENTION_*_DAYS`, in 5000-row batches. A job test must never call `PurgeDue` against a
+  shared dev DB (it deletes any expired workspace there) — use `dueOrgs`/`PurgeOrg` on the seeded org.
+- **Erasure.** `user.deleted` anonymizes every row of that account (`EraseUserByClerkUserID`: name, email,
+  avatar, Clerk id, flags) and drops its push subscriptions; rows stay for audit attribution.
+- **Export.** `GET /org/export` (owner/admin, 3/hour) returns the workspace's data as JSON — never encrypted
+  keys, OAuth credentials, share tokens, file contents or run checkpoints; audit/cost/run tables are capped at
+  50k newest rows.
+- **Key rotation.** Set `ENCRYPTION_KEY` to the new key and `ENCRYPTION_KEY_PREVIOUS` to the old, deploy, run
+  `go run ./cmd/rotatekeys` (`-dry-run` first), then drop the previous key. Ciphertext format is unchanged.
+- **Prod checklist:** run migrations through 000027, and `ALTER ROLE app_user/app_system PASSWORD ...` (the
+  migration passwords are dev-only; boot refuses them in production).
+
 ### Dependency policy
 
 Go dependencies are added when code actually imports them, not pre-installed speculatively
