@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/google/uuid"
@@ -135,6 +136,15 @@ func (e *Engine) runFrom(ctx context.Context, nodes Nodes, state *RunState, node
 			status := "failed"
 			if ctx.Err() != nil {
 				status = "cancelled"
+			}
+			if status == "failed" {
+				// Persist the reason: the SSE event below is gone once the
+				// stream closes, and a run that fails before the browser
+				// connects would otherwise show no explanation at all.
+				slog.Error("graph: node failed", "run_id", state.WorkflowRunID, "node", node, "err", err)
+				if state.Output == "" {
+					state.Output = fmt.Sprintf("Run failed in %s: %v", node, err)
+				}
 			}
 			_ = checkpoint(context.WithoutCancel(ctx), e.pool, state, node, status)
 			e.Bus.Publish(Event{Type: EventError, RunID: state.WorkflowRunID, Data: err.Error()})
