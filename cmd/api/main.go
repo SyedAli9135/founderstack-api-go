@@ -536,6 +536,9 @@ func newRouter(cfg *config.Config, db, systemDB *pgxpool.Pool, rdb *redis.Client
 var expensiveRoutes = []middleware.RouteRule{
 	{Method: "POST", Path: "/api/v1/settings/api-key", Limit: 10, Window: time.Minute},
 	{Method: "POST", Path: "/api/v1/settings/digest/test", Limit: 5, Window: time.Hour},
+	// Model test spends a few tokens on the customer's own key; model listing is cached only on success.
+	{Method: "POST", Path: "/api/v1/settings/api-key/providers/:provider/models/test", Limit: 20, Window: time.Hour},
+	{Method: "GET", Path: "/api/v1/settings/api-key/providers/:provider/models", Limit: 60, Window: time.Hour},
 	{Method: "POST", Path: "/api/v1/settings/push-subscription", Limit: 30, Window: time.Hour},
 	{Method: "POST", Path: "/api/v1/integrations/:service/connect", Limit: 20, Window: time.Minute},
 	{Method: "POST", Path: "/api/v1/reports", Limit: 30, Window: time.Hour},
