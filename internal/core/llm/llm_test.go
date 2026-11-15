@@ -33,7 +33,6 @@ func TestValidateKey_RejectsWrongFormatPerProvider(t *testing.T) {
 		{ProviderAnthropic, "Bearer sk-ant-with-a-prefix-in-front"},
 		{ProviderOpenAI, "hunter2"},
 		{ProviderOpenAI, "AIza-thats-a-gemini-key"},
-		{ProviderGemini, "sk-not-a-gemini-key"},
 		{ProviderQwen, "hunter2"},
 		{ProviderDeepSeek, "hunter2"},
 	}

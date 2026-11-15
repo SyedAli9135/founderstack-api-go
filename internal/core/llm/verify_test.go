@@ -67,9 +67,9 @@ func TestVerifyOpenAICompatible_UnreachableServerIsValidationUnavailable(t *test
 }
 
 func TestVerifyGemini_OKMeansValid(t *testing.T) {
-	var gotQuery string
+	var gotKey string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotQuery = r.URL.RawQuery
+		gotKey = r.Header.Get("x-goog-api-key")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -78,8 +78,8 @@ func TestVerifyGemini_OKMeansValid(t *testing.T) {
 	if err := verifyGemini(context.Background(), "AIzaTestKey"); err != nil {
 		t.Fatalf("verifyGemini() error = %v, want nil", err)
 	}
-	if gotQuery != "key=AIzaTestKey" {
-		t.Fatalf("query = %q, want %q", gotQuery, "key=AIzaTestKey")
+	if gotKey != "AIzaTestKey" {
+		t.Fatalf("x-goog-api-key = %q, want %q", gotKey, "AIzaTestKey")
 	}
 }
 

@@ -79,15 +79,15 @@ func verifyOpenAICompatible(modelsURL string) verify {
 var geminiModelsURL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 // verifyGemini checks a Google AI Studio key via the same "list models,
-// cheap and side-effect-free" idea — Gemini authenticates via a `key`
-// query parameter, not a Bearer header, which is why it isn't folded into
+// cheap and side-effect-free" idea — Gemini authenticates via an
+// `x-goog-api-key` header (works for both AIza and AQ. keys), not a Bearer header, which is why it isn't folded into
 // verifyOpenAICompatible.
 func verifyGemini(ctx context.Context, apiKey string) error {
-	url := geminiModelsURL + "?key=" + apiKey
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, geminiModelsURL, nil)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrValidationUnavailable, err)
 	}
+	req.Header.Set("x-goog-api-key", apiKey)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {

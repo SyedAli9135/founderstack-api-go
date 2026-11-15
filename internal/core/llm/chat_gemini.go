@@ -36,6 +36,9 @@ type geminiPart struct {
 	Text         string                `json:"text,omitempty"`
 	FunctionCall *geminiFunctionCall   `json:"functionCall,omitempty"`
 	FunctionResp *geminiFunctionResult `json:"functionResponse,omitempty"`
+	// ThoughtSignature rides on the functionCall part it belongs to and must be
+	// returned verbatim on later turns.
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
 }
 
 type geminiFunctionCall struct {
@@ -103,11 +106,12 @@ func (c *GeminiChatClient) Send(ctx context.Context, systemPrompt string, messag
 		return ChatResponse{}, fmt.Errorf("llm: marshal gemini request: %w", err)
 	}
 
-	url := geminiGenerateContentBaseURL + "/" + c.model + ":generateContent?key=" + c.apiKey
+	url := geminiGenerateContentBaseURL + "/" + c.model + ":generateContent"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("%w: %w", ErrChatUnavailable, err)
 	}
+	httpReq.Header.Set("x-goog-api-key", c.apiKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := chatHTTPClient.Do(httpReq)
@@ -149,7 +153,7 @@ func toGeminiContents(messages []Message) []geminiContent {
 				parts = append(parts, geminiPart{Text: m.Content})
 			}
 			for _, tc := range m.ToolCalls {
-				parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{Name: tc.Name, Args: tc.Args}})
+				parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{Name: tc.Name, Args: tc.Args}, ThoughtSignature: tc.ThoughtSignature})
 			}
 			out = append(out, geminiContent{Role: "model", Parts: parts})
 		case RoleTool:
@@ -174,7 +178,7 @@ func toGeminiTools(tools []ToolSchema) []geminiTool {
 	}
 	decls := make([]geminiFunctionDeclaration, len(tools))
 	for i, t := range tools {
-		decls[i] = geminiFunctionDeclaration{Name: t.Name, Description: t.Description, Parameters: t.InputSchema}
+		decls[i] = geminiFunctionDeclaration{Name: t.Name, Description: t.Description, Parameters: sanitizeGeminiSchema(t.InputSchema)}
 	}
 	return []geminiTool{{FunctionDeclarations: decls}}
 }
@@ -200,9 +204,10 @@ func fromGeminiResponse(r geminiResponse) ChatResponse {
 			// providers; this adapter itself matches replies by name (see
 			// toGeminiContents), not by this synthesized ID.
 			out.ToolCalls = append(out.ToolCalls, ToolCall{
-				ID:   "call_" + strconv.Itoa(callIndex),
-				Name: part.FunctionCall.Name,
-				Args: part.FunctionCall.Args,
+				ID:               "call_" + strconv.Itoa(callIndex),
+				Name:             part.FunctionCall.Name,
+				Args:             part.FunctionCall.Args,
+				ThoughtSignature: part.ThoughtSignature,
 			})
 			callIndex++
 		}
@@ -221,4 +226,88 @@ func fromGeminiResponse(r geminiResponse) ChatResponse {
 		out.StopReason = StopReasonOther
 	}
 	return out
+}
+
+// geminiSchemaKeys is the subset of JSON Schema Gemini's function_declarations
+// accept (an OpenAPI-style schema). Anything else — notably the
+// "additionalProperties" and "$schema" that MCP tool schemas carry — is
+// rejected with a 400, so it is dropped rather than forwarded.
+var geminiSchemaKeys = map[string]bool{
+	"type": true, "format": true, "description": true, "nullable": true,
+	"enum": true, "properties": true, "required": true, "items": true,
+	"minItems": true, "maxItems": true, "minimum": true, "maximum": true,
+}
+
+// sanitizeGeminiSchema rewrites a JSON Schema into the subset Gemini accepts.
+// It returns nil (no parameters) when the schema is empty or has no properties,
+// since Gemini rejects an object schema with an empty properties map. On any
+// parse problem it returns the input unchanged so the provider's own error
+// surfaces instead of the tool silently disappearing.
+func sanitizeGeminiSchema(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return raw
+	}
+	m, ok := cleanGeminiSchema(v).(map[string]any)
+	if !ok {
+		return raw
+	}
+	if props, _ := m["properties"].(map[string]any); len(props) == 0 {
+		return nil
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func cleanGeminiSchema(v any) any {
+	switch t := v.(type) {
+	case []any:
+		for i := range t {
+			t[i] = cleanGeminiSchema(t[i])
+		}
+		return t
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			switch k {
+			case "properties":
+				// Property names are arbitrary, so clean each value, not each key.
+				props, ok := val.(map[string]any)
+				if !ok {
+					continue
+				}
+				cleaned := make(map[string]any, len(props))
+				for name, p := range props {
+					cleaned[name] = cleanGeminiSchema(p)
+				}
+				out[k] = cleaned
+			case "type":
+				// JSON Schema allows ["string","null"]; Gemini wants one type plus nullable.
+				if arr, ok := val.([]any); ok {
+					for _, e := range arr {
+						if s, _ := e.(string); s == "null" {
+							out["nullable"] = true
+						} else if s != "" {
+							out[k] = s
+						}
+					}
+					continue
+				}
+				out[k] = val
+			default:
+				if geminiSchemaKeys[k] {
+					out[k] = cleanGeminiSchema(val)
+				}
+			}
+		}
+		return out
+	default:
+		return v
+	}
 }

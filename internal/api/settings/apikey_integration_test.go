@@ -497,7 +497,8 @@ func TestSettingsAPIKey_ListProviders(t *testing.T) {
 			if p.IsConfigured || p.IsValid || p.IsActive || p.KeyPrefix != nil {
 				t.Errorf("provider %q = %+v, want all-false/nil before any submission", p.Provider, p)
 			}
-			if p.Name == "" || p.KeyPrefixHint == "" {
+			// Gemini deliberately has no prefix hint: Google issues both AIza and AQ. keys.
+			if p.Name == "" || (p.KeyPrefixHint == "" && p.Provider != "gemini") {
 				t.Errorf("provider %q missing catalog metadata: %+v", p.Provider, p)
 			}
 		}

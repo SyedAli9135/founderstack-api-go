@@ -21,11 +21,12 @@ func withGeminiTestServer(t *testing.T, handler http.HandlerFunc) *GeminiChatCli
 	return NewGeminiChatClient("AIza-test", "gemini-2.5-pro")
 }
 
-func TestGeminiChatClient_SendsKeyAsQueryParamAndSystemInstruction(t *testing.T) {
+func TestGeminiChatClient_SendsKeyAsHeaderAndSystemInstruction(t *testing.T) {
 	var gotReq geminiRequest
-	var gotQuery string
+	var gotKey, gotRawQuery string
 	client := withGeminiTestServer(t, func(w http.ResponseWriter, r *http.Request) {
-		gotQuery = r.URL.RawQuery
+		gotKey = r.Header.Get("x-goog-api-key")
+		gotRawQuery = r.URL.RawQuery
 		_ = json.NewDecoder(r.Body).Decode(&gotReq)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(geminiResponse{
@@ -41,8 +42,8 @@ func TestGeminiChatClient_SendsKeyAsQueryParamAndSystemInstruction(t *testing.T)
 		t.Fatalf("Send() error = %v", err)
 	}
 
-	if gotQuery != "key=AIza-test" {
-		t.Fatalf("query = %q, want key=AIza-test", gotQuery)
+	if gotKey != "AIza-test" || gotRawQuery != "" {
+		t.Fatalf("header key = %q, query = %q; want key in header only", gotKey, gotRawQuery)
 	}
 	if gotReq.SystemInstruction == nil || gotReq.SystemInstruction.Parts[0].Text != "You are a helpful COO." {
 		t.Fatalf("SystemInstruction = %+v", gotReq.SystemInstruction)
@@ -147,5 +148,80 @@ func TestGeminiChatClient_ErrorClassification(t *testing.T) {
 		if !errors.Is(err, c.want) {
 			t.Errorf("status %d: err = %v, want %v", c.status, err, c.want)
 		}
+	}
+}
+
+func TestSanitizeGeminiSchema_DropsUnsupportedKeywords(t *testing.T) {
+	in := json.RawMessage(`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","additionalProperties":false,"required":["a"],"properties":{"a":{"type":"string","description":"x","additionalProperties":false},"additionalProperties":{"type":["integer","null"]},"n":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"z":{"type":"string"}}}}}}`)
+	var got map[string]any
+	if err := json.Unmarshal(sanitizeGeminiSchema(in), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["additionalProperties"]; ok {
+		t.Fatalf("root additionalProperties kept: %v", got)
+	}
+	if _, ok := got["$schema"]; ok {
+		t.Fatalf("$schema kept: %v", got)
+	}
+	props := got["properties"].(map[string]any)
+	if _, ok := props["a"].(map[string]any)["additionalProperties"]; ok {
+		t.Fatal("nested additionalProperties kept")
+	}
+	// A property that happens to be named additionalProperties must survive.
+	ap := props["additionalProperties"].(map[string]any)
+	if ap["type"] != "integer" || ap["nullable"] != true {
+		t.Fatalf("type array not normalised: %v", ap)
+	}
+	items := props["n"].(map[string]any)["items"].(map[string]any)
+	if _, ok := items["additionalProperties"]; ok {
+		t.Fatal("items additionalProperties kept")
+	}
+}
+
+func TestSanitizeGeminiSchema_NoPropertiesMeansNoParameters(t *testing.T) {
+	if got := sanitizeGeminiSchema(json.RawMessage(`{"type":"object","additionalProperties":false}`)); got != nil {
+		t.Fatalf("got %s, want nil", got)
+	}
+}
+
+func TestGeminiChatClient_EchoesThoughtSignatureOnFunctionCalls(t *testing.T) {
+	// Turn 1: the model answers with a function call carrying a thought signature.
+	var calls int
+	var secondReq geminiRequest
+	client := withGeminiTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"stripe.list_subscriptions","args":{}},"thoughtSignature":"SIG-ABC"}]},"finishReason":"STOP"}]}`))
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&secondReq)
+		_ = json.NewEncoder(w).Encode(geminiResponse{Candidates: []geminiCandidate{{Content: geminiContent{Role: "model", Parts: []geminiPart{{Text: "done"}}}, FinishReason: "STOP"}}})
+	})
+
+	first, err := client.Send(context.Background(), "", []Message{{Role: RoleUser, Content: "go"}}, nil)
+	if err != nil || len(first.ToolCalls) != 1 || first.ToolCalls[0].ThoughtSignature != "SIG-ABC" {
+		t.Fatalf("first = %+v, err = %v; want the signature captured on the call", first, err)
+	}
+
+	// Turn 2: replaying the conversation must send the signature back on the same part.
+	_, err = client.Send(context.Background(), "", []Message{
+		{Role: RoleUser, Content: "go"},
+		{Role: RoleAssistant, ToolCalls: first.ToolCalls},
+		{Role: RoleTool, Name: "stripe.list_subscriptions", Content: "[]"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	for _, c := range secondReq.Contents {
+		for _, p := range c.Parts {
+			if p.FunctionCall != nil {
+				got = p.ThoughtSignature
+			}
+		}
+	}
+	if got != "SIG-ABC" {
+		t.Fatalf("replayed functionCall signature = %q, want SIG-ABC", got)
 	}
 }

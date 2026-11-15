@@ -616,7 +616,7 @@ func TestAgentsHandler_DefaultModelFollowsTheOrgsProvider(t *testing.T) {
 		_ = json.Unmarshal(env.Data, &got)
 		return got.Model
 	}
-	for provider, want := range map[string]string{"anthropic": "claude-sonnet-5-5", "openai": "gpt-4o", "gemini": "gemini-2.0-flash", "": "claude-sonnet-5-5"} {
+	for provider, want := range map[string]string{"anthropic": "claude-sonnet-5-5", "openai": "gpt-4o", "gemini": "gemini-2.5-flash", "": "claude-sonnet-5-5"} {
 		if got := create(provider); got != want {
 			t.Errorf("provider %q: default model = %q, want %q", provider, got, want)
 		}

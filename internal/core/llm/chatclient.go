@@ -43,6 +43,10 @@ type ToolCall struct {
 	ID   string          `json:"id"`
 	Name string          `json:"name"`
 	Args json.RawMessage `json:"args,omitempty"`
+	// ThoughtSignature is Gemini's opaque reasoning token for this call. Gemini 3.x
+	// rejects the next turn (400) unless it is echoed back unchanged on the same
+	// functionCall part. Other providers leave it empty.
+	ThoughtSignature string `json:"thought_signature,omitempty"`
 }
 
 // ToolSchema is one tool's definition offered to the model each turn.

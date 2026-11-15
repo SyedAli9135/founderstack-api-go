@@ -27,7 +27,7 @@ type Meta struct {
 var defaultModels = map[ProviderID]string{
 	ProviderAnthropic: "claude-sonnet-5-5",
 	ProviderOpenAI:    "gpt-4o",
-	ProviderGemini:    "gemini-2.0-flash",
+	ProviderGemini:    "gemini-2.5-flash",
 	ProviderQwen:      "qwen-plus",
 	ProviderDeepSeek:  "deepseek-chat",
 }
@@ -46,7 +46,9 @@ func DefaultModel(p ProviderID) string {
 var Catalog = map[ProviderID]Meta{
 	ProviderAnthropic: {Name: "Anthropic", KeyPrefix: "sk-ant-"},
 	ProviderOpenAI:    {Name: "OpenAI", KeyPrefix: "sk-"},
-	ProviderGemini:    {Name: "Google Gemini", KeyPrefix: "AIza"},
-	ProviderQwen:      {Name: "Qwen", KeyPrefix: "sk-"},
-	ProviderDeepSeek:  {Name: "DeepSeek", KeyPrefix: "sk-"},
+	// No KeyPrefix: Google issues both legacy "AIza" keys and newer "AQ." auth keys,
+	// so the live models-list call is the format check.
+	ProviderGemini:   {Name: "Google Gemini"},
+	ProviderQwen:     {Name: "Qwen", KeyPrefix: "sk-"},
+	ProviderDeepSeek: {Name: "DeepSeek", KeyPrefix: "sk-"},
 }
