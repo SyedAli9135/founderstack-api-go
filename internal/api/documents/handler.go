@@ -516,7 +516,7 @@ func logProcessingError(op string, docID pgtype.UUID, err error) {
 var hydeModelByProvider = map[llm.ProviderID]string{
 	llm.ProviderAnthropic: "claude-haiku-4-5-20251001",
 	llm.ProviderOpenAI:    "gpt-4o-mini",
-	llm.ProviderGemini:    "gemini-2.5-flash",
+	llm.ProviderGemini:    "gemini-flash-lite-latest",
 	llm.ProviderQwen:      "qwen-turbo",
 	llm.ProviderDeepSeek:  "deepseek-chat",
 }

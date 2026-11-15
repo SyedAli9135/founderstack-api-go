@@ -27,7 +27,7 @@ type Meta struct {
 var defaultModels = map[ProviderID]string{
 	ProviderAnthropic: "claude-sonnet-5-5",
 	ProviderOpenAI:    "gpt-4o",
-	ProviderGemini:    "gemini-2.5-flash",
+	ProviderGemini:    "gemini-flash-lite-latest",
 	ProviderQwen:      "qwen-plus",
 	ProviderDeepSeek:  "deepseek-chat",
 }
