@@ -52,6 +52,11 @@ func ResolveChatClient(ctx context.Context, appPool *pgxpool.Pool, encryptionKey
 		return nil, fmt.Errorf("llm: decrypt key: %w", err)
 	}
 
+	return NewChatClient(provider, apiKey, model)
+}
+
+// NewChatClient builds a ChatClient for provider from an already-decrypted key.
+func NewChatClient(provider ProviderID, apiKey, model string) (ChatClient, error) {
 	switch provider {
 	case ProviderAnthropic:
 		return NewAnthropicChatClient(apiKey, model), nil

@@ -33,6 +33,7 @@ type Handler struct {
 	email            notify.EmailSender
 	digestTokens     *notify.DigestTokenSigner
 	appBaseURL       string
+	modelCache       modelCache
 }
 
 // encryptionKey is the decoded ENCRYPTION_KEY, resolved once at startup so a misconfigured
@@ -50,6 +51,8 @@ func (h *Handler) Register(rg *gin.RouterGroup) {
 	rg.GET("/api-key/status", h.APIKeyStatus)
 	rg.DELETE("/api-key", h.DeleteAPIKey)
 	rg.GET("/api-key/providers", h.ListProviders)
+	rg.GET("/api-key/providers/:provider/models", h.ListModels)
+	rg.POST("/api-key/providers/:provider/models/test", h.TestModel)
 	rg.GET("/api-key/usage", h.APIKeyUsage)
 
 	// Approval-gate notification config — see approvals.go and pushsubscription.go.
