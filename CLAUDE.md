@@ -267,6 +267,19 @@ confirm the route exists.
   nowhere in the new frontend flow but not removed — an existing, working, backward-compatible
   endpoint costs nothing to leave in place).
 
+### Live model discovery and Gemini quirks (added 2026-11-15, found by the first real-key testing)
+
+Everything before this date was verified with `MOCK_LLM_MODE` only; a real Gemini key surfaced bugs no mock could.
+
+- **Models come from the provider, not a table.** `llm.ListModels` (`internal/core/llm/models.go`) asks each provider which chat models the org's key can use (Gemini filters on `supportedGenerationMethods` containing `generateContent` and drops tts/image/embedding/transcribe; OpenAI/Qwen filter by id since their lists carry no capability field; Anthropic/DeepSeek are unfiltered). `GET /settings/api-key/providers/:provider/models` returns that list plus a `recommended` pick (10-minute in-process cache keyed to the stored ciphertext; mock keys get a canned one-model list).
+- **A listed model is not proof it works.** Google lists models that `generateContent` then refuses ("no longer available to new users") or stalls on. `POST .../models/test` (`llm.ProbeModel`, admin only, 25s timeout) sends one tiny real request and returns the provider's own error, and the agent form has a "Test model" button for it. Retired ids are never safe to hardcode: `defaultModels` is only a fallback.
+- **Gemini keys come in two formats** (`AIza...` and the newer `AQ.`), so Gemini has no `KeyPrefix`; the live models call is the format check. The key is sent in the `x-goog-api-key` header, never the URL.
+- **Gemini tool schemas** must be the OpenAPI subset: MCP schemas carry `additionalProperties`/`$schema`, which Gemini rejects with a 400, so `sanitizeGeminiSchema` allowlists keywords and drops empty-property objects.
+- **Gemini 3.x thought signatures:** a `functionCall` part's `thoughtSignature` must be echoed back verbatim on the next turn or Gemini returns 400. It rides on `llm.ToolCall.ThoughtSignature` through the checkpointed conversation.
+- **A failed run now says why:** `Engine.runFrom` logs the node error and stores `Run failed in <node>: <err>` in `workflow_runs.output` (before this, the reason only existed on the SSE stream).
+- **Live-verified 2026-11-15 with a real key:** plain run, tool run (Stripe/Calendar/Drive reads), both approval legs (one real Stripe test-mode refund), a team/A2A run through the ngrok loopback, the 10-run cap, inactive team member (409), member permissions, Slack/Notion reads, and write tools for Slack, Discord, Notion, Drive and Calendar. GitHub `create_issue` needs a PAT with Issues write on the target repo.
+- **Known gaps:** a stalled model takes up to 120s x3 attempts to fail; `PATCH /agents/:id {is_active:true}` does not reactivate a deleted agent; the AGENT_INACTIVE message shows an agent id rather than a name.
+
 ### Third-Party Integrations (workflow 4) — `internal/core/integrations`, `internal/api/integrations`
 
 8 catalog entries (`internal/core/integrations/catalog.go`): Slack, Discord, Notion, Google
